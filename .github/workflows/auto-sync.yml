@@ -1,0 +1,79 @@
+# Put this workflow on a separate default branch (for example, sync-control).
+# Keep master free of fork-only commits so it can exactly match upstream.
+name: Auto sync upstream master
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-sync-master
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Hanson-Liang-27/hcomm'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_PROMPT_DISABLED: '1'
+      GIT_TERMINAL_PROMPT: '0'
+      # Optional repository variable: https://gitcode.com/cann/hcomm.git
+      SOURCE_URL: ${{ vars.HCOMM_SYNC_SOURCE_URL || 'https://github.com/hicann/hcomm.git' }}
+      TARGET_BRANCH: master
+    steps:
+      - name: Check workflow branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          default_branch=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.default_branch')
+          if [[ "$default_branch" == "$TARGET_BRANCH" ]]; then
+            echo '::error::Create a sync-control branch containing this workflow and make it the default branch first.'
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/heads/$default_branch" ]]; then
+            echo '::error::Run this workflow from the default control branch.'
+            exit 1
+          fi
+          case "$SOURCE_URL" in
+            https://github.com/hicann/hcomm.git|https://gitcode.com/cann/hcomm.git) ;;
+            *) echo '::error::Unsupported sync source.'; exit 1 ;;
+          esac
+
+      - name: Fast-forward master to upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init --bare "$RUNNER_TEMP/hcomm-sync.git"
+          cd "$RUNNER_TEMP/hcomm-sync.git"
+          git remote add upstream "$SOURCE_URL"
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          # Read public history without checking out or executing upstream code.
+          git fetch --no-tags upstream "refs/heads/master:refs/remotes/upstream/master"
+          git fetch --no-tags origin "refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
+          before=$(git rev-parse "refs/remotes/origin/$TARGET_BRANCH")
+          after=$(git rev-parse refs/remotes/upstream/master)
+          {
+            echo "Source: $SOURCE_URL"
+            echo "Target: $GITHUB_REPOSITORY/$TARGET_BRANCH"
+            echo "Before: $before"
+            echo "Upstream: $after"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$before" == "$after" ]]; then
+            echo 'Already synchronized.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! git merge-base --is-ancestor "$before" "$after"; then
+            echo '::error::Target has commits absent from upstream, or upstream history was rewritten. No branches were overwritten.'
+            echo 'Stopped: target cannot be fast-forwarded.' >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          gh auth setup-git --hostname github.com
+          # Ordinary push also rejects a concurrent divergent update.
+          git push origin "refs/remotes/upstream/master:refs/heads/$TARGET_BRANCH"
+          echo 'Synchronized successfully (fast-forward only).' >> "$GITHUB_STEP_SUMMARY"
