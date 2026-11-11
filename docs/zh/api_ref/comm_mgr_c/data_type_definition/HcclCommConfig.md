@@ -34,6 +34,7 @@ typedef struct HcclCommConfigDef {
     uint32_t hcclQos;
     uint64_t hcclSymWinMaxMemSizePerRank;
     uint32_t hcclChannelSqDepth;
+    uint32_t hcclChannelScqDepth;
 } HcclCommConfig;
 ```
 
@@ -59,7 +60,8 @@ typedef struct HcclCommConfigDef {
     - 2：开启归约类通信算子的严格确定性计算，即保序功能（在确定性的基础上保证所有bit位的归约顺序均一致）。支持AllReduce和ReduceScatter算子，配置为该参数时需满足以下条件：
       - 通信规模要求rank size ≥ 3。
       - 仅支持INF/NaN模式，不支持饱和模式。
-      - 仅支持AI CPU展开模式。若通信算子展开模式配置为CCU_MS、CCU_SCHED或AIV，系统会回退到AI CPU展开模式。
+      - 仅支持AI CPU和AIV展开模式。HCCL算子使用CCU_MS或CCU_SCHED展开模式时，会回退到AI CPU展开模式下发。HCCL算子使用CCU_MS_ONLY或CCU_SCHED_ONLY展开模式时，若无法满足严格确定性计算要求，则报错退出，不自动回退。legacy通信域的例外行为参见对应展开模式的说明。
+      - 不支持RoCE协议的链路。
 
     调用[HcclCommConfigInit](../HcclCommConfigInit.md)后，如不修改hcclDeterministic，通信域将继承进程级确定性配置。HCCL_DETERMINISTIC环境变量已配置时使用环境变量配置；环境变量未配置、但已调用HcclSetConfig时使用接口配置；二者均未配置时使用普通确定性计算。显式配置0、1或2时，以通信域配置为准。配置其他值时，创建通信域失败并返回HCCL_E_PARA。
   <!-- end id1 -->
@@ -98,37 +100,62 @@ typedef struct HcclCommConfigDef {
 
     该配置项支持Broadcast、Reduce、AllReduce、Scatter、ReduceScatter、ReduceScatterV、AllGather、AllGatherV、AlltoAll、AlltoAllV、AlltoAllVC、Send、Recv、BatchSendRecv算子。
 
-    图模式（Ascend IR）或者图捕获（aclgraph）场景，当通信算法采用AI CPU模式时，单卡上的并发图数量不能超过6个，否则可能会因AI CPU核被占满而导致通信阻塞。
+    图模式（Ascend IR）或者图捕获（aclgraph）场景，当通信算法采用AI CPU模式时，单卡上的并发图数量不能超过系统为集合通信预留的AI CPU上限（该上限默认为6，但实际可用量可能因其他业务占用而减少），否则可能会因AI CPU核被占满而导致通信阻塞。
 
   - 3：通信算子在Device侧的Vector Core计算单元展开。
-    - 该配置仅支持对称组网、推理特性。
-    - 该配置下，若数据量不满足在“Vector Core”上的运行要求，部分算子会自动切换到默认模式。
+    - 该配置仅支持推理特性。
+    - 部分HCCL算子在数据量不满足Vector Core运行要求时，会自动回退到默认展开模式下发。
     - 该配置项仅支持Broadcast、Reduce、AllReduce、ReduceScatter、Scatter、AllGather、AlltoAll、AlltoAllV、AlltoAllVC算子，当前仅支持单机场景。
       - 针对Reduce、AllReduce、ReduceScatter算子，数据类型支持int8、int16、int32、int64、float16、float32、bfp16。
 
     - 该配置项下，支持控核能力，建议业务根据实际使用场景中计算算子与通信算子的并发情况进行Vector Core核数的配置。
 
   - 4：代表通信算子在Device侧的Vector Core计算单元展开，但不会随着数据量的变化进行模式切换，始终使用Vector Core计算，如果不满足Vector Core的运行条件，会报错退出。
-    - 该配置仅支持对称组网、推理特性。
+    - 该配置仅支持推理特性。
     - 该配置项支持的算子及约束限制参见配置“3”。
+    - 该配置项支持的最大通信域规模：单通信域rankSize不超过1024，其中AlltoAllV、AlltoAllVC算子不超过256。超过上限时算子执行报错退出，不会自动切换模式。
 
-  - 5：通信算子在CCU（Collective Communication Unit，集合通信加速单元）展开，使用CcuBuffer进行内存读写。Ascend 950PR不支持此配置。
+  - 5：通信算子在CCU（Collective Communication Unit，集合通信加速单元）展开，使用CcuBuffer进行内存读写（即CCU_MS模式）。Ascend 950PR不支持此配置。
 
-    此模式下，当CCU与多个远端通信时，使用CcuBuffer作为中转，用于节省内存读写带宽，CcuBuffer的特点是大小较小，但速度较快。当CCU资源不足时，系统会自动切换为“2：AI CPU模式”。
+    此模式下，当CCU与多个远端通信时，使用CcuBuffer作为中转，用于节省内存读写带宽，CcuBuffer的特点是大小较小，但速度较快。
+
+    HCCL算子在CCU资源不足时，会先尝试从CCU_MS模式回退到CCU_SCHED模式下发；若CCU_SCHED模式仍无法满足运行条件，再回退到AI CPU展开模式下发。
 
     该配置项仅支持Broadcast、Reduce、AllReduce、ReduceScatter、AllGather算子，当前仅支持单机场景。
     - 针对Broadcast、AllGather算子，数据类型支持int8、uint8、int16、uint16、int32、uint32、int64、uint64、float16、float32、float64、bfp16。
     - 针对Reduce、AllReduce、ReduceScatter算子，数据类型支持int16、int32、float16、float32、bfp16。
-      
-  - 6：通信算子在CCU展开，使用调度模式。
+
+    CCU资源扩容及额外实例的复用规则参见下文CCU调度模式的说明。
+
+  - 6：通信算子在CCU展开，使用调度模式（即CCU_SCHED模式）。
 
     调度模式指使用CCU作为调度器，向UB引擎调度UB WQE任务。调度模式下不使用CcuBuffer，直接在两个rank间进行片上内存到片上内存的数据传输。
 
-    针对单机通信场景的AllReduce、ReduceScatter、Reduce算子，当数据量超过一定值时，为防止性能下降，系统会自动切换为“2：AI_CPU模式”（该阈值并非固定，会根据算子运行模式及网络规模等因素有所调整）。
+    HCCL的AllReduce、ReduceScatter和Reduce算子在单机通信场景中，当数据量超过一定阈值时，会自动回退到AI CPU展开模式下发，以避免性能下降。该阈值并非固定，会根据算子运行模式及网络规模等因素调整。
 
     此模式下，ReduceScatterV、AllGatherV算子仅支持单Server场景。
 
-    当CCU资源不足时，系统会自动切换为“2：AI CPU模式”。
+    AlltoAllV使用CCU调度模式执行时，若通信域已有CCU实例的容量不能满足其资源需求，HCCL会在设备剩余资源允许的情况下自动申请一份额外CCU实例，并使用该实例执行算子，无需额外配置。
+
+    - 每个通信域最多创建一份额外CCU实例。原实例和额外实例分别承载完整的算子资源需求，容量不叠加使用。
+    - 后续HCCL算子在同一通信域内申请CCU资源时，会优先复用已有的额外实例；若额外实例容量不足，则不再扩容，也不再检查原实例的容量，而是按既有流程回退。
+    - 支持单算子模式、图模式（Ascend IR）和图捕获（aclgraph）的资源申请，图回放不重复创建额外实例。额外实例随通信域销毁释放，业务无需单独释放。
+
+    扩容的使用约束及配套版本要求参见[HCCL_OP_EXPANSION_MODE](https://gitcode.com/cann/hccl/blob/master/docs/zh/user_guide/hccl_env/HCCL_OP_EXPANSION_MODE.md)中CCU_SCHED配置项的说明。
+
+    HCCL算子无法获得满足需求的CCU资源时，会自动回退到AI CPU展开模式下发。
+
+  - 8：通信算子在CCU展开，执行方式与“5”相同，区别在于：不随数据量、资源状态进行模式切换，不满足运行条件时会报错退出。
+
+    该配置项支持的算子及约束限制参见配置“5”。
+
+    例外：legacy通信域在CCU不可用时，自动回退为“2：AI CPU模式”，不报错退出。
+
+  - 9：通信算子在CCU展开，使用调度模式。执行方式与“6”相同，区别在于：不随数据量、资源状态进行模式切换，不满足运行条件会报错退出。
+
+    该配置项支持的算子及约束限制参见配置“6”。
+
+    例外：legacy通信域在CCU不可用时，自动回退为“2：AI CPU模式”，不报错退出。
   <!-- end id4 -->
 
   <!-- npu="A3" id5 -->
@@ -138,14 +165,15 @@ typedef struct HcclCommConfigDef {
   - 2：通信算子在AI CPU计算单元展开。
   - 3：通信算子在Device侧的Vector Core计算单元展开。
     - 该配置仅支持对称组网、推理特性。
-    - 该配置下，若数据量不满足在“Vector Core”上的运行要求，部分算子会自动切换到默认模式。
+    - 部分HCCL算子在数据量不满足Vector Core运行要求时，会自动回退到默认展开模式下发。
     - 该配置项仅支持Broadcast、AllReduce、ReduceScatter、AllGather、AlltoAll、AlltoAllV、AlltoAllVC算子。
       - 针对Broadcast算子，数据类型支持int8、uint8、int16、uint16、int32、uint32、float16、float32、bfp16、int64、uint64、float64，仅支持超节点内的单机/多机通信，仅支持单算子模式和Ascend IR图模式，不支持跨超节点间通信。
       - 针对AllReduce算子，数据类型支持int8、int16、int32、float16、float32、bfp16，reduce的操作类型仅支持sum、max、min，仅支持超节点内的单机/多机通信，不支持跨超节点间通信。
       - 针对ReduceScatter算子，数据类型支持int8、int16、int32、float16、float32、bfp16，reduce的操作类型仅支持sum、max、min，仅支持超节点内的单机/多机通信，不支持跨超节点间通信。
       - 针对AllGather、AlltoAll、AlltoAllV、AlltoAllVC算子，数据类型支持int8、uint8、int16、uint16、int32、uint32、float16、float32、bfp16，仅支持超节点内的单机/多机通信，不支持跨超节点间通信。
 
-    - 针对Broadcast、AllReduce、ReduceScatter、AllGather、AlltoAll（单机通信场景）算子，当数据量超过一定值时，为防止性能下降，系统会自动切换为“2：AI CPU模式”（该阈值并非固定，会根据算子运行模式、是否启动确定性计算及网络规模等因素有所调整）；针对AlltoAllV、AlltoAllVC、AlltoAll（多机通信场景）算子，系统不会自动切换为“2：AI CPU”模式，为避免性能劣化，当任意两个rank之间的最大通信数据量不超过1MB时，建议配置为“3：AIV模式”，否则请采用“2：AI CPU模式”。
+    - HCCL的Broadcast、AllReduce、ReduceScatter、AllGather和AlltoAll（单机通信场景）算子在数据量超过一定阈值时，会自动回退到AI CPU展开模式下发，以避免性能下降。该阈值并非固定，会根据算子运行模式、是否开启确定性计算及网络规模等因素调整。
+    - HCCL的AlltoAllV、AlltoAllVC和AlltoAll（多机通信场景）算子不会自动回退到AI CPU展开模式下发。为避免性能劣化，当任意两个rank之间的最大通信数据量不超过1MB时，建议配置为“3：AIV模式”，否则请采用“2：AI CPU模式”。
     - 该配置项下，集合通信支持控核能力，建议业务根据实际使用场景中计算算子与通信算子的并发情况进行Vector Core核数的配置。
 
       - 针对Broadcast算子，建议至少分配ranksize个vector核。
@@ -173,7 +201,7 @@ typedef struct HcclCommConfigDef {
 
   - 3：通信算子在Device侧的Vector Core计算单元展开。
     - 该配置仅支持对称组网、推理特性。
-    - 该配置下，若数据量不满足在“Vector Core”上的运行要求，部分算子会自动切换到默认模式。
+    - 部分HCCL算子在数据量不满足Vector Core运行要求时，会自动回退到默认展开模式下发。
     - 该配置项仅支持Broadcast、AllReduce、AlltoAll、AlltoAllV、AlltoAllVC、AllGather、ReduceScatter、AllGatherV、ReduceScatterV算子。
       - 针对Broadcast算子，数据类型支持int8、uint8、int16、uint16、int32、uint32、float16、float32、bfp16，仅支持单机场景8卡以内的单算子模式。
       - 针对AllReduce算子，数据类型支持int8、int16、int32、float16、float32、bfp16，reduce的操作类型仅支持sum、max、min。
@@ -288,7 +316,9 @@ typedef struct HcclCommConfigDef {
 
 - **hcclSymWinMaxMemSizePerRank**：Atlas A3系列产品的HCCS场景下，为当前通信域中每个rank预留的对称内存大小，单位GB，取值范围：\[1, 当前环境中允许分配的物理内存最大值\]，默认值16。该参数仅在Atlas A3系列产品的HCCS场景下生效。Ascend 950PR&950DT系列产品的URMA场景使用已申请的Device内存注册对称内存窗口，不依赖该参数配置预留的对称内存大小。
 
-- **hcclChannelSqDepth**：用于配置通信发送队列（SQ）深度，目前仅在A5场景下支持，且仅在AIV展开模式和UB_CTP、UB_RTP协议下可配置。配置值会向上调整为最近的2的整数次幂，调整后的有效取值范围为[16, 设备的max_jfs_depth]。其余场景下保持为无效值。
+- **hcclChannelSqDepth**：用于配置通信发送队列（SQ）深度，目前仅在A5场景下支持，且仅在AIV展开模式和UB_CTP、UB_RTP协议下可配置。配置值会向上调整为最近的2的整数次幂，调整后的有效取值范围为[16, 设备的max_jfs_depth]。其余场景下保持为无效值。当hcclChannelSqDepth与hcclChannelScqDepth同时配置时，hcclChannelScqDepth不得小于hcclChannelSqDepth（HOST、AIV场景），否则通道创建返回HCCL_E_PARA。
+
+- **hcclChannelScqDepth**：用于配置通信发送完成队列（SCQ）深度，目前仅在A5场景下支持，且仅在AIV展开模式和UB_CTP、UBC_TP、UB_RTP协议下可配置。配置值会向上调整为最近的2的整数次幂，调整后的有效取值范围为[64, 32768]。未配置时使用默认深度32768。其余场景下保持为无效值。当hcclChannelSqDepth与hcclChannelScqDepth同时配置时，hcclChannelScqDepth不得小于hcclChannelSqDepth（HOST、AIV场景），否则通道创建返回HCCL_E_PARA。
 
 
 ## 配置优先级说明

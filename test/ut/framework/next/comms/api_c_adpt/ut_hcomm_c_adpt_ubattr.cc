@@ -12,7 +12,7 @@
 #include "mockcpp/mokc.h"
 #include <mockcpp/mockcpp.hpp>
 #include "hcomm_c_adpt.h"
-#include "hcomm_result_defs.h"
+#include "common/result_defs_pub.h"
 #include "hcomm_res_defs.h"
 #include "hcomm_channel.h"
 #include "adapter_rts.h"
@@ -112,6 +112,68 @@ TEST_F(CheckUbAttrTest, Ut_CheckUbAttr_When_SqDepthIs100_Expect_ReturnHCCL_SUCCE
     EXPECT_EQ(channelDesc.ubAttr.sqDepth, 128);
 }
 
+TEST_F(CheckUbAttrTest, Ut_CheckUbAttr_When_ScqDepthIsNotSet_Expect_RemainNotSet)
+{
+    HcommChannelDesc channelDesc{};
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_CTP;
+    channelDesc.ubAttr.sqDepth = 0xFFFFFFFFU;
+    channelDesc.ubAttr.scqDepth = 0xFFFFFFFFU;
+
+    HcommResult ret = CheckUbAttr(channelDesc, COMM_ENGINE_AICPU);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(channelDesc.ubAttr.sqDepth, 0xFFFFFFFFU);
+    EXPECT_EQ(channelDesc.ubAttr.scqDepth, 0xFFFFFFFFU);
+}
+
+TEST_F(CheckUbAttrTest, Ut_CheckUbAttr_When_ScqDepthIs64_Expect_ReturnHCCL_SUCCESS_And_AdjustTo64)
+{
+    HcommChannelDesc channelDesc{};
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_CTP;
+    channelDesc.ubAttr.sqDepth = 0xFFFFFFFFU;
+    channelDesc.ubAttr.scqDepth = 64;
+
+    HcommResult ret = CheckUbAttr(channelDesc, COMM_ENGINE_AICPU);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(channelDesc.ubAttr.scqDepth, 64);
+}
+
+TEST_F(CheckUbAttrTest, Ut_CheckUbAttr_When_ScqDepthIs63_Expect_ReturnHCCL_SUCCESS_And_AdjustTo64)
+{
+    HcommChannelDesc channelDesc{};
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_CTP;
+    channelDesc.ubAttr.sqDepth = 0xFFFFFFFFU;
+    channelDesc.ubAttr.scqDepth = 63;
+
+    HcommResult ret = CheckUbAttr(channelDesc, COMM_ENGINE_AICPU);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(channelDesc.ubAttr.scqDepth, 64U);
+}
+
+TEST_F(CheckUbAttrTest, Ut_CheckUbAttr_When_ScqDepthIs100_Expect_ReturnHCCL_SUCCESS_And_AdjustTo128)
+{
+    HcommChannelDesc channelDesc{};
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_CTP;
+    channelDesc.ubAttr.sqDepth = 0xFFFFFFFFU;
+    channelDesc.ubAttr.scqDepth = 100;
+
+    HcommResult ret = CheckUbAttr(channelDesc, COMM_ENGINE_AICPU);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(channelDesc.ubAttr.scqDepth, 128);
+}
+
+TEST_F(CheckUbAttrTest, Ut_CheckUbAttr_When_SqAndScqDepthAreNotPowerOfTwo_Expect_AdjustBoth)
+{
+    HcommChannelDesc channelDesc{};
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_CTP;
+    channelDesc.ubAttr.sqDepth = 100;
+    channelDesc.ubAttr.scqDepth = 100;
+
+    HcommResult ret = CheckUbAttr(channelDesc, COMM_ENGINE_AICPU);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(channelDesc.ubAttr.sqDepth, 128);
+    EXPECT_EQ(channelDesc.ubAttr.scqDepth, 128);
+}
+
 class HcommChannelDescInitTest : public testing::Test {
 protected:
     static void SetUpTestCase() { std::cout << "HcommChannelDescInitTest tests set up." << std::endl; }
@@ -172,7 +234,7 @@ TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_QosUnset_KeepOriginalSlTc)
     channelDesc.roceAttr.tc = 120;
     channelDesc.qos = 0xFFFFFFFFU;
 
-    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST), HCCL_SUCCESS);
+    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST, nullptr), HCCL_SUCCESS);
     EXPECT_EQ(channelDesc.roceAttr.sl, 3);
     EXPECT_EQ(channelDesc.roceAttr.tc, 120);
 }
@@ -189,7 +251,7 @@ TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_QosSet_MapsSlAndDefaultDscpTc)
     channelDesc.roceAttr.tc = 120;
     channelDesc.qos = 4; // 未配置 qos_dscp 时回退默认 DSCP=33，TC=33<<2
 
-    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST), HCCL_SUCCESS);
+    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST, nullptr), HCCL_SUCCESS);
     EXPECT_EQ(channelDesc.roceAttr.sl, 4);
     EXPECT_EQ(channelDesc.roceAttr.tc, static_cast<uint8_t>(33U << 2U));
 }
@@ -230,7 +292,7 @@ TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_LocalHostLoc_UsesPeerOnlineHccnMod
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 4;
 
-    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST), HCCL_SUCCESS);
+    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST, nullptr), HCCL_SUCCESS);
     EXPECT_EQ(gCapturedRaGetHccnCfgMode, static_cast<uint32_t>(NETWORK_PEER_ONLINE));
 }
 
@@ -252,7 +314,7 @@ TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_LocalDeviceLoc_UsesOfflineHccnMode
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 4;
 
-    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE), HCCL_SUCCESS);
+    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr), HCCL_SUCCESS);
     EXPECT_EQ(gCapturedRaGetHccnCfgMode, static_cast<uint32_t>(NETWORK_OFFLINE));
 }
 
@@ -265,7 +327,7 @@ TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_UnsupportedLocType_Expect_E_PARA)
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 4;
 
-    EXPECT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_RESERVED), HCCL_E_PARA);
+    EXPECT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_RESERVED, nullptr), HCCL_E_PARA);
 }
 
 TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_DeviceTypeNot950Or960_Expect_SkipQosCompat)
@@ -279,7 +341,7 @@ TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_DeviceTypeNot950Or960_Expect_SkipQ
     channelDesc.roceAttr.tc = 120;
     channelDesc.qos = 4;
 
-    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST), HCCL_SUCCESS);
+    ASSERT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST, nullptr), HCCL_SUCCESS);
     EXPECT_EQ(channelDesc.roceAttr.sl, 3);
     EXPECT_EQ(channelDesc.roceAttr.tc, 120);
 }
@@ -293,5 +355,5 @@ TEST_F(CheckUbAttrTest, Ut_CheckRoceAttr_When_DeviceTypeInvalid_Expect_ReturnHCC
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 4;
 
-    EXPECT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST), HCCL_E_PARA);
+    EXPECT_EQ(CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST, nullptr), HCCL_E_PARA);
 }

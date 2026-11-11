@@ -15,7 +15,7 @@
 #include <vector>
 #include <string>
 #include "reged_mem_mgr.h"
-#include "rma_buffer_mgr.h"
+#include "common/rma_buffer_mgr_pub.h"
 #include "buffer_key.h"
 #include "local_ub_rma_buffer.h"
 #include "remote_rma_buffer.h"
@@ -41,6 +41,8 @@ private:
     mutable std::mutex memMtx_;
     std::unique_ptr<LocalIpcRmaBufferMgr> localIpcRmaBufferMgr_{};
     std::vector<RegedBufferEntry<Hccl::LocalIpcRmaBuffer>> allRegisteredBuffers_;
+    // 注册记录（按注册顺序），供 GetAllMemHandles 枚举；注销时由 UnregisterMemoryImpl 同步移除
+    std::vector<std::shared_ptr<Hccl::LocalIpcRmaBuffer>> handlesRecords_;
 };
 } // namespace hcomm
 

@@ -25,7 +25,6 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/src/plugin/runner/runner_utils
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/include/store
-    ${CMAKE_SOURCE_DIR}/include/runnerdb
     ${CMAKE_SOURCE_DIR}/third_party/CLI11
     ${YAMLCPP_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/third_party/nlohmann_json
@@ -109,6 +108,27 @@ target_include_directories(test_task_graph_sync_conflict_v3 BEFORE PRIVATE
 )
 target_link_libraries(test_task_graph_sync_conflict_v3 PRIVATE ${CHECKER_LIBC_SEC})
 configure_checker_test(test_task_graph_sync_conflict_v3)
+
+add_executable(test_ccu_loop_parallel_boundary_v3
+    task_graph_generator_v3/ccu_loop_parallel_boundary_v3_test.cc
+    main.cc
+)
+target_sources(test_ccu_loop_parallel_boundary_v3 PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/plugin/checker/src/framework/task_graph_generator_v3/task_def_v3.cc
+    ${CMAKE_SOURCE_DIR}/src/plugin/checker/src/framework/task_graph_generator_v3/task_graph_generator_v3.cc
+    ${CMAKE_SOURCE_DIR}/src/plugin/checker/src/framework/task_graph_generator_v3/ccu_graph_generator_v3/ccu_task_common_v3.cc
+    ${CMAKE_SOURCE_DIR}/src/plugin/checker/src/dfx/ccu_resource_stats_dfx.cc
+    ${CHECKER_LOG_SRC}
+)
+target_include_directories(test_ccu_loop_parallel_boundary_v3 BEFORE PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/plugin/checker/src/framework/task_graph_generator_v3
+    ${CMAKE_SOURCE_DIR}/src/plugin/checker/src/utils
+    ${CMAKE_SOURCE_DIR}/src/plugin/checker/src/log
+)
+target_compile_options(test_ccu_loop_parallel_boundary_v3 PRIVATE -ffunction-sections -fdata-sections)
+target_link_options(test_ccu_loop_parallel_boundary_v3 PRIVATE -Wl,--gc-sections)
+target_link_libraries(test_ccu_loop_parallel_boundary_v3 PRIVATE ${CHECKER_LIBC_SEC})
+configure_checker_test(test_ccu_loop_parallel_boundary_v3)
 
 add_executable(test_task_graph_mem_conflict_v3
     task_graph_generator_v3/task_graph_mem_conflict_v3_test.cc

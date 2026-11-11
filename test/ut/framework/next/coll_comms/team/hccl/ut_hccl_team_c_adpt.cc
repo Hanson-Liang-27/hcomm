@@ -31,7 +31,7 @@
 #include "hccl_team_c_adpt.h"
 #include "hcomm_team_c_adpt.h"
 #include "hcomm_team_mgr.h"
-#include "hcomm_result_defs.h"
+#include "common/result_defs_pub.h"
 #include "hccl/hccl_res.h"
 #include "hccl/hccl_channel.h"
 #include "hccl/hccl_rank_graph.h"
@@ -311,6 +311,7 @@ protected:
         MOCKER(HcclRankGraphGetLinks).stubs().will(invoke(StubRankGraphGetLinks));
         MOCKER(HcclChannelAcquire).stubs().will(invoke(StubChannelAcquireFill));
         MOCKER(HcclChannelGetRemoteMems).stubs().will(invoke(StubChannelGetRemoteMemsSync));
+        MOCKER(HcclChannelDestroy).stubs().will(returnValue(HCCL_SUCCESS));
     }
 
     std::shared_ptr<hccl::hcclComm> hcclCommPtr;

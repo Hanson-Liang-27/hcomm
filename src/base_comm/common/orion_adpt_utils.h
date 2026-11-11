@@ -11,26 +11,28 @@
 #ifndef ORION_ADPT_UTILS_H
 #define ORION_ADPT_UTILS_H
 
-#include "hccl/hccl_types.h"
-#include "hcomm_res_defs.h"
 #include "hccl_net_dev_defs.h"
-#include "hccp_ctx.h"
 #include "hcomm_adapter_hccp.h"
+#include "common/orion_adpt_utils_pub.h"
+#include "hccl_ip_address.h"
 
 // Orion
-#include "ip_address.h"
 #include "virtual_topo.h"
 
 namespace hcomm {
+
+HcclResult IpAddressToCommAddr(const Hccl::IpAddress& ipAddr, CommAddr& commAddr);
 
 constexpr u32 UB_SQ_DEPTH_MIN = 16U;
 constexpr u32 UB_SCQ_DEPTH_MIN = 64U;
 constexpr u32 UB_SCQ_DEPTH_MAX_NORMAL = 32768U;     // Host UB (normal 模式)
 constexpr u32 UB_SCQ_DEPTH_MAX_STARS_POLL = 16384U; // AICPU UB (stars poll 模式)
+constexpr u32 UB_SQ_DEPTH_NOT_SET = 0xFFFFFFFFU;    // sqDepth 哨兵值，表示使用默认值
 constexpr u32 UB_SCQ_DEPTH_NOT_SET = 0xFFFFFFFFU;   // scqDepth 哨兵值，表示使用默认值
 
 HcclResult CommAddrToIpAddress(const CommAddr& commAddr, Hccl::IpAddress& ipAddr);
-HcclResult IpAddressToCommAddr(const Hccl::IpAddress& ipAddr, CommAddr& commAddr);
+Hccl::IpAddress HcclIpAddressToIpAddress(const hccl::HcclIpAddress& v1);
+hccl::HcclIpAddress IpAddressToHcclIpAddress(const Hccl::IpAddress& v2);
 HcclResult CommProtocolToLinkProtocol(CommProtocol commProtocol, Hccl::LinkProtocol& linkProtocol);
 HcclResult CommAddrTypeToHcclAddressType(CommAddrType commAddrType, HcclAddressType& hcclAddressType);
 Hccl::LinkData BuildDefaultLinkData();

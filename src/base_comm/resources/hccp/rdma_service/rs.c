@@ -297,8 +297,7 @@ STATIC int RsInitRscbCfg(struct rs_cb *rscb)
         -EINVAL);
 #ifdef CUSTOM_INTERFACE
     if (RsIsUdmaSupported() || RsIsRdmaSupported()) {
-        ret = RsGetChipProtocol(rscb->chipId, rscb->hccpMode, &rscb->protocol, rscb->logicId);
-        CHK_PRT_RETURN(ret != 0, hccp_err("rs_get_chip_protocol failed, ret[%d]", ret), ret);
+        rscb->protocol = RsIsUdmaSupported() ? PROTOCOL_UDMA : PROTOCOL_RDMA;
         // make sure RsRoceGetApiVersion and RsNetGetApiVersion are valid
         ret = RsCtxApiInit(rscb->hccpMode, rscb->protocol);
         CHK_PRT_RETURN(ret != 0, hccp_err("rs_ctx_api_init failed, ret[%d]", ret), ret);
@@ -316,6 +315,13 @@ STATIC int RsInitRscbCfg(struct rs_cb *rscb)
     }
 
 #endif
+
+    ret = RsInitDevEidInfoCb(rscb);
+    if (ret != 0) {
+        hccp_warn("RsInitDevEidInfoCb unsuccessful, chipId:%u, ret:%d, eid query will be unavailable", rscb->chipId,
+            ret);
+        ret = 0;
+    }
 
     ret = rs_ssl_init(rscb);
     if (ret != 0) {
@@ -338,6 +344,7 @@ STATIC int RsInitRscbCfg(struct rs_cb *rscb)
 create_pthread_err:
     rs_ssl_deinit(rscb);
 ssl_init_err:
+    RsDeinitDevEidInfoCb(rscb);
 #ifdef CUSTOM_INTERFACE
     if (RsIsUdmaSupported() || RsIsRdmaSupported()) {
         RsDeInitNetAdapt(rscb);
@@ -356,6 +363,7 @@ STATIC void RsDeinitRscbCfg(struct rs_cb *rscb)
     eventfd_t event = 1;
     int ret;
 
+    RsDeinitDevEidInfoCb(rscb);
 #ifdef CUSTOM_INTERFACE
     if (RsIsUdmaSupported() || RsIsRdmaSupported()) {
         RsDeInitNetAdapt(rscb);
@@ -441,7 +449,7 @@ RS_ATTRI_VISI_DEF int RsInit(struct RsInitConfig *cfg)
 
     ret = getifaddrs(&rscb->ifaddrList);
     if (ret != 0) {
-        hccp_err("getifaddrs failed, ret:%d", ret);
+        hccp_err("getifaddrs failed, ret:%d, errno:%d", ret, errno);
         goto getifaddrs_err;
     }
 
@@ -718,7 +726,7 @@ int RsQueryGid(struct rdev rdevInfo, struct ibv_context *ibCtxTmp, uint8_t ibPor
         ret = RsCompareIpGid(rdevInfo, &gidTmp);
         if (ret == 0) {
             CHK_PRT_RETURN(attr.state != IBV_PORT_ACTIVE,
-                hccp_err("port number %u state is %s", ibPort, portStates[attr.state]), -ENOLINK);
+                hccp_run_warn("port number %u state is %s", ibPort, portStates[attr.state]), -ENOLINK);
             *gidIdx = i;
             return 0;
         }
@@ -827,7 +835,11 @@ STATIC int RsGetIbCtxAndRdevIndex(struct rdev rdevInfo, struct RsRdevCb *rdevCb,
             RsIbvCloseDevice(ibCtxTmp);
         } else {
             RsIbvCloseDevice(ibCtxTmp);
-            hccp_err("rs_query_gid failed, ret:%d", ret);
+            if (ret == -ENOLINK) {
+                hccp_warn_rma("rs_query_gid unsuccessful, ret:%d", ret);
+            } else {
+                hccp_err("rs_query_gid failed, ret:%d", ret);
+            }
             return ret;
         }
     }
@@ -938,7 +950,11 @@ STATIC int RsRdevCbInit(struct rdev rdevInfo, struct RsRdevCb *rdevCb, struct rs
 
     ret = RsGetIbCtxAndRdevIndex(rdevInfo, rdevCb, rdevIndex);
     if (ret) {
-        hccp_err("rs_get_ib_ctx_and_rdev_index failed, ret:%d", ret);
+        if (ret == -ENOLINK) {
+            hccp_warn_rma("rs_get_ib_ctx_and_rdev_index unsuccessful, ret:%d", ret);
+        } else {
+            hccp_err("rs_get_ib_ctx_and_rdev_index failed, ret:%d", ret);
+        }
         goto destroy_cqe_mutex;
     }
 
@@ -1071,7 +1087,11 @@ STATIC int RsRdevInitWithBackupInfo(struct rdev rdevInfo, struct RsBackupInfo ba
     ret = RsRdevCbInit(rdevInfo, rdevCb, rsCb, rdevIndex);
     if (ret != 0) {
         RsSensorNodeUnregister(rdevCb->rsCb);
-        hccp_err("rs_rdev_cb_init failed ret %d!, normal ret 0", ret);
+        if (ret == -ENOLINK) {
+            hccp_warn_rma("rs_rdev_cb_init unsuccessful ret %d!, normal ret 0", ret);
+        } else {
+            hccp_err("rs_rdev_cb_init failed ret %d!, normal ret 0", ret);
+        }
         goto free_dev_list;
     }
 
@@ -1437,8 +1457,8 @@ STATIC void RsFreeConnOneNode(struct rs_cb *rscb, struct RsConnInfo *conn)
 
     RS_CLOSE_RETRY_FOR_EINTR(ret, conn->connfd);
 
-    hccp_info_socket("free for conn IP:%s, port:%d, connfd:%d, state:%u", conn->clientIp.readAddr, conn->port,
-        conn->connfd, conn->state);
+    hccp_info_socket("free for conn IP:%s, port:%d, connfd:%d, state:%u, tag:%s", conn->clientIp.readAddr, conn->port,
+        conn->connfd, conn->state, conn->tag);
 
     conn->connfd = RS_FD_INVALID;
     conn->state = RS_CONN_STATE_RESET;
@@ -1832,6 +1852,7 @@ STATIC void RsDeinitFreeRscb(struct rs_cb *rscb)
         }
     }
 #endif
+    RsDeinitDevEidInfoCb(rscb);
     pthread_mutex_destroy(&rscb->mutex);
     pthread_mutex_destroy(&rscb->connCb.connMutex);
     RsDestroyEpoll(rscb);
@@ -2212,6 +2233,30 @@ RS_ATTRI_VISI_DEF int RsGetSecRandom(unsigned int *value)
     return ret;
 }
 
+STATIC enum ProductType RsParseProductType(const char *chipName)
+{
+    static const struct {
+        const char *pattern;
+        enum ProductType type;
+    } productTypeTable[] = {
+        {"910_93[a-zA-Z1-9_]*", PRODUCT_TYPE_910_93},
+        {"910B[a-zA-Z1-9_]*", PRODUCT_TYPE_910B},
+        {"960[a-zA-Z1-9_]*", PRODUCT_TYPE_960},
+        {"910[a-zA-Z1-9]*", PRODUCT_TYPE_910},
+        {"310p[a-zA-Z1-9]*", PRODUCT_TYPE_310p},
+        {"950[a-zA-Z1-9]*", PRODUCT_TYPE_950},
+        {"350[a-zA-Z1-9_]*", PRODUCT_TYPE_350},
+    };
+    unsigned int i;
+
+    for (i = 0; i < sizeof(productTypeTable) / sizeof(productTypeTable[0]); i++) {
+        if (fnmatch(productTypeTable[i].pattern, chipName, 0) == 0) {
+            return productTypeTable[i].type;
+        }
+    }
+    return PRODUCT_TYPE_OTHERS;
+}
+
 RS_ATTRI_VISI_DEF enum ProductType RsGetProductType(int devId)
 {
     static enum ProductType type = PRODUCT_TYPE_NO_VALUE;
@@ -2229,24 +2274,7 @@ RS_ATTRI_VISI_DEF enum ProductType RsGetProductType(int devId)
 
     CHK_PRT_RETURN(ret != 0, hccp_err("[Get][ChipInfo]DlHalGetChipInfo failed ret:%d", ret), PRODUCT_TYPE_INVALID);
 
-    if (fnmatch("910_93[a-zA-Z1-9_]*", (const char *)chipInfo.name, 0) == 0) {
-        type = PRODUCT_TYPE_910_93;
-    } else if (fnmatch("910B[a-zA-Z1-9_]*", (const char *)chipInfo.name, 0) == 0) {
-        type = PRODUCT_TYPE_910B;
-    } else if (fnmatch("960[a-zA-Z1-9_]*", (const char *)chipInfo.name, 0) == 0) {
-        type = PRODUCT_TYPE_960;
-    } else if (fnmatch("910[a-zA-Z1-9]*", (const char *)chipInfo.name, 0) == 0) {
-        type = PRODUCT_TYPE_910;
-    } else if (fnmatch("310p[a-zA-Z1-9]*", (const char *)chipInfo.name, 0) == 0) {
-        type = PRODUCT_TYPE_310p;
-    } else if (fnmatch("950[a-zA-Z1-9]*", (const char *)chipInfo.name, 0) == 0) {
-        type = PRODUCT_TYPE_950;
-    } else if (fnmatch("350[a-zA-Z1-9]*", (const char *)chipInfo.name, 0) == 0) {
-        type = PRODUCT_TYPE_350;
-    } else {
-        type = PRODUCT_TYPE_OTHERS;
-    }
-
+    type = RsParseProductType((const char *)chipInfo.name);
     hccp_run_info("[Get][ChipInfo]chip name is %s, type:%d", chipInfo.name, type);
     return type;
 }

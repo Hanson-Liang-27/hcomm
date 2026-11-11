@@ -82,6 +82,28 @@ static HcclResult ApplyHcclSqDepth(const HcclCommConfig* hcclCommConfig, CommCon
     return HCCL_SUCCESS;
 }
 
+static HcclResult ApplyHcclScqDepth(const HcclCommConfig* hcclCommConfig, CommConfig& commConfig)
+{
+    if (hcclCommConfig == nullptr) {
+        return HCCL_SUCCESS;
+    }
+
+    uint32_t configVersion = 0U;
+    CHK_RET(GetHcclCommConfigVersion(hcclCommConfig, configVersion));
+    if (configVersion < HCCL_COMM_CONFIG_SCQ_DEPTH_VERSION) {
+        HCCL_RUN_INFO(
+            "[%s] skip hcclScqDepth by version, configVersion[%u] < "
+            "HCCL_COMM_CONFIG_SCQ_DEPTH_VERSION[%u]",
+            __func__, configVersion, HCCL_COMM_CONFIG_SCQ_DEPTH_VERSION);
+        return commConfig.SetConfigScqDepth(HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET);
+    }
+
+    const uint32_t scqDepth = hcclCommConfig->hcclChannelScqDepth;
+    CHK_RET(commConfig.SetConfigScqDepth(scqDepth));
+    HCCL_RUN_INFO("[%s] hcclScqDepth[%u]", __func__, scqDepth);
+    return HCCL_SUCCESS;
+}
+
 static HcclResult ApplyTrafficClassAndServiceLevel(const HcclCommConfig* hcclCommConfig, CommConfig& commConfig)
 {
     if (hcclCommConfig == nullptr) {
@@ -148,6 +170,7 @@ HcclResult ApplyHcclCommConfig(
     opExpansionMode = hcclCommConfig->hcclOpExpansionMode;
     CHK_RET(ApplyTrafficClassAndServiceLevel(hcclCommConfig, commConfig));
     CHK_RET(ApplyHcclQos(hcclCommConfig, commConfig));
+    CHK_RET(commConfig.SetConfigSymmetricMemoryStride(hcclCommConfig->hcclSymWinMaxMemSizePerRank));
 
     if (hcclCommConfig->hcclAlgo[0] != '\0') {
         size_t algoLen = strnlen(hcclCommConfig->hcclAlgo, static_cast<size_t>(HCCL_COMM_ALGO_MAX_LENGTH));
@@ -155,9 +178,14 @@ HcclResult ApplyHcclCommConfig(
     }
     if (hcclCommConfig->hcclUdi[0] != '\0') {
         size_t udiLen = strnlen(hcclCommConfig->hcclUdi, UDI_MAX_LENGTH);
-        CHK_RET(commConfig.SetConfigUdi(std::string(hcclCommConfig->hcclUdi, udiLen)));
+        const std::string hcclUdi(hcclCommConfig->hcclUdi, udiLen);
+        CHK_RET(commConfig.SetConfigUdi(hcclUdi));
+        HCCL_INFO(
+            "[ApplyHcclCommConfig] set hcclUdi, commName[%s], hcclUdi[%s].", commConfig.GetConfigCommName().c_str(),
+            hcclUdi.c_str());
     }
     CHK_RET(ApplyHcclSqDepth(hcclCommConfig, commConfig));
+    CHK_RET(ApplyHcclScqDepth(hcclCommConfig, commConfig));
     return HCCL_SUCCESS;
 }
 } // namespace hccl

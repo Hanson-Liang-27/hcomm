@@ -1354,6 +1354,36 @@ RS_ATTRI_VISI_DEF int RsRdevGetPortStatus(unsigned int phyId, unsigned int rdevI
     return 0;
 }
 
+RS_ATTRI_VISI_DEF int RsRdevGetAttr(unsigned int phyId, unsigned int rdevIndex, struct RdevAttr *attr)
+{
+    struct ibv_port_attr portAttr = {0};
+    struct RsRdevCb *rdevCb = NULL;
+    int ret;
+
+    CHK_PRT_RETURN(phyId >= RS_MAX_DEV_NUM, hccp_err("phyId:%u >= [%d], is invalid", phyId, RS_MAX_DEV_NUM), -EINVAL);
+    CHK_PRT_RETURN(attr == NULL, hccp_err("param err! attr is NULL"), -EINVAL);
+
+    ret = RsQueryRdevCb(phyId, rdevIndex, &rdevCb);
+    CHK_PRT_RETURN(ret != 0, hccp_err("RsQueryRdevCb phyId:%u rdevIndex:%u ret:%d", phyId, rdevIndex, ret), ret);
+
+    ret = RsIbvQueryPort(rdevCb->ibCtx, rdevCb->ibPort, &portAttr);
+    CHK_PRT_RETURN(ret != 0, hccp_err("ibv_query_port failed ret[%d]", ret), -EOPENSRC);
+
+    attr->status = (portAttr.state == IBV_PORT_ACTIVE) ? PORT_STATUS_ACTIVE : PORT_STATUS_DOWN;
+    // Align with UB capability query: verbs only returns max_msg_sz, so the 3 union fields share one value.
+    attr->maxMsgSize = portAttr.max_msg_sz;
+    attr->maxQpWr = rdevCb->deviceAttr.max_qp_wr;
+    attr->maxCqe = rdevCb->deviceAttr.max_cqe;
+
+    // extDevCap 由 RsIbvQueryDeviceExtend 查询所得；仅当 D2N 直连形态为 UB 且网卡扩展能力支持 INLINE REDUCE 时才置位
+    attr->isInlineReduceSupported = ((rdevCb->directFlag == DIRECT_FLAG_UB) &&
+                                     ((rdevCb->extDevCap & IBV_EXTEND_DEV_INLINE_REDUCE) != 0));
+
+    hccp_dbg("phyId:%u status:%u maxMsgSize:%u maxQpWr:%u maxCqe:%u isInlineReduceSupported:%d", phyId, attr->status,
+        attr->maxMsgSize, attr->maxQpWr, attr->maxCqe, attr->isInlineReduceSupported);
+    return 0;
+}
+
 RS_ATTRI_VISI_DEF int RsGetNotifyMrInfo(unsigned int phyId, unsigned int rdevIndex, struct MrInfoT *info)
 {
     struct RsRdevCb *rdevCb = NULL;
@@ -2399,6 +2429,29 @@ STATIC void RsTypicalQpModifyInfoRelated(struct RsQpCb *qpCb, struct TypicalQp *
     (void)memcpy_s(qpCb->qpInfoRem.gid.raw, HCCP_GID_RAW_LEN, remoteQpInfo->gid, HCCP_GID_RAW_LEN);
 }
 
+STATIC int RsTypicalQpModifyUdpSport(struct RsQpCb *qpCb, uint32_t udpSport)
+{
+    struct ibv_qp_attr_extend attr = {0};
+    int ret = 0;
+
+    if (qpCb->rdevCb->ibCtxEx == NULL || udpSport == 0) {
+        return 0;
+    }
+
+    hccp_info_rma("qpn:%u udpSport:%u", qpCb->ibQp->qp_num, udpSport);
+    attr.qp = qpCb->ibQp;
+    attr.udp_src_port = udpSport;
+    ret = RsIbvModifyQpExtend(qpCb->rdevCb->ibCtxEx, &attr, IBV_QP_ATTR_EXTEND_UDP_SRC_PORT);
+    if (ret != 0) {
+        hccp_err("RsIbvModifyQpExtend udpSrcPort:%u failed, ret:%d qpn:%u errno:%d", attr.udp_src_port, ret,
+            qpCb->ibQp->qp_num, errno);
+        return ret;
+    }
+
+    qpCb->udpSport = udpSport;
+    return ret;
+}
+
 STATIC void RsTypicalQpModifyExtend(struct RsQpCb *qpCb, struct TypicalQp *localQpInfo, struct TypicalQp *remoteQpInfo)
 {
     struct ibv_hyroce_feature output = {0};
@@ -2432,9 +2485,7 @@ STATIC void RsTypicalQpModifyExtend(struct RsQpCb *qpCb, struct TypicalQp *local
 
     attr.qp = qpCb->ibQp;
     (void)memcpy_s(&attr.feature, sizeof(struct ibv_hyroce_feature), &output, sizeof(struct ibv_hyroce_feature));
-    attr.udp_src_port = localQpInfo->udpSport;
-    ret = RsIbvModifyQpExtend(qpCb->rdevCb->ibCtxEx, &attr,
-        IBV_QP_ATTR_EXTEND_UDP_SRC_PORT | IBV_QP_ATTR_EXTEND_HYROCE_FEATURE);
+    ret = RsIbvModifyQpExtend(qpCb->rdevCb->ibCtxEx, &attr, IBV_QP_ATTR_EXTEND_HYROCE_FEATURE);
     if (ret != 0) {
         hccp_warn_rma("RsIbvModifyQpExtend unsuccessful, ret:%d qpn:%u errno:%d", ret, qpCb->ibQp->qp_num, errno);
         return;
@@ -2514,6 +2565,12 @@ RS_ATTRI_VISI_DEF int RsTypicalQpModify(unsigned int phyId, unsigned int rdevInd
     CHK_PRT_RETURN(ret != 0,
         hccp_err("[modify]local_qpn:%u remote_qpn:%u modify to rts failed, ret %d", localQpInfo.qpn, remoteQpInfo.qpn,
             ret),
+        ret);
+
+    ret = RsTypicalQpModifyUdpSport(qpCb, localQpInfo.udpSport);
+    CHK_PRT_RETURN(ret != 0,
+        hccp_err("RsTypicalQpModifyUdpSport failed, ret:%d local_qpn:%u udpSport:%u", ret, localQpInfo.qpn,
+            localQpInfo.udpSport),
         ret);
 
     ret = RsTypicalQueryQpAttr(qpCb, qpAttr);

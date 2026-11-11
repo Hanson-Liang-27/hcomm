@@ -9,13 +9,14 @@
  */
 
 #include "coll_comm_aicpu_mgr.h"
+#include "aicpu_init_param.h"
 #include "ns_recovery/aicpu/ns_recovery_func_lite.h"
 #include "rtsq_poll/aicpu/coll_rtsq_poll_completion_daemon.h"
 #include "aicpu_daemon_service.h"
 #include "hcclCommTaskExceptionLite.h"
 #include "stream_task_monitor.h"
 #include "coll_comm_aicpu_destroy_func.h"
-#include "aicpu_indop_env.h"
+#include "common/device/aicpu_indop_env_pub.h"
 #include "config_plf_log_v2.h"
 #include "dlhal_function_v2.h"
 #include "profiling_command_handle_lite.h"
@@ -203,6 +204,11 @@ HcclResult CollCommAicpuMgr::DestroyComm(const std::string& group)
         HCCL_RUN_WARNING("[CollCommAicpuMgr][%s]legacy comm group [%s] is busy, skip erase", __func__, group.c_str());
         return HCCL_E_AGAIN;
     }
+
+    // 登记表条目存的是本通信域 taskexception 共享内存的 device VA，而那块内存由宿主侧 LegacyDpuThread 持有、
+    // 随宿主通信域销毁释放。条目须与通信域对象同生共死，否则同名通信域重建时 Init 的 Find 会取到已释放地址；
+    // 放在这里而不是销毁命令处理里，是为了让 busy 跳过销毁时条目也一并保留（通信域还在，地址就还得有效）
+    taskExpDevMemRegistry_.Erase(group, aicpuComm->GetHcclCommDfxLite()->GetTaskExpDevMem());
 
     commMap_.erase(group);
     HCCL_RUN_INFO("[CollCommAicpuMgr][%s]Destroy comm group [%s] success.", __func__, group.c_str());

@@ -26,15 +26,17 @@ static HcclResult WaitForJettyCreated(Hccl::DevUbConnection& conn, uint32_t time
             return HCCL_SUCCESS;
         }
         if (st == Hccl::RmaConnStatus::CONN_INVALID) {
-            HCCL_ERROR("[%s] temp connection became CONN_INVALID.", __func__);
+            HCCL_ERROR("[SharedJettyChannelHelper::%s] temp connection became CONN_INVALID.", __func__);
             return HCCL_E_INTERNAL;
         }
         if (st == Hccl::RmaConnStatus::CLOSE) {
-            HCCL_ERROR("[%s] temp connection CLOSED.", __func__);
+            HCCL_ERROR("[SharedJettyChannelHelper::%s] temp connection CLOSED.", __func__);
             return HCCL_E_INTERNAL;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
-            HCCL_ERROR("[%s] wait jetty create timeout[%ums].", __func__, timeoutMs);
+            HCCL_ERROR(
+                "[SharedJettyChannelHelper::%s] wait jetty create timeout[%ums], conn[%s].", __func__, timeoutMs,
+                conn.Describe().c_str());
             return HCCL_E_TIMEOUT;
         }
         constexpr uint32_t kRetrySleepMs = 2;
@@ -47,12 +49,12 @@ static HcclResult AllocAndZeroQueueIndex(void** ptr, uint64_t size, const char* 
 {
     HcclResult allocRet = hrtMalloc(ptr, size);
     if (allocRet != HCCL_SUCCESS || *ptr == nullptr) {
-        HCCL_ERROR("[%s] hrtMalloc %s failed, ret[%d].", __func__, name, allocRet);
+        HCCL_ERROR("[SharedJettyChannelHelper::%s] hrtMalloc %s failed, ret[%d].", __func__, name, allocRet);
         return HCCL_E_MEMORY;
     }
     aclError memsetRet = aclrtMemset(*ptr, size, 0, size);
     if (memsetRet != ACL_SUCCESS) {
-        HCCL_ERROR("[%s] aclrtMemset %s failed, ret[%d].", __func__, name, memsetRet);
+        HCCL_ERROR("[SharedJettyChannelHelper::%s] aclrtMemset %s failed, ret[%d].", __func__, name, memsetRet);
         (void)hrtFree(*ptr);
         *ptr = nullptr;
         return HCCL_E_MEMORY;
@@ -119,7 +121,25 @@ ProvideSharedJettyCtx(const TempConnFactory& tempConnFactory, uint64_t sharedQue
         cleanup();
         return transferRet;
     }
-    // 临时 connection 析构：ReleaseResource 跳过 DestroyJetty，ReleaseTp 释放 TP
+    // 移交 TP 引用所有权给 JettyContext：临时 connection 析构不再 ReleaseTp。
+    // 背景：临时 connection"申请即析构释放"会使 TpManager 缓存 useCnt 归零被 erase，
+    // 同（地址对 + qos）的后续申请逐个击穿缓存重复发起 get TP list 内核查询，高频建链下
+    // 内核 URMA 内存耗尽。移交后缓存条目随共享 jetty 生命周期保活。
+    // 无有效 TP 引用（tpHandle=0）或已移交过时回调置空，析构路径本就跳过释放，行为不变；
+    // jetty 所有权移交不回滚：即使 TP 移交真实失败，jetty 仍由 JettyContext 保管，
+    // TP 引用未移交，退化为临时 connection 析构释放的旧行为，仅丢失缓存保活优化，不影响正确性。
+    // 顺序不变量：本移交必须是 provideCtx 的最后一步，其后不得再插入可失败步骤——回调一旦填充，
+    // TP 引用的释放责任随之移交（connection 已置 releaseTpOnDestroy_=false）；若未来违反该顺序，
+    // 由 JettyContext::Acquire 第二段失败路径的回调兜底执行保护（见 jetty_context.cc 契约防御）。
+    HcclResult tpDetachRet = DetachConnTpOwnership(tempConn.get(), ctx.tpReleaseCb);
+    if (tpDetachRet != HCCL_SUCCESS) {
+        HCCL_WARNING(
+            "[%s] DetachConnTpOwnership ret[%d], tp ownership not transferred, tp ref falls back to release by "
+            "temp conn destroy.",
+            __func__, tpDetachRet);
+        ctx.tpReleaseCb = nullptr;
+    }
+    // 临时 connection 析构：jetty/JFC 与 TP 引用所有权均已移交，ReleaseResource 均跳过销毁/释放
     return HCCL_SUCCESS;
 }
 
@@ -143,7 +163,9 @@ HcclResult AcquireSharedJettyForChannel(
     JettyContext* jettyCtx = dynamic_cast<JettyContext*>(endpoint->GetCommQueueContext());
     CHK_PTR_NULL(jettyCtx);
     HcclResult ret = jettyCtx->Acquire(provideCtx, ctx);
-    CHK_PRT_RET(ret != HCCL_SUCCESS, HCCL_ERROR("[%s] Acquire shared jetty failed, ret[%d].", __func__, ret), ret);
+    CHK_PRT_RET(
+        ret != HCCL_SUCCESS,
+        HCCL_ERROR("[SharedJettyChannelHelper::%s] Acquire shared jetty failed, ret[%d].", __func__, ret), ret);
     outCtx = ctx;
 
     // 命中复用或首次创建完成：通过适配层填充 jetty 字段到主 connection
@@ -159,13 +181,16 @@ HcclResult AcquireSharedJettyForChannel(
     };
     HcclResult injectRet = SetSharedJettyFieldsToConn(connection, ctx, endpoint, std::move(releaseCb));
     if (injectRet != HCCL_SUCCESS) {
-        HCCL_ERROR("[%s] SetSharedJettyFields failed, ret[%d], rollback refCount.", __func__, injectRet);
+        HCCL_ERROR(
+            "[SharedJettyChannelHelper::%s] SetSharedJettyFields failed, ret[%d], rollback refCount.", __func__,
+            injectRet);
         (void)jettyCtx->Release();
         return injectRet;
     }
     HCCL_INFO(
-        "[%s] shared jetty acquired and fields set, handle[0x%llx], sqPi[%p] sqCi[%p] cqPi[%p] cqCi[%p].", __func__,
-        static_cast<unsigned long long>(ctx.handle), ctx.sqPiPtr, ctx.sqCiPtr, ctx.cqPiPtr, ctx.cqCiPtr);
+        "[SharedJettyChannelHelper::%s] shared jetty acquired and fields set, handle[0x%llx], sqPi[%p] sqCi[%p] "
+        "cqPi[%p] cqCi[%p].",
+        __func__, static_cast<unsigned long long>(ctx.handle), ctx.sqPiPtr, ctx.sqCiPtr, ctx.cqPiPtr, ctx.cqCiPtr);
     return HCCL_SUCCESS;
 }
 

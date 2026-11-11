@@ -442,21 +442,6 @@ void TcRaBatchSendWr()
     EXPECT_INT_EQ(0, ret);
 }
 
-void TcRaCtxUpdateCi()
-{
-    struct RaCtxQpHandle qpHandle = {0};
-    struct RaCtxHandle ctxHandle = {0};
-    int ret = 0;
-
-    mocker_clean();
-    mocker(RaHdcProcessMsg, 1, 0);
-    qpHandle.ctxHandle = &ctxHandle;
-    ctxHandle.ctxOps = &gRaHdcCtxOps;
-    ret = RaCtxUpdateCi(&qpHandle, 1);
-    EXPECT_INT_EQ(0, ret);
-    mocker_clean();
-}
-
 void TcRaGetTpInfoListAsync()
 {
     struct HccpTpInfo infoList[HCCP_MAX_TPID_INFO_NUM] = {0};
@@ -2266,18 +2251,11 @@ void TcRaCtxNotifyEvent()
     EXPECT_INT_EQ(ret, ROCE_EINVAL);
 
     ctxHandle.ctxOps = &gRaHdcCtxOps;
-    mocker(RaHdcHasCapability, 1, 0);
-    ret = RaCtxNotifyEvent(&ctxHandle, &event);
-    EXPECT_INT_EQ(ret, ROCE_ENOTSUPP);
-    mocker_clean();
-
-    mocker(RaHdcHasCapability, 1, 1);
     mocker(RaHdcCtxNotifyEvent, 1, -1);
     ret = RaCtxNotifyEvent(&ctxHandle, &event);
     EXPECT_INT_EQ(ret, 128100);
     mocker_clean();
 
-    mocker(RaHdcHasCapability, 1, 1);
     mocker(RaHdcCtxNotifyEvent, 1, 0);
     ret = RaCtxNotifyEvent(&ctxHandle, &event);
     EXPECT_INT_EQ(ret, 0);

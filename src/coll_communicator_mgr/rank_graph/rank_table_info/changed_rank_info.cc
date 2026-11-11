@@ -13,7 +13,6 @@
 #include <unordered_map>
 #include <sstream>
 #include "json_parser.h"
-#include "exception_util.h"
 #include "log.h"
 #include "adapter_error_manager_pub.h"
 #include "rank_table_report_macro.h"
@@ -38,26 +37,30 @@ void ChangedRankInfo::Dump() const
     }
 }
 
-void ChangedRankInfo::Deserialize(const nlohmann::json& changedRankInfoJson, RankTableSource source)
+HcclResult ChangedRankInfo::Deserialize(const nlohmann::json& changedRankInfoJson, RankTableSource source)
 {
-    std::string msgVersion = "[ChangedRankInfo] error occurs when parser object of propName \"version\"";
-    std::string msgRankcount = "[ChangedRankInfo] error occurs when parser object of propName \"rank_count\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgVersion, (version = GetJsonProperty(changedRankInfoJson, "version")),
-        changedRankInfoJson, "version", "non-empty string", source);
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgRankcount, (rankCount = GetJsonPropertyUInt(changedRankInfoJson, "rank_count")),
-        changedRankInfoJson, "rank_count", "0 ~ UINT32_MAX", source);
+    HcclResult ret = GetJsonProperty(changedRankInfoJson, "version", true, version);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(changedRankInfoJson, "version", "non-empty string", source);
+        return ret;
+    }
+    ret = GetJsonPropertyUInt(changedRankInfoJson, "rank_count", true, 0, rankCount);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(changedRankInfoJson, "rank_count", "0 ~ UINT32_MAX", source);
+        return ret;
+    }
 
     nlohmann::json rankJsons;
-    std::string msgRanklist = "error occurs when parser object of propName \"rank_list\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgRanklist, (GetJsonPropertyList(changedRankInfoJson, "rank_list", rankJsons)),
-        changedRankInfoJson, "rank_list", "array", source);
+    ret = GetJsonPropertyList(changedRankInfoJson, "rank_list", rankJsons);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(changedRankInfoJson, "rank_list", "array", source);
+        return ret;
+    }
     for (auto& rankJson : rankJsons) {
         NewRankInfo rankInfo;
-        rankInfo.Deserialize(rankJson, source);
+        CHK_RET(rankInfo.Deserialize(rankJson, source));
         ranks.emplace_back(rankInfo);
     }
+    return HCCL_SUCCESS;
 }
 } // namespace Hccl

@@ -12,6 +12,10 @@
 #define HCCL_COMMUNICATOR_IMPL_H
 
 #include <set>
+#include <map>
+#include <shared_mutex>
+#include <tuple>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #include <mutex>
@@ -53,7 +57,6 @@
 #include "error_message_v2.h"
 #include "hccp.h"
 #include "aicpu/launch_device_v2.h"
-#include "communicator_dpu_types.h"
 
 namespace Hccl {
 
@@ -225,9 +228,6 @@ public:
     HcclResult GetLocalCclBuffer(void** addr, uint64_t* size);
     HcclResult GetDevMemWorkSpace(const std::string& memTag, uint64_t* size, void** addr, bool* newCreated);
     HcclResult CreateWorkspaceBuf(const char* memTag, uint64_t* size, bool* newCreated);
-    HcclResult AllocAndRegKFCWorkSpace(uint64_t size, const std::string& memTag);
-    HcclResult GetKFCWorkSpaceVA(const std::string& memTag, const uint64_t* size, void** addr, bool* newCreated);
-    HcclResult DestroyKFCWorkSpaceVA();
 
     bool IsWorldGroup() const;
 
@@ -316,7 +316,7 @@ public:
 
     void SetAivCoreLimit(u32 newAivCoreLimit) { aivCoreLimit = newAivCoreLimit; }
     HcclResult CalcTaskNum(OpType opType, DataType dataType, u64 count, u32& taskNum) const;
-    void CollAlgComponentInit();
+    HcclResult CollAlgComponentInit();
 
     virtual CcuStreamSyncNotifyManager& GetCcuStreamSyncNotifyManager() const;
 
@@ -363,8 +363,6 @@ public:
     aclrtFuncHandle GetAicpuKernelFuncHandle(const char* kernelName) const;
     bool IsCommWithPCIEProtocol() const; // 判断通信域内是否有rank之间存在PCIE链路
     HcclResult Mc2AiCpuStreamAllocAndGetV2(rtStream_t* aiCpuStream);
-    HcclResult SaveDpuStreamId();
-    uint32_t GetDpuStreamId() const { return dpuStreamId; }
 
     HcclResult GetRankIpPortMap(RankIpPortMapPtr& rankIpPortMap);
     HcclResult SetRankIpPortMap(const RankIpPortMapPtr& rankIpPortMap);
@@ -384,7 +382,6 @@ private:
     HcclCommConfig config;
     std::string udi_;
     std::shared_ptr<RankGraph> rankGraph;
-    uint32_t dpuStreamId{0};
     unique_ptr<DataBufManager> dataBufferManager;
     unique_ptr<LocalRmaBufManager> localRmaBufManager;
     unique_ptr<RemoteRmaBufManager> remoteRmaBufManager;
@@ -419,12 +416,30 @@ private:
     unique_ptr<CcuStreamSyncNotifyManager> ccuStreamSyncNotifyManager;
     std::shared_ptr<CcuDriverHandle> ccuDrvHandle{nullptr};
 
-    std::vector<u32> netLayersVec;
-    std::vector<uint32_t> instSizeVec;
-    std::vector<uint32_t> rankListVec;
-    std::vector<CommLink> linkListVec;
-    std::vector<uint32_t> ranksVec;
-    std::vector<uint32_t> topoInstsVec;
+    // 六接口查询结果按入参缓存：条目写入后不再修改，返回指针在通信域销毁前始终有效。
+    // queryCacheMutex_只保护缓存表的查找/插入（读锁快路径、写锁慢路径），不覆盖借用期。
+    struct IdListCacheEntry {
+        std::vector<uint32_t> values;
+        uint32_t count{0};
+    };
+    struct LinkListCacheEntry {
+        std::vector<CommLink> values;
+        uint32_t count{0};
+    };
+    // rankGraph重建（快照恢复）后清空全部查询缓存
+    void ClearQueryCache();
+
+    mutable std::shared_mutex queryCacheMutex_;
+    // netLayers只依赖通信域，其余缓存按入参区分
+    bool netLayersCached_{false};
+    IdListCacheEntry netLayersCache_;
+    std::map<uint32_t, IdListCacheEntry> instRankListCache_; // key: netLayer
+    std::map<uint32_t, IdListCacheEntry> instSizeListCache_; // key: netLayer
+    std::map<uint32_t, IdListCacheEntry> topoInstsCache_;    // key: netLayer
+    // key: netLayer+srcRank+dstRank
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, LinkListCacheEntry> linkListCache_;
+    // key: netLayer+topoInstId
+    std::map<std::pair<uint32_t, uint32_t>, IdListCacheEntry> ranksByTopoInstCache_;
 
     NotifyTimeoutCfg notifyTimeoutCfg;
 
@@ -443,7 +458,6 @@ private:
     bool isSuspended = false;
     bool isCleaned = false;
     bool isAicpuKernelLaunched = false;
-    bool isDpuKernelLaunched = false;
     bool isWorldGroup = false;
     bool aivClearEnable = false;
 
@@ -460,14 +474,6 @@ private:
     std::shared_ptr<DevBuffer> barrierOutMemory;
     std::unordered_map<std::string, std::shared_ptr<DevBuffer>> tagWorkspaceMap_;
     bool isFirstBarrier = true;
-    DpuKernelLaunchParam hostArgs;
-    std::unordered_map<std::string, DpuShmem> tagDpuShmemArgsMap_
-        = {{"DPUTAG", DpuShmem{}}, {"DPUTASKEXCEPTION", DpuShmem{}}};
-    void* hostShareBuf{nullptr}; // 在dpu线程中，从DPUTAG共享内存拷出算法信息的存放地址，作为入参给算法注册的回调
-    std::unordered_map<std::string, std::shared_ptr<DevBuffer>> tagWorkspaceVAMap_;
-    aclrtStream dpuStream;
-    aclrtContext dpuContext;
-    aclrtContext npuContext;
 
     std::unordered_map<std::string, std::shared_ptr<Buffer>> offloadScrachBufferMap;
     BinaryStream staticBinaryInfo; // 静态信息序列化流
@@ -497,12 +503,12 @@ private:
     void InitCommonData(const CommParams& commParams);
     void InitCommonDataNotInitDevType(const CommParams& commParams, const HcclCommConfig& commConfig);
     void InitCommonData(const CommParams& commParams, const HcclCommConfig& commConfig);
-    void InitRankGraph(const string& ranktableM);
-    void InitRankGraph(std::unique_ptr<RankGraph>& inputRankGraph);
-    void InitRankGraph(
+    HcclResult InitRankGraph(const string& ranktableM);
+    HcclResult InitRankGraph(std::unique_ptr<RankGraph>& inputRankGraph);
+    HcclResult InitRankGraph(
         std::shared_ptr<RankGraph> inputRankGraph, const RankTableInfo& inputRankTableInfo,
         const TopoInfo& inputTopoInfo);
-    void InitRankGraph(const RankTableInfo& ranktable);
+    HcclResult InitRankGraph(const RankTableInfo& ranktable);
     void CheckRankGraph() const;
     void CheckRankGraphAddrs() const;
     HcclResult CheckCommStatus() const;
@@ -535,17 +541,7 @@ private:
     // dpu相关
     void InitHccpPeer() const; // 拉起peer模式HCCP进程
     bool IsNeedDpu();          // 判断是否需要Host网卡参与集合通信
-    void InitDpuKernel();
-    std::unordered_set<IpAddress> GetHostIpFromRankGraph();
-    HcclResult LaunchDpuKernel(aclrtFuncHandle& funcHandle);
-    HcclResult PrepareDpuKernelResource(aclrtFuncHandle& funcHandle);
-    HcclResult DestroyDpuKernelResource();
-    HcclResult WaitDpuKernelThreadTerminate();
     void DestroyImpl();
-    HcclResult InitAndLaunchDpuKernel();
-    HcclResult InitAndLaunchAicpuKernel(); // 保存dpu taskexception共享内存到aicpu全局map中
-    HcclResult DestroyDpuTaskexpShmemInDevice();
-    HcclResult CleanupKFCWorkSpaceOnFailure(DpuShmem& shmem, HcclResult ret) const;
 
     HcclResult Init(const CommParams& commParams, std::unique_ptr<RankGraph>& inputRankGraph, DevId inputDevLogicId);
     HcclResult Init(
@@ -553,12 +549,12 @@ private:
         DevId inputDevLogicId);
     HcclResult InitCommResource(const CommParams& commParams);
 
-    void WaitReady() const;
+    HcclResult WaitReady() const;
 
     void InitMirrorTaskManager();
     HcclResult InitProfilingReporter();
     void UpdateProfStat();
-    void InitTaskExceptionHandler() const;
+    HcclResult InitTaskExceptionHandler() const;
 
     // 配置cachedReq属性：静态图模式：true, 动态图模式：false， 单算子模式：false
     void ReportProfInfo(uint64_t beginTime, bool cachedReq, bool opbased);
@@ -576,7 +572,7 @@ private:
     void FillAllToAllVArgs(const CollOpParams& opParams, rtCcuTaskInfo_t*& ccuParams) const;
     void ExecuteFastCcuLaunch(const CollOpParams& opParams, aclrtStream const stream, CachedCCUParams& params);
 
-    void OpAcceleratorStateFallback(); // 算子粒度加速模式状态回退
+    HcclResult OpAcceleratorStateFallback(); // 算子粒度加速模式状态回退
     HcclResult ReLoadOpbasedOp();
     HcclResult ReLoadOffloadOp();
 

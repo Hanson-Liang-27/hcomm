@@ -14,6 +14,7 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <string>
 
 #include "ccu_instr_info_v1.h"
 #include "ccu_rep_block_v1.h"
@@ -35,24 +36,24 @@ namespace CcuRep {
 
         CcuRepTranslator(std::shared_ptr<CcuRepReferenceManager> refManager, const TransDep& transDep);
         static uint32_t GetInstrNum(const int32_t userDevId);
-        static HcclResult GetResReq(const int32_t userDevId, uint8_t dieId, CcuResReq& resReq);
+        static CcuResult GetResReq(const int32_t userDevId, uint8_t dieId, CcuResReq& resReq);
         void GetRes(CcuRepResource& res);
         CcuInstrInfo Translate(
             CcuKernel* ccuKernel, const std::vector<std::shared_ptr<CcuRepBase>>& repVec, uint16_t startInstrId,
             bool isFuncBlock = false);
-        void Translate(
+        CcuResult Translate(
             CcuKernel* ccuKernel, const std::vector<std::shared_ptr<CcuRepBase>>& repVec, CcuInstr*& instr,
             uint16_t& instrId, std::function<bool(std::shared_ptr<CcuRepBase>)> filter);
-        void DumpInstruction(const CcuInstrInfo& instrInfo) const;
+        void DumpInstruction(const CcuInstrInfo& instrInfo, const std::string& tag = "CcuInstrInfo") const;
         void SetTransDep(TransDep transDepIn) { transDep = transDepIn; }
         TransDep& GetTransDep() { return transDep; }
 
     private:
         template <typename T1, typename T2>
-        void BuildReference(const std::shared_ptr<CcuRepBase>& rep);
-        void PreProcess(std::shared_ptr<CcuRepBase> rep);
-        void CommonProcess(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& instrId);
-        void FinishMainBlock(CcuInstr*& instr, uint16_t& instrId);
+        CcuResult BuildReference(const std::shared_ptr<CcuRepBase>& rep);
+        CcuResult PreProcess(std::shared_ptr<CcuRepBase> rep);
+        CcuResult CommonProcess(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& instrId);
+        CcuResult FinishMainBlock(CcuInstr*& instr, uint16_t& instrId);
         void DumpRep(const std::vector<std::shared_ptr<CcuRepBase>>& repVec, const CcuInstrInfo& instrInfo) const;
         void BindResource(bool isFuncBlock);
 

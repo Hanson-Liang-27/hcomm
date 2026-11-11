@@ -14,7 +14,9 @@
 #define private public
 #define protected public
 
-#include "ccu_device_pub.h"
+#include "comm_engine/ccu/ccu_device_pub.h"
+#include "ccu_device.h"
+#include "ccu_res_repo.h"
 #include "ccu_dev_mgr_imp.h"
 
 #include "ccu_comp.h"
@@ -25,6 +27,9 @@
 
 #undef protected
 #undef private
+
+// 放在 #undef 之后，避免 private→public 宏污染资源树头文件
+#include "base_comm_node_accessors.h"
 
 namespace hcomm {
 
@@ -184,7 +189,7 @@ static HcclResult MockCcuAllocChannels(
     CHK_RET(hrtGetDevicePhyIdByIndex(static_cast<uint32_t>(deviceLogicId), devPhyId));
 
     DevEidInfo eidInfo{};
-    CHK_RET(EidInfoMgr::GetInstance(devPhyId).GetEidInfoByAddr(ccuChannelPara.commAddr, eidInfo));
+    CHK_RET(GetEidInfoMgr(devPhyId).GetEidInfoByAddr(ccuChannelPara.commAddr, eidInfo));
     const uint8_t dieId = static_cast<uint8_t>(eidInfo.dieId);
     const uint32_t feId = eidInfo.funcId;
     ChannelPara para{};

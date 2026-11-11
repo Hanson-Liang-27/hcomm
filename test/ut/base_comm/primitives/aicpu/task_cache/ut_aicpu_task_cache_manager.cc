@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <atomic>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -37,11 +38,28 @@ using namespace hcomm;
 using namespace Hccl;
 
 namespace {
+std::vector<u64> g_defaultTransports(128, DFX_INVALID_U64);
+std::vector<u8> g_defaultLinkTypes(128, static_cast<u8>(DfxLinkTypeVal::LINK_ONCHIP));
+std::vector<u8> g_defaultTransportTypes(128, static_cast<u8>(DfxTransportType::DFX_TRANSPORT_TYPE_LOCAL));
+} // namespace
+
+namespace {
 constexpr uint32_t TEST_SQ_DEPTH = 128;
 constexpr uint64_t TEST_BASE_ADDR_0 = 0x10000ULL;
 constexpr uint64_t TEST_MEM_SIZE_0 = 0x1000ULL;
 constexpr uint64_t TEST_BASE_ADDR_1 = 0x20000ULL;
 constexpr uint64_t TEST_MEM_SIZE_1 = 0x2000ULL;
+constexpr ChannelHandle TEST_CHANNEL_HANDLE = 0x1234ULL;
+constexpr u32 TEST_REMOTE_RANK_ID = 7;
+
+HcclResult GetRemoteRankIdForTest(ChannelHandle channelHandle, u32& remoteRankId)
+{
+    if (channelHandle != TEST_CHANNEL_HANDLE) {
+        return HCCL_E_PARA;
+    }
+    remoteRankId = TEST_REMOTE_RANK_ID;
+    return HCCL_SUCCESS;
+}
 
 Hccl::WqeTask MakeManagerWqeTaskRead()
 {
@@ -72,6 +90,7 @@ protected:
     std::vector<char> emptyUniqueId_;
     bool savedIsHit_ = false;
     AicpuTaskCacheEntry* savedCacheEntryPtr_ = nullptr;
+    AicpuTaskCacheManager::GetChannelRemoteRankIdCallback savedGetChannelRemoteRankIdCallback_ = nullptr;
 
     void SetUp() override
     {
@@ -89,6 +108,8 @@ protected:
 
         savedIsHit_ = AicpuTaskCacheManager::isHit;
         savedCacheEntryPtr_ = AicpuTaskCacheManager::cacheEntryPtr;
+        savedGetChannelRemoteRankIdCallback_
+            = AicpuTaskCacheManager::getChannelRemoteRankIdCallback_.load(std::memory_order_acquire);
     }
 
     void TearDown() override
@@ -96,6 +117,7 @@ protected:
         AicpuTaskCacheManager::isHit = savedIsHit_;
         AicpuTaskCacheManager::cacheEntryPtr = savedCacheEntryPtr_;
         AicpuTaskCacheManager::cacheTag = "";
+        AicpuTaskCacheManager::RegisterGetChannelRemoteRankIdCallback(savedGetChannelRemoteRankIdCallback_);
     }
 
     void SetNeedCacheTaskState(AicpuTaskCacheEntry* entryPtr)
@@ -196,7 +218,10 @@ TEST_F(AicpuTaskCacheManagerTest, AddSqeArray_NeedCacheTaskFalse_ReturnsInternal
     Rt91095StarsSqeHeader* header = reinterpret_cast<Rt91095StarsSqeHeader*>(sqeArray.data());
     header->type = static_cast<uint8_t>(Rt91095StarsSqeType::RT_91095_SQE_TYPE_NOTIFY_WAIT);
     EXPECT_EQ(
-        AicpuTaskCacheManager::AddSqeArray(rtsqPtr_, aicpuTsThread_.get(), 1, sqeArray.data(), 0), HCCL_E_INTERNAL);
+        AicpuTaskCacheManager::AddSqeArray(
+            rtsqPtr_, aicpuTsThread_.get(), 1, sqeArray.data(), 0, g_defaultTransports.data(),
+            g_defaultLinkTypes.data(), g_defaultTransportTypes.data()),
+        HCCL_E_INTERNAL);
 }
 
 TEST_F(AicpuTaskCacheManagerTest, AddSqeArray_CacheHit_ReturnsInternal)
@@ -206,21 +231,32 @@ TEST_F(AicpuTaskCacheManagerTest, AddSqeArray_CacheHit_ReturnsInternal)
     Rt91095StarsSqeHeader* header = reinterpret_cast<Rt91095StarsSqeHeader*>(sqeArray.data());
     header->type = static_cast<uint8_t>(Rt91095StarsSqeType::RT_91095_SQE_TYPE_NOTIFY_WAIT);
     EXPECT_EQ(
-        AicpuTaskCacheManager::AddSqeArray(rtsqPtr_, aicpuTsThread_.get(), 1, sqeArray.data(), 0), HCCL_E_INTERNAL);
+        AicpuTaskCacheManager::AddSqeArray(
+            rtsqPtr_, aicpuTsThread_.get(), 1, sqeArray.data(), 0, g_defaultTransports.data(),
+            g_defaultLinkTypes.data(), g_defaultTransportTypes.data()),
+        HCCL_E_INTERNAL);
 }
 
 TEST_F(AicpuTaskCacheManagerTest, AddSqeArray_NullRtsqPtr_ReturnsPtrError)
 {
     SetNeedCacheTaskState(entry_.get());
     std::vector<uint8_t> sqeArray(Hccl::AC_SQE_SIZE, 0);
-    EXPECT_EQ(AicpuTaskCacheManager::AddSqeArray(nullptr, aicpuTsThread_.get(), 1, sqeArray.data(), 0), HCCL_E_PTR);
+    EXPECT_EQ(
+        AicpuTaskCacheManager::AddSqeArray(
+            nullptr, aicpuTsThread_.get(), 1, sqeArray.data(), 0, g_defaultTransports.data(), g_defaultLinkTypes.data(),
+            g_defaultTransportTypes.data()),
+        HCCL_E_PTR);
 }
 
 TEST_F(AicpuTaskCacheManagerTest, AddSqeArray_NullAicpuTsThread_ReturnsPtrError)
 {
     SetNeedCacheTaskState(entry_.get());
     std::vector<uint8_t> sqeArray(Hccl::AC_SQE_SIZE, 0);
-    EXPECT_EQ(AicpuTaskCacheManager::AddSqeArray(rtsqPtr_, nullptr, 1, sqeArray.data(), 0), HCCL_E_PTR);
+    EXPECT_EQ(
+        AicpuTaskCacheManager::AddSqeArray(
+            rtsqPtr_, nullptr, 1, sqeArray.data(), 0, g_defaultTransports.data(), g_defaultLinkTypes.data(),
+            g_defaultTransportTypes.data()),
+        HCCL_E_PTR);
 }
 
 TEST_F(AicpuTaskCacheManagerTest, AddSqeArray_Success_DelegatesToEntry)
@@ -229,7 +265,11 @@ TEST_F(AicpuTaskCacheManagerTest, AddSqeArray_Success_DelegatesToEntry)
     std::vector<uint8_t> sqeArray(Hccl::AC_SQE_SIZE, 0);
     Rt91095StarsSqeHeader* header = reinterpret_cast<Rt91095StarsSqeHeader*>(sqeArray.data());
     header->type = static_cast<uint8_t>(Rt91095StarsSqeType::RT_91095_SQE_TYPE_NOTIFY_WAIT);
-    EXPECT_EQ(AicpuTaskCacheManager::AddSqeArray(rtsqPtr_, aicpuTsThread_.get(), 1, sqeArray.data(), 0), HCCL_SUCCESS);
+    EXPECT_EQ(
+        AicpuTaskCacheManager::AddSqeArray(
+            rtsqPtr_, aicpuTsThread_.get(), 1, sqeArray.data(), 0, g_defaultTransports.data(),
+            g_defaultLinkTypes.data(), g_defaultTransportTypes.data()),
+        HCCL_SUCCESS);
     EXPECT_EQ(entry_->sqeArrayInfos_.size(), 1U);
 }
 
@@ -258,4 +298,19 @@ TEST_F(AicpuTaskCacheManagerTest, AicpuTaskCache_GlobalInstance_Usable)
     ASSERT_EQ(AicpuTaskCacheManager::aicpuTaskCache.AddEntry("manager_test_tag", &entryPtr), HCCL_SUCCESS);
     ASSERT_NE(entryPtr, nullptr);
     EXPECT_EQ(AicpuTaskCacheManager::aicpuTaskCache.ClearEntry("manager_test_tag"), HCCL_SUCCESS);
+}
+
+TEST_F(AicpuTaskCacheManagerTest, GetChannelRemoteRankId_CallbackNotRegistered_ReturnsInternal)
+{
+    AicpuTaskCacheManager::RegisterGetChannelRemoteRankIdCallback(nullptr);
+    u32 remoteRankId = INVALID_UINT;
+    EXPECT_EQ(AicpuTaskCacheManager::GetChannelRemoteRankId(TEST_CHANNEL_HANDLE, remoteRankId), HCCL_E_INTERNAL);
+}
+
+TEST_F(AicpuTaskCacheManagerTest, GetChannelRemoteRankId_CallbackRegistered_ReturnsRemoteRankId)
+{
+    AicpuTaskCacheManager::RegisterGetChannelRemoteRankIdCallback(GetRemoteRankIdForTest);
+    u32 remoteRankId = INVALID_UINT;
+    EXPECT_EQ(AicpuTaskCacheManager::GetChannelRemoteRankId(TEST_CHANNEL_HANDLE, remoteRankId), HCCL_SUCCESS);
+    EXPECT_EQ(remoteRankId, TEST_REMOTE_RANK_ID);
 }

@@ -20,11 +20,17 @@ googletest:
 json:
   version: v3.12.0
   type: build
+libboundscheck:
+  version: v1.1.11
+  type: test
+mariadb-connector-c:
+  version: v3.3.8
+  type: test
 makeself:
   version: v2.5.0-h1
   type: build
 mockcpp:
-  version: v2.7-h4
+  version: v2.7-h6
   type: test
 openssl:
   version: v3.0.9

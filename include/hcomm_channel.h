@@ -19,11 +19,9 @@ extern "C" {
 
 static const uint32_t HCOMM_CHANNEL_MAGIC_WORD = 0x0fcf0f0fU;
 static const uint32_t HCOMM_CHANNEL_VERSION_ONE = 1U;
-static const uint32_t HCOMM_CHANNEL_VERSION_FOUR = 4U;
 /** ABI v3：相比 v1 增加 uint32_t qos 与 const char *channelName（channel 业务匹配标识） */
 /** ABI v4：相比 v3 增加 roceAttr.srcPortList（QP 源端口号，union 内字段，sizeof 不变） */
-/** ABI v5：相比 v4 增加 ubAttr.scqDepth（UB SCQ 队列深度，union 内字段，sizeof 不变） */
-static const uint32_t HCOMM_CHANNEL_VERSION = 5U;
+static const uint32_t HCOMM_CHANNEL_VERSION = 4U;
 
 // channelName标识最大长度（字节）
 static const uint32_t HCOMM_CHANNEL_NAME_MAX_LEN = 191U;
@@ -35,7 +33,6 @@ static const uint32_t HCOMM_CHANNEL_DESC_RAW_MAX_LEN = 128U; ///< HcommChannelDe
  *       ABI v1：HCOMM_CHANNEL_VERSION_ONE，无 union 之后的 qos 字段，见 HCOMM_CHANNEL_DESC_ABI_V1_SIZE。
  *       ABI v3：HCOMM_CHANNEL_VERSION，相比 v1 增加 uint32_t qos 与 const char *channelName（channel 业务匹配标识）。
  *       ABI v4：HCOMM_CHANNEL_VERSION，相比 v3 增加 roceAttr.srcPortList（QP 源端口号，union 内字段，sizeof 不变）。
- *       ABI v5：HCOMM_CHANNEL_VERSION，相比 v4 增加 ubAttr.scqDepth（UB SCQ 队列深度，union 内字段，sizeof 不变）。
  */
 typedef struct {
     CommAbiHeader header;        ///< ABI头部，包含版本等信息
@@ -59,16 +56,18 @@ typedef struct {
             uint32_t cqAttrFlags; ///< CQ属性标志位，用于配置ibv_cq_init_attr_ex的flags标志位，默认0。
                                   ///< 备注：NPU网卡不支持该配置；第三方网卡场景下是否有效，与各自网卡能力相关
             uint16_t* srcPortList; ///< QP源端口号，用于哈希分流
-            uint32_t sqDepth; ///< SQ队列深度，0/0xffffffff表示使用默认值（默认2K）；有效范围[64, 32K]且为2^n
-            uint32_t scqDepth; ///< 发送CQ队列深度，0/0xffffffff表示使用默认值（默认2K）；有效范围[64, 32K]且为2^n
+            uint32_t sqDepth; ///< SQ队列深度：须与scqDepth成对配置，0/0xffffffff表示未配置。host场景下同时约束RQ深度；
+                              ///< 显式配置须为2^n且在[64, 32K]内，host上限按网卡规格校验；默认host 1024、device 2048
+            uint32_t scqDepth; ///< CQ队列深度：须与sqDepth成对配置，0/0xffffffff表示未配置。host约束发送/接收CQ，
+                               ///< device仅约束发送CQ；显式配置须为2^n且在[64, 32K]内；host默认65535（不可显式配置）
         } roceAttr;
         struct {
             uint32_t qos; ///< HCCS QoS
         } hccsAttr;
         struct {
             uint32_t sqDepth; ///< UB SQ队列深度，0和0xffffffff表示使用默认值
-            // UB SCQ队列深度，0和0xffffffff表示使用默认值；有效值时JFC以独占模式创建，
-            // 仅支持HOST和AICPU场景，AIV不支持；HOST场景取值范围[64, 32768]，AICPU场景[64, 16384]
+            // UB SCQ队列深度，0和0xffffffff表示使用默认值；有效值时JFC以独占模式创建；
+            // HOST场景取值范围[64, 32768]，AICPU场景[64, 16384]，AIV场景[64, 32768]
             uint32_t scqDepth;
         } ubAttr;
         struct {
@@ -206,6 +205,17 @@ extern HcommResult HcommChannelCreateWithConfig(
 extern HcommResult HcommChannelGetStatus(const ChannelHandle* channelList, uint32_t listNum, int32_t* statusList);
 
 extern HcommResult HcommChannelDestroy(const ChannelHandle* channels, uint32_t channelNum);
+
+/**
+ * @brief 获取通信通道远端内存信息
+ * @param[in] channelHandle 通道句柄
+ * @param[out] memNum 远端内存的数量
+ * @param[out] remoteMem 远端内存数组
+ * @param[out] memInfos 远端内存标签字符串数组
+ * @return HcommResult 执行结果状态码
+ */
+extern HcommResult
+HcommChannelGetRemoteMems(ChannelHandle channelHandle, uint32_t* memNum, CommMem** remoteMem, char*** memInfos);
 
 #ifdef __cplusplus
 }

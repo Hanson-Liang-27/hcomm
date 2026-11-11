@@ -12,6 +12,7 @@
 #include "hccl_one_sided_service_v2.h"
 #include "communicator_impl.h"
 #include "virtual_topo.h"
+#include "link_data_adapter.h"
 #include "alg_topo_package_helper.h"
 #include "aicpu_res_package_helper.h"
 #include "hccl_mem.h"
@@ -58,7 +59,7 @@ LinkData HcclOneSidedService::GetLinkData(RankId remoteRankId)
 {
     if (linkDataMap_.find(remoteRankId) == linkDataMap_.end()) {
         // 组建linkData
-        LinkData linkData(comm_->GetRankGraph()->GetPaths(0, comm_->GetMyRank(), remoteRankId)[0]);
+        LinkData linkData = MakeLinkData(comm_->GetRankGraph()->GetPaths(0, comm_->GetMyRank(), remoteRankId)[0]);
         linkDataMap_.emplace(remoteRankId, linkData);
     }
     HCCL_INFO("[HcclOneSidedService][GetLinkData] linkData[%s]", linkDataMap_.at(remoteRankId).Describe().c_str());
@@ -513,7 +514,7 @@ HcclOneSidedService::BatchPut(RankId remoteRankId, const HcclOneSideOpDesc* desc
     auto it = oneSidedConns_.find(remoteRankId);
     if (it == oneSidedConns_.end()) {
         HCCL_ERROR("[HcclMemCommunication][BatchPut] Can't find oneSidedConn by remoteRank %u", remoteRankId);
-        throw out_of_range("Can't find oneSidedConn by remoteRank.");
+        return HCCL_E_NOT_FOUND;
     }
     oneSidedConnslock.unlock();
 
@@ -532,7 +533,7 @@ HcclOneSidedService::BatchGet(RankId remoteRankId, const HcclOneSideOpDesc* desc
     auto it = oneSidedConns_.find(remoteRankId);
     if (it == oneSidedConns_.end()) {
         HCCL_ERROR("[HcclMemCommunication][BatchGet] Can't find oneSidedConn by remoteRank %u", remoteRankId);
-        throw out_of_range("Can't find oneSidedConn by remoteRank.");
+        return HCCL_E_NOT_FOUND;
     }
     oneSidedConnslock.unlock();
 

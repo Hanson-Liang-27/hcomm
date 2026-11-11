@@ -15,8 +15,8 @@
 #include "hccl_comm_pub.h"
 
 #include "exception_handler.h"
-#include "ccu_instance_mgr.h"
-#include "ccu_device_res.h"
+#include "comm_engine/ccu/ccu_instance_pub.h"
+#include "comm_engine/ccu/ccu_device_res_pub.h"
 
 static HcclResult CreateCcuInsByFixedResNum(
     const char* funcName, const std::string& commId, hccl::MyRank* myRank, CcuInsHandle& ccuInsHandle)
@@ -30,11 +30,11 @@ static HcclResult CreateCcuInsByFixedResNum(
         return HcclResult::HCCL_E_UNAVAIL;
     }
 
-    CcuInsHandle newHandle = 0;
+    CcuInsHandle newEntityHandle = 0;
     auto ccuRet = CcuResult::CCU_SUCCESS;
     // CCU_MS 资源不足（CCU_E_UNAVAIL）时降级到 CCU_SCHED 重试一次；CCU_SCHED 不再继续降级
     while (true) {
-        ccuRet = HcommCcuInsCreateLegacy(ccuInsType, &newHandle);
+        ccuRet = HcommCcuInsCreateLegacy(ccuInsType, &newEntityHandle);
         if (ccuRet != CcuResult::CCU_E_UNAVAIL || ccuInsType != CcuInstanceType::CCU_MS) {
             break;
         }
@@ -56,8 +56,8 @@ static HcclResult CreateCcuInsByFixedResNum(
             ccuRet);
         return static_cast<HcclResult>(ccuRet);
     }
-    myRank->SetCcuInstance(newHandle);
-    ccuInsHandle = newHandle;
+    myRank->SetCcuInstance(newEntityHandle);
+    ccuInsHandle = newEntityHandle;
     return HcclResult::HCCL_SUCCESS;
 }
 
@@ -99,6 +99,14 @@ HcclResult HcclCommQueryCcuIns(HcclComm comm, CcuInsHandle* insHandles, uint32_t
         }
     }
 
+    if (!hcomm::CcuInstanceExists(collComm->GetDeviceLogicId(), ccuInsHandle)) {
+        *insNum = 0;
+        HCCL_ERROR(
+            "[%s] failed, commId[%s] ccu instance[%llu] is not found.", __func__, commId.c_str(),
+            static_cast<unsigned long long>(ccuInsHandle));
+        return HcclResult::HCCL_E_NOT_FOUND;
+    }
+
     insHandles[0] = ccuInsHandle;
     *insNum = 1;
     HCCL_INFO("[%s] success, take time [%lld]us.", __func__, DURATION_US(TIME_NOW() - startut).count());
@@ -136,6 +144,14 @@ HcclResult HcclCommQueryAssignedCcuIns(HcclComm comm, CcuInsHandle* insHandles, 
     if (assignedCcuInsHandle == 0) {
         HCCL_WARNING("[%s] assigned ccu instance not exist, commId[%s].", __func__, commId.c_str());
         return HcclResult::HCCL_E_UNAVAIL;
+    }
+
+    if (!hcomm::CcuInstanceExists(collComm->GetDeviceLogicId(), assignedCcuInsHandle)) {
+        *insNum = 0;
+        HCCL_ERROR(
+            "[%s] failed, commId[%s] ccu instance[%llu] is not found.", __func__, commId.c_str(),
+            static_cast<unsigned long long>(assignedCcuInsHandle));
+        return HcclResult::HCCL_E_NOT_FOUND;
     }
 
     insHandles[0] = assignedCcuInsHandle;
@@ -192,8 +208,7 @@ HcclResult HcclCommAssignCcuIns(HcclComm comm, CcuInsHandle insHandle)
         }
 
         const auto devLogicId = collComm->GetDeviceLogicId();
-        auto* ccuIns = hcomm::CcuInstanceMgr::GetInstance(devLogicId).Get(insHandle);
-        if (ccuIns == nullptr) {
+        if (!hcomm::CcuInstanceExists(devLogicId, insHandle)) {
             HCCL_ERROR(
                 "[%s] failed, commId[%s] ccu instance[%llu] is not found.", __func__, commId.c_str(),
                 static_cast<unsigned long long>(insHandle));

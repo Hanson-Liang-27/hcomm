@@ -205,7 +205,7 @@ check_environment() {
     
     # 检查第三方依赖
     info "检查第三方依赖..."
-    local dependencies=("cmake" "libsqlite3-dev" "libboost-all-dev" "rdma-core" "libibverbs-dev" "pkg-config" "gcc-aarch64-linux-gnu" "g++-aarch64-linux-gnu" "qemu-user-static" "binfmt-support")
+    local dependencies=("cmake" "libboost-all-dev" "rdma-core" "libibverbs-dev" "pkg-config" "gcc-aarch64-linux-gnu" "g++-aarch64-linux-gnu" "qemu-user-static" "binfmt-support")
     local missing_deps=()
     
     for dep in "${dependencies[@]}"; do

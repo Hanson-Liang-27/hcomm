@@ -10,7 +10,6 @@
 
 set(src_list
     server_socket_mgr.cc
-    server_socket_manager.cc
 )
 
 if(TARGET hcomm_base_obj)

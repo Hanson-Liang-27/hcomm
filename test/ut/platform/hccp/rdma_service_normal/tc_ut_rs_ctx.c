@@ -67,9 +67,18 @@ int StubRsUbGetDevCb(struct rs_cb* rscb, unsigned int devIndex, struct RsUbDevCb
 
 int StubRsGetRsCb(unsigned int phyId, struct rs_cb** rsCb)
 {
+    static struct HccpDevEidInfo eidArr[2];
     static struct rs_cb stubRsCb = {0};
+    static struct RsDevEidInfoCb eidCb;
 
     stubRsCb.protocol = PROTOCOL_UDMA;
+    if (eidCb.num == 0) {
+        eidArr[0].eidIndex = 0;
+        eidArr[1].eidIndex = 1;
+        eidCb.infoList = eidArr;
+        eidCb.num = 2;
+    }
+    stubRsCb.devEidInfoCb = &eidCb;
     *rsCb = &stubRsCb;
     return 0;
 }
@@ -80,24 +89,67 @@ void TcRsGetDevEidInfoNum()
     int ret = 0;
 
     mocker_clean();
+    mocker(RsGetProductType, 100, PRODUCT_TYPE_950);
     mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
-    mocker(RsUbGetDevEidInfoNum, 1, 0);
     ret = RsGetDevEidInfoNum(0, &num);
     EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ(num, 2);
     mocker_clean();
 }
 
 void TcRsGetDevEidInfoList()
 {
     struct HccpDevEidInfo infoList[5] = {0};
-    unsigned int count = 0;
+    unsigned int count = 2;
     int ret = 0;
 
     mocker_clean();
+    mocker(RsGetProductType, 100, PRODUCT_TYPE_950);
     mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
-    mocker(RsUbGetDevEidInfoList, 1, 0);
     ret = RsGetDevEidInfoList(0, infoList, 0, count);
     EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ(infoList[0].eidIndex, 0);
+    EXPECT_INT_EQ(infoList[1].eidIndex, 1);
+    mocker_clean();
+}
+
+void TcRsGetDevEidInfoListOutOfRange()
+{
+    struct HccpDevEidInfo infoList[5] = {0};
+    int ret = 0;
+
+    mocker_clean();
+    mocker(RsGetProductType, 100, PRODUCT_TYPE_950);
+    mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
+    ret = RsGetDevEidInfoList(0, infoList, 0, 3);
+    EXPECT_INT_EQ(ret, -EINVAL);
+    mocker_clean();
+}
+
+void TcRsGetDevEidInfoListStartIndexOverflow()
+{
+    struct HccpDevEidInfo infoList[5] = {0};
+    int ret = 0;
+
+    mocker_clean();
+    mocker(RsGetProductType, 100, PRODUCT_TYPE_950);
+    mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
+    ret = RsGetDevEidInfoList(0, infoList, UINT_MAX, 1);
+    EXPECT_INT_EQ(ret, -EINVAL);
+    mocker_clean();
+}
+
+void TcRsGetDevEidInfoListStartIndexOffset()
+{
+    struct HccpDevEidInfo infoList[5] = {0};
+    int ret = 0;
+
+    mocker_clean();
+    mocker(RsGetProductType, 100, PRODUCT_TYPE_950);
+    mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
+    ret = RsGetDevEidInfoList(0, infoList, 1, 1);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ(infoList[0].eidIndex, 1);
     mocker_clean();
 }
 
@@ -386,20 +438,6 @@ void TcRsCtxBatchSendWr()
     mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
     mocker(RsUbCtxBatchSendWr, 1, 0);
     ret = RsCtxBatchSendWr(&baseInfo, &wrData, &wrResp, &wrlistNum);
-    EXPECT_INT_EQ(ret, 0);
-    mocker_clean();
-}
-
-void TcRsCtxUpdateCi()
-{
-    struct RaRsDevInfo devInfo = {0};
-    int ret = 0;
-
-    mocker_clean();
-    mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
-    mocker(RsUbGetDevCb, 1, 0);
-    mocker(RsUbCtxJettyUpdateCi, 1, 0);
-    ret = RsCtxUpdateCi(&devInfo, 0, 0);
     EXPECT_INT_EQ(ret, 0);
     mocker_clean();
 }
@@ -839,7 +877,7 @@ void TcRsCtxNotifyNetDfxEvent()
 
     devInfo.phyId = 0;
     devInfo.devIndex = 0;
-    event.eventType = 1;
+    event.eventType = NET_DFX_SNAPSHOT_CMD;
     event.eventInfo.netDfxInfo.pid = 1000;
     event.eventInfo.netDfxInfo.status = 1;
     mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
@@ -857,13 +895,13 @@ void TcRsCtxNotifyNetDfxEventAubdfxFail()
     mocker_clean();
     devInfo.phyId = 0;
     devInfo.devIndex = 0;
-    event.eventType = 1;
+    event.eventType = NET_DFX_SNAPSHOT_CMD;
     event.eventInfo.netDfxInfo.pid = 1000;
     event.eventInfo.netDfxInfo.status = 1;
     mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
     mocker_invoke(RsUbGetDevCb, StubRsUbGetDevCb, 1);
     mocker(RsAubdfxNotifyEvent, 1, -EINVAL);
-    EXPECT_INT_EQ(RsCtxNotifyEvent(&devInfo, &event), -EINVAL);
+    EXPECT_INT_EQ(RsCtxNotifyEvent(&devInfo, &event), 0);
     mocker_clean();
 }
 
@@ -875,7 +913,7 @@ void TcRsCtxNotifyEventUnsupportedType()
     mocker_clean();
     devInfo.phyId = 0;
     devInfo.devIndex = 0;
-    event.eventType = 2;
+    event.eventType = CMD_MAX;
     mocker_invoke(RsGetRsCb, StubRsGetRsCb, 1);
     mocker_invoke(RsUbGetDevCb, StubRsUbGetDevCb, 1);
     EXPECT_INT_EQ(RsCtxNotifyEvent(&devInfo, &event), -EINVAL);

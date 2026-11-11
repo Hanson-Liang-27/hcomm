@@ -21,7 +21,7 @@
 #include "endpoint.h"
 #include "ub_reged_mem_mgr.h"
 #include "adapter_rts.h"
-#include "server_socket_manager.h"
+#include "server_socket_mgr.h"
 #include "hccp_peer_manager.h"
 
 #define private public
@@ -60,7 +60,7 @@ protected:
         rdmaHandle = (void*)0x1000000;
 
         MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
-        // 出参 devPhyId 需赋合法值：批次1后它作为 GetDeviceResMgr(devPhyId) 的设备数组下标
+        // 出参 devPhyId 需赋合法值：作为 GetEndpointCtxMgr 的设备子树键
         unsigned int devicePhyId = 0U;
         MOCKER(hrtGetDevicePhyIdByIndex)
             .stubs()
@@ -94,7 +94,7 @@ TEST_F(CpuUrmaEndpointTest, Ut_When_ServerSocketListen_Normal_Expect_HCCL_SUCCES
 {
     auto endpoint = std::make_unique<CpuUrmaEndpoint>(endpointDesc);
     EXPECT_EQ(endpoint->Init(), HCCL_SUCCESS);
-    MOCKER_CPP(&hcomm::ServerSocketManager::ServerSocketStartListen).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hcomm::ServerSocketMgr::ServerSocketStartListen).stubs().will(returnValue(HCCL_SUCCESS));
     // 监听 3 方法由 ServerSocketContext 承载，经 GetServerSocketContext() 访问
     EXPECT_EQ(endpoint->GetServerSocketContext()->ServerSocketListen(60001), HCCL_SUCCESS);
 }
@@ -103,7 +103,7 @@ TEST_F(CpuUrmaEndpointTest, Ut_When_ServerSocketStopListen_Normal_Expect_HCCL_SU
 {
     auto endpoint = std::make_unique<CpuUrmaEndpoint>(endpointDesc);
     EXPECT_EQ(endpoint->Init(), HCCL_SUCCESS);
-    MOCKER_CPP(&hcomm::ServerSocketManager::ServerSocketStopListen).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hcomm::ServerSocketMgr::ServerSocketStopListen).stubs().will(returnValue(HCCL_SUCCESS));
     EXPECT_EQ(endpoint->GetServerSocketContext()->ServerSocketStopListen(60001), HCCL_SUCCESS);
 }
 
@@ -140,7 +140,7 @@ TEST_F(CpuUrmaEndpointTest, Ut_When_ServerSocketGetListenPort_Normal_Expect_HCCL
     uint32_t port = 0;
     uint32_t portValue = 60001;
 
-    MOCKER_CPP(&hcomm::ServerSocketManager::ServerSocketStartListen)
+    MOCKER_CPP(&hcomm::ServerSocketMgr::ServerSocketStartListen)
         .stubs()
         .with(mockcpp::any(), mockcpp::any(), mockcpp::any(), outBoundP(&portValue, sizeof(portValue)))
         .will(returnValue(HCCL_SUCCESS));

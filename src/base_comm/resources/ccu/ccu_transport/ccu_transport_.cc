@@ -8,16 +8,21 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
 #include "ccu_transport_.h"
 
 #include "exception_handler.h"
+
+#include "ccu_dev_mgr_imp.h"
+
+#include "ccu_instance.h"
+#include "hcomm/ccu/hcomm_res_ccu_entity_defs.h"
 
 #include "../../../../../legacy/ascend950/unified_platform/resource/mem/user_remote_mem_getter.h"
 
 #include "env_config/env_config_v2.h"
 #include "ccu_assist_v1.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 
 namespace hcomm {
 
@@ -39,6 +44,57 @@ HcclResult BuildCcuConnection(
     CHK_PTR_NULL(ccuConnection);
     CHK_RET(ccuConnection->Init());
     return HCCL_SUCCESS;
+}
+
+// CCU Channel 实体快照查询辅助接口。
+int32_t CcuTransport::GetDevLogicId() const { return userDevId_; }
+
+// 将内部 CCU 版本转换为跨 SO 版本号；未知版本返回内部错误。
+HcclResult CcuTransport::GetCcuVersion(uint32_t& ccuVersion) const
+{
+    CcuVersion version = CcuVersion::CCU_INVALID;
+    CHK_RET(CcuDevMgrImp::GetCcuVersion(userDevId_, version));
+    if (version == CcuVersion::CCU_V1) {
+        ccuVersion = hcomm::HCOMM_CCU_VERSION_V1;
+        return HCCL_SUCCESS;
+    }
+    if (version == CcuVersion::CCU_V2) {
+        ccuVersion = hcomm::HCOMM_CCU_VERSION_V2;
+        return HCCL_SUCCESS;
+    }
+    ccuVersion = hcomm::HCOMM_CCU_VERSION_INVALID;
+    return HCCL_E_INTERNAL;
+}
+
+// 获取本端与对端的 CKE、XN 资源数量。
+HcclResult CcuTransport::GetResourceNums(
+    uint32_t& localCkeNum, uint32_t& localXnNum, uint32_t& remoteCkeNum, uint32_t& remoteXnNum) const
+{
+    localCkeNum = static_cast<uint32_t>(locRes_.ckes.size());
+    localXnNum = static_cast<uint32_t>(locRes_.xns.size());
+    remoteCkeNum = static_cast<uint32_t>(rmtRes_.ckes.size());
+    remoteXnNum = static_cast<uint32_t>(rmtRes_.xns.size());
+    return HcclResult::HCCL_SUCCESS;
+}
+
+HcclResult CcuTransport::GetRmtCcuBufInfo(uint64_t& rmtCcuBufAddr, uint64_t& rmtCcuBufSize) const
+{
+    rmtCcuBufAddr = ccuConnection_->GetRmtCcuBufAddr();
+    rmtCcuBufSize = ccuConnection_->GetRmtCcuBufSize();
+    return HcclResult::HCCL_SUCCESS;
+}
+
+HcclResult CcuTransport::GetRemoteBufferInfos(std::vector<CclBufferInfo>& bufferInfos) const
+{
+    // 与UpdateMemInfo写缓存段同持remoteMemsMutex_，防止并发内存更新时push_back扩容导致读取侧失效
+    std::lock_guard<std::mutex> lock(remoteMemsMutex_);
+    bufferInfos.clear();
+    bufferInfos.reserve(rmtBufferVec_.size());
+    for (const auto& buffer : rmtBufferVec_) {
+        CHK_PTR_NULL(buffer);
+        bufferInfos.emplace_back(buffer->GetAddr(), buffer->GetSize(), buffer->GetTokenId(), buffer->GetTokenValue());
+    }
+    return HcclResult::HCCL_SUCCESS;
 }
 
 HcclResult CcuCreateTransport(
@@ -320,7 +376,7 @@ HcclResult CcuTransport::RecvDataSize()
 {
     // 接收数据包尺寸
     EXCEPTION_HANDLE_BEGIN
-    socket_->RecvAsync(ReinterpretAs<u8*>(&exchangeDataSize_), sizeof(exchangeDataSize_));
+    socket_->RecvAsync(&exchangeDataSize_, sizeof(exchangeDataSize_));
     EXCEPTION_HANDLE_END
     HCCL_INFO(
         "[CcuTransport::%s] Receive size[%u] of data success. [%zu] bytes received.", __func__, exchangeDataSize_,
@@ -341,7 +397,7 @@ HcclResult CcuTransport::RecvConnAndTransInfo()
 {
     recvData_.resize(exchangeDataSize_);
     EXCEPTION_HANDLE_BEGIN
-    socket_->RecvAsync(ReinterpretAs<u8*>(recvData_.data()), recvData_.size());
+    socket_->RecvAsync(recvData_.data(), recvData_.size());
     EXCEPTION_HANDLE_END
     return HcclResult::HCCL_SUCCESS;
 }
@@ -382,8 +438,12 @@ HcclResult CcuTransport::RecvDataProcess()
     CHK_RET(HandshakeMsgUnpack(binaryStream));
     CHK_RET(ConnInfoUnpackProc(binaryStream));
     CHK_RET(TransResUnpackProc(binaryStream));
-    rmtBufferVec_.clear();
-    CHK_RET(BufferInfoUnpack(binaryStream));
+    {
+        // 建链阶段的远端内存列表重填同样与查询侧同持remoteMemsMutex_，避免与CcuGetRmtMemToken等读者竞争
+        std::lock_guard<std::mutex> lock(remoteMemsMutex_);
+        rmtBufferVec_.clear();
+        CHK_RET(BufferInfoUnpack(binaryStream));
+    }
     return HcclResult::HCCL_SUCCESS;
 }
 
@@ -403,7 +463,7 @@ HcclResult CcuTransport::RecvTransInfo()
 {
     recvTrans_.resize(exchangeDataSize_);
     EXCEPTION_HANDLE_BEGIN
-    socket_->RecvAsync(ReinterpretAs<u8*>(recvTrans_.data()), recvTrans_.size());
+    socket_->RecvAsync(recvTrans_.data(), recvTrans_.size());
     EXCEPTION_HANDLE_END
     return HcclResult::HCCL_SUCCESS;
 }
@@ -544,7 +604,7 @@ HcclResult CcuTransport::RecvFinish()
 {
     recvFinishMsg_.resize(FINISH_MSG_SIZE);
     EXCEPTION_HANDLE_BEGIN
-    socket_->RecvAsync(ReinterpretAs<u8*>(recvFinishMsg_.data()), FINISH_MSG_SIZE);
+    socket_->RecvAsync(recvFinishMsg_.data(), FINISH_MSG_SIZE);
     EXCEPTION_HANDLE_END
     return HcclResult::HCCL_SUCCESS;
 }
@@ -673,6 +733,8 @@ HcclResult CcuTransport::GetRmtXnByIndex(const uint32_t index, uint32_t& rmtXnId
 
 HcclResult CcuTransport::GetLocBuffer(CclBufferInfo& bufferInfo, const uint32_t& bufNum) const
 {
+    // 与UpdateMemInfo写缓存段同持remoteMemsMutex_，防止并发内存更新时insert扩容导致读取侧失效
+    std::lock_guard<std::mutex> lock(remoteMemsMutex_);
     (void)bufNum;
     bufferInfo = locBufferInfos_[0];
     return HCCL_SUCCESS;
@@ -680,6 +742,8 @@ HcclResult CcuTransport::GetLocBuffer(CclBufferInfo& bufferInfo, const uint32_t&
 
 HcclResult CcuTransport::GetRmtBuffer(CclBufferInfo& bufferInfo, const uint32_t& bufNum) const
 {
+    // 与UpdateMemInfo写缓存段同持remoteMemsMutex_，防止并发内存更新时读到写入中的rmtHcclBufferInfo_
+    std::lock_guard<std::mutex> lock(remoteMemsMutex_);
     (void)bufNum;
     bufferInfo = rmtHcclBufferInfo_;
     return HCCL_SUCCESS;
@@ -819,8 +883,9 @@ HcclResult CcuTransport::CheckSocketStatus()
                       .count();
             HCCL_ERROR(
                 "[%s][%s] wait socket establish timeout, channel connect timeout after %lld sec, "
-                "elapsed[%lld]ms, retryCount[%u]",
-                LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_TIMEOUT.c_str(), timeout.count(), elapsed, retryCount);
+                "elapsed[%lld]ms, retryCount[%u], socketStatus[%s]",
+                LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_TIMEOUT.c_str(), timeout.count(), elapsed, retryCount,
+                socketStatus.Describe().c_str());
             return HCCL_E_TIMEOUT;
         }
         EXCEPTION_HANDLE_END
@@ -835,7 +900,13 @@ HcclResult CcuTransport::UpdateMemInfo(std::vector<CcuTransport::CclBufferInfo>&
         HCCL_WARNING("[CcuTransport][UpdateMemInfo] bufferNum is 0.");
         return HCCL_SUCCESS;
     }
-    uint32_t totalBufferNum = locBufferInfos_.size() + bufferVecTemp.size();
+    // 锁内读取locBufferInfos_当前规模，与持锁insert的写入保持同步（上限检查允许软性竞态，不影响内存安全）
+    uint32_t locBufferNum = 0;
+    {
+        std::lock_guard<std::mutex> lock(remoteMemsMutex_);
+        locBufferNum = static_cast<uint32_t>(locBufferInfos_.size());
+    }
+    uint32_t totalBufferNum = locBufferNum + bufferVecTemp.size();
     if (UNLIKELY(totalBufferNum > MAX_BUFFER_NUM)) {
         HCCL_ERROR(
             "[CcuTransport][UpdateMemInfo] totalBufferNum[%u] exceeds limit[%u]", totalBufferNum, MAX_BUFFER_NUM);
@@ -860,10 +931,17 @@ HcclResult CcuTransport::UpdateMemInfo(std::vector<CcuTransport::CclBufferInfo>&
     CHK_RET(RecvConnAndTransInfo());
     CHK_RET(CheckSocketStatus());
     Hccl::BinaryStream recvStream(recvData_);
-    CHK_RET(BufferInfoUnpack(recvStream));
-    locBufferInfos_.insert(locBufferInfos_.end(), bufferVecTemp.begin(), bufferVecTemp.end());
-    // 流程中已有新增内存数量判断，故执行到此位置一定存在新增内存，需要将标识置位false，使得再次调用GetRemoteMems时重新构造缓存
-    cacheValid_ = false;
+    // 远端内存更新流程对共享缓存成员（rmtBufferVec_/rmtHcclBufferInfo_/locBufferInfos_/cacheValid_等）的写入须与
+    // GetRemoteMems/GetRemoteBufferInfos/GetRmtBuffer/GetLocBuffer的读取同持remoteMemsMutex_，否则存在数据竞争；
+    // socket收发留在锁外，避免长临界区。
+    // 注意：握手解包路径（RecvTransInfo类流程）无锁写入rmtBufferVec_，仅发生在通道建立阶段，与查询无并发窗口。
+    {
+        std::lock_guard<std::mutex> lock(remoteMemsMutex_);
+        CHK_RET(BufferInfoUnpack(recvStream));
+        locBufferInfos_.insert(locBufferInfos_.end(), bufferVecTemp.begin(), bufferVecTemp.end());
+        // 流程中已有新增内存数量判断，故执行到此位置一定存在新增内存，需要将标识置位false，使得再次调用GetRemoteMems时重新构造缓存
+        cacheValid_ = false;
+    }
     return HcclResult::HCCL_SUCCESS;
 }
 
@@ -882,6 +960,8 @@ CcuTransport::ConstructMsgOnlyTransport(Hccl::Socket* socket, std::unique_ptr<Cc
 
 HcclResult CcuTransport::CcuGetRmtMemToken(uint64_t srcVa, uint64_t& tokenInfo)
 {
+    // 与UpdateMemInfo写缓存段同持remoteMemsMutex_，防止并发扩容搬移元素时读到失效的bufferInfo
+    std::lock_guard<std::mutex> lock(remoteMemsMutex_);
     for (auto& bufferInfo : rmtBufferVec_) {
         if (bufferInfo->GetAddr() == srcVa) {
             tokenInfo = CcuRep::CcuCombineTokenInfo(bufferInfo->GetTokenId(), bufferInfo->GetTokenValue(), 1);

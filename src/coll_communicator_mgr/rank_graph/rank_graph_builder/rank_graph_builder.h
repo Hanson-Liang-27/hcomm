@@ -13,6 +13,7 @@
 
 #include <memory>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,7 +36,7 @@ public:
     std::shared_ptr<TopoInfo> GetTopoInfo();
     std::unique_ptr<RankGraph>
     RecoverBuild(const RankTableInfo& rankTableInfo, const TopoInfo& topoInfo, RankId myRank);
-    void SetEndpointDesc();
+    HcclResult SetEndpointDesc();
 
 private:
     std::unique_ptr<RankTableInfo> rankTable_;
@@ -47,21 +48,25 @@ private:
     // BuildFromRankTable时记录，供建链/topoInst注册路径替代实例名前缀匹配
     bool level0PcieFallback_{false};
     std::shared_ptr<TopoInfo> topoInfo_;
+    // 350L拆层形态: 非对称mesh组时为true, AddTopoDescFabricInfo据此过滤graph(0)中的clos边,
+    // 维持"level0纯mesh"视图; 对称形态在RestoreSymmetricLevel0View中已还原单层, 无需过滤
+    bool filterClosInLevel0_{false};
     UpdaterFor64Plus1 updaterFor64Plus1_{};
 
-    void CheckMyRankInRankTable() const;
-    void CheckNetLayerFromPhyTopo(const u32 netLayer) const;
-    void BuildRankGraph();
+    HcclResult CheckMyRankInRankTable() const;
+    HcclResult CheckNetLayerFromPhyTopo(const u32 netLayer) const;
+    HcclResult BuildRankGraph();
     void BuildIpIndexMap();
-    void BuildFromRankTable();
-    void BuildPeer2PeerLinks();
-    void BuildPcieFallbackLinks(NetInstance* innerNetInstance);
-    void AddFabricInfo(u32 level);
+    HcclResult BuildFromRankTable();
+    void RestoreSymmetricLevel0View();
+    HcclResult BuildPeer2PeerLinks();
+    HcclResult BuildPcieFallbackLinks(NetInstance* innerNetInstance);
+    HcclResult AddFabricInfo(u32 netLayer);
     void AddPeer2NetLink(
         const u32 netLayer, const std::string& netInstId, RankId rankId, const AddressInfo& addrInfo,
         const std::shared_ptr<NetInstance::Fabric>& fabNode, const std::vector<std::shared_ptr<PhyTopo::Link>>& links);
-    void AddTopoDescFabricInfo();
-    void UpdateTopoInstForMyRankOnly();
+    HcclResult AddTopoDescFabricInfo();
+    HcclResult UpdateTopoInstForMyRankOnly();
     const RankLevelInfo& GetRankLevelInfoByNetLayer(const NewRankInfo& rankInfo, u32 netLayer) const;
     std::shared_ptr<NetInstance> GetNetInstance(const RankLevelInfo& levelInfo);
     std::shared_ptr<NetInstance> CreateNetInstance(const RankLevelInfo& levelInfo);
@@ -72,7 +77,8 @@ std::vector<std::shared_ptr<PhyTopo::Link>> GetPeer2NetPhyLinks(u32 netLayer, Lo
 std::vector<std::shared_ptr<NetInstance::ConnInterface>> ConstructConnIFromPhyTopoConnIAndPortMap(
     std::shared_ptr<PhyTopo::ConnInterface> phyConnIFace,
     const std::map<std::string, std::vector<IpAddress>>& portAddrMap, const TopoType topoType, const u32 topoInstId,
-    u32 localDeviceId);
+    u32 localDeviceId, std::optional<LinkType> linkTypeOverride = std::nullopt,
+    std::optional<u32> targetDeviceId = std::nullopt);
 std::vector<std::shared_ptr<NetInstance::Link>> ConstructLinks(
     std::shared_ptr<NetInstance::Peer> srcPeer, std::shared_ptr<NetInstance::Peer> dstPeer,
     std::vector<std::shared_ptr<NetInstance::ConnInterface>> sourceIfaces,

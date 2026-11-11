@@ -10,10 +10,14 @@
 
 #include "hccl/hccl_comm.h"
 #include "coll_comm_aicpu_mgr.h"
-#include "aicpu_indop_env.h"
-#include "aicpu_ts_primitives_c_adpt.h"
+#include "common/device/aicpu_indop_env_pub.h"
+#include "comm_engine/thread/device/aicpu_ts_primitives_c_adpt_pub.h"
+#include "comm_engine/thread/device/device_thread_pub.h"
 #include "aicpu_hccl_process.h"
 #include "sqe_build_a5.h"
+#include "common/cast_utils_pub.h"
+#include "common/dev_type_utils_pub.h"
+#include "aicpu_task_cache_manager.h"
 
 using namespace hccl;
 
@@ -24,7 +28,10 @@ HcclResult HcclCommGetStatus(const char* commId, HcclCommStatus* status)
     *status = HcclCommStatus::HCCL_COMM_STATUS_READY;
     DevType deviceType;
     CHK_RET(hrtGetDeviceType(deviceType));
-    if (deviceType == DevType::DEV_TYPE_950 || deviceType == DevType::DEV_TYPE_960) {
+    // deviceType 保留用于 910B 分支与日志；谓词取数失败须显式返回，不得 value_or(false) 误报 READY
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
+    if (*isGe950) {
         CollCommAicpu* collCommAicpu = CollCommAicpuMgr::GetInstance().GetCurrentComm(commId);
         CHK_PRT_RET(!collCommAicpu, HCCL_ERROR("%s AicpuGetComm is null, commId[%s]", __func__, commId), HCCL_E_PTR);
         *status = collCommAicpu->GetCommmStatus();
@@ -52,9 +59,7 @@ void RefreshSqeProfilingState()
 {
     bool isSqeProfEnabled = false;
     if (Hccl::DfxProfilingHandlerLite::GetInstance().GetProfL1State()) {
-        DevType devType = DevType::DEV_TYPE_COUNT;
-        (void)hrtGetDeviceType(devType);
-        isSqeProfEnabled = (devType == DevType::DEV_TYPE_960);
+        isSqeProfEnabled = hcomm::EqualTo960().value_or(false);
     }
     Hccl::SetSqeProfilingEnabled(isSqeProfEnabled);
 }
@@ -77,9 +82,9 @@ HcclResult HcclDfxRegOpInfoByCommId(char* commId, void* hcclDfxOpInfo)
         return HCCL_SUCCESS;
     }
 
-    HcclDfxOpInfo* aicpuDfxInfo = reinterpret_cast<HcclDfxOpInfo*>(hcclDfxOpInfo);
-    CHK_RET(HcommThreadGetNotifyId(
-        aicpuDfxInfo->cpuTsThread, aicpuDfxInfo->cpuWaitAicpuNotifyIdx, &aicpuDfxInfo->cpuWaitAicpuNotifyId));
+    HcclDfxOpInfo* aicpuDfxInfo = ReinterpretAs<HcclDfxOpInfo*>(hcclDfxOpInfo);
+    CHK_RET(static_cast<HcclResult>(HcommThreadGetNotifyId(
+        aicpuDfxInfo->cpuTsThread, aicpuDfxInfo->cpuWaitAicpuNotifyIdx, &aicpuDfxInfo->cpuWaitAicpuNotifyId)));
     CollCommAicpu* currentComm = CollCommAicpuMgr::GetInstance().GetCurrentComm();
     CHK_PTR_NULL(currentComm);
     CHK_RET(currentComm->InitDfxOpInfo(aicpuDfxInfo));
@@ -87,19 +92,44 @@ HcclResult HcclDfxRegOpInfoByCommId(char* commId, void* hcclDfxOpInfo)
     return HCCL_SUCCESS;
 }
 
+namespace {
+HcclResult GetChannelRemoteRankIdForTaskCache(ChannelHandle channelHandle, u32& remoteRankId)
+{
+    // 依赖算子展开线程的thread_local currentComm_，须在同一线程的HcommAcquireComm与HcommReleaseComm之间调用。
+    HCCL_DEBUG(
+        "[%s] query current comm for channelHandle[0x%llx]", __func__, static_cast<unsigned long long>(channelHandle));
+    CollCommAicpu* currentComm = CollCommAicpuMgr::GetInstance().GetCurrentComm();
+    CHK_PTR_NULL(currentComm);
+    // RunAicpuCommRecordChannels 已按解包后的 device transport handle 登记对端 rank。
+    auto* dfxLite = currentComm->GetHcclCommDfxLite();
+    CHK_PTR_NULL(dfxLite);
+    const u32 rankId = dfxLite->GetChannelRemoteRankId(channelHandle);
+    CHK_PRT_RET(
+        rankId == INVALID_UINT,
+        HCCL_ERROR(
+            "[%s] remote rank not found for channelHandle[0x%llx]", __func__,
+            static_cast<unsigned long long>(channelHandle)),
+        HCCL_E_NOT_FOUND);
+    remoteRankId = rankId;
+    return HCCL_SUCCESS;
+}
+
+} // namespace
+
 int32_t HcommAcquireComm(const char* commId)
 {
     CHK_PTR_NULL(commId);
     DevType deviceType;
     CHK_RET(hrtGetDeviceType(deviceType));
     HCCL_INFO("[%s]comId[%s], devType[%d]", __func__, commId, deviceType);
-    if (deviceType != DevType::DEV_TYPE_950 && deviceType != DevType::DEV_TYPE_960) {
+    if (!hcomm::EqualToOrGreaterThan950().value_or(false)) {
         HcclCommAicpu* hcclComm = AicpuHcclProcess::AicpuGetCommbyGroup(commId);
         CHK_PRT_RET(!hcclComm, HCCL_ERROR("%s AicpuGetCommbyGroup is null, commId[%s]", __func__, commId), HCCL_E_PTR);
         CHK_RET(hcclComm->SetDispatcherCtxOnThread());
     } else {
         CollCommAicpu* hcclComm = CollCommAicpuMgr::GetInstance().AcquireCommForUse(commId);
         CHK_PRT_RET(!hcclComm, HCCL_ERROR("%s AcquireCommForUse is null, commId[%s]", __func__, commId), HCCL_E_PTR);
+        hcomm::AicpuTaskCacheManager::RegisterGetChannelRemoteRankIdCallback(GetChannelRemoteRankIdForTaskCache);
     }
     return HCCL_SUCCESS;
 }
@@ -110,7 +140,7 @@ int32_t HcommReleaseComm(const char* commId)
     DevType deviceType;
     CHK_RET(hrtGetDeviceType(deviceType));
     HCCL_INFO("[%s]comId[%s], devType[%d]", __func__, commId, deviceType);
-    if (deviceType != DevType::DEV_TYPE_950 && deviceType != DevType::DEV_TYPE_960) {
+    if (!hcomm::EqualToOrGreaterThan950().value_or(false)) {
         AicpuHcclProcess::AicpuReleaseCommbyGroup(commId);
     } else {
         CollCommAicpuMgr::GetInstance().ReleaseComm(commId);
@@ -125,9 +155,9 @@ HcclResult HcommProfilingReportDeviceOp(const char* groupname)
     }
     CHK_PTR_NULL(groupname);
 
-    DevType deviceType;
-    CHK_RET(hrtGetDeviceType(deviceType));
-    if (deviceType != DevType::DEV_TYPE_950 && deviceType != DevType::DEV_TYPE_960) {
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
+    if (!(*isGe950)) {
         return HCCL_SUCCESS;
     }
 
@@ -143,21 +173,22 @@ HcclResult HcommProfilingReportKernelStartTask(uint64_t thread, const char* grou
         return HCCL_SUCCESS;
     }
 
-    DevType deviceType;
-    CHK_RET(hrtGetDeviceType(deviceType));
-    if (deviceType != DevType::DEV_TYPE_950 && deviceType != DevType::DEV_TYPE_960) {
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
+    if (!(*isGe950)) {
         return HCCL_SUCCESS;
     }
     CHK_PTR_NULL(groupname);
     CollCommAicpu* currentComm = CollCommAicpuMgr::GetInstance().GetCurrentComm();
     CHK_PTR_NULL(currentComm);
+    CHK_RET(static_cast<HcclResult>(HcommThreadUnwrapHandle(&thread)));
     CHK_RET(currentComm->UpdateTask());
-    Thread* const threadPtr = reinterpret_cast<Thread*>(thread);
-    CHK_PTR_NULL(threadPtr);
-    auto* const streamLitePtr = static_cast<Hccl::StreamLite*>(threadPtr->GetStreamLitePtr());
+    void* streamLitePtr = nullptr;
+    CHK_RET(static_cast<HcclResult>(HcommThreadGetStreamLite(thread, &streamLitePtr)));
     CHK_PTR_NULL(streamLitePtr);
+    auto* const streamLite = static_cast<Hccl::StreamLite*>(streamLitePtr);
     Hccl::DfxFlagTaskInfo flagTaskInfo;
-    auto* rtsq = streamLitePtr->GetRtsq();
+    auto* rtsq = streamLite->GetRtsq();
     CHK_PRT_RET(rtsq == nullptr, HCCL_ERROR("[%s] rtsq is null", __func__), HCCL_E_PTR);
     flagTaskInfo.taskId = rtsq->GetTaskId();
     flagTaskInfo.type = Hccl::DfxMainStreamTaskType::HEAD;
@@ -174,27 +205,29 @@ HcclResult HcommProfilingReportKernelEndTask(uint64_t thread, const char* groupn
     CHK_PTR_NULL(groupname);
     HCCL_INFO("[%s] START. thread [%llu], groupname[%s].", __func__, thread, groupname);
 
-    DevType deviceType;
-    CHK_RET(hrtGetDeviceType(deviceType));
-    if (deviceType != DevType::DEV_TYPE_950 && deviceType != DevType::DEV_TYPE_960) {
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
+    if (!(*isGe950)) {
         return HCCL_SUCCESS;
     }
 
-    Thread* const threadPtr = reinterpret_cast<Thread*>(thread);
-    CHK_PRT_RET(threadPtr == nullptr, HCCL_ERROR("[%s] threadPtr is null", __func__), HCCL_E_PTR);
-    auto* const streamLitePtr = static_cast<Hccl::StreamLite*>(threadPtr->GetStreamLitePtr());
-    CHK_PRT_RET(streamLitePtr == nullptr, HCCL_ERROR("[%s] streamLitePtr is null", __func__), HCCL_E_PTR);
+    CHK_RET(static_cast<HcclResult>(HcommThreadUnwrapHandle(&thread)));
+    void* streamLitePtr = nullptr;
+    CHK_PRT_RET(
+        HcommThreadGetStreamLite(thread, &streamLitePtr) != HCOMM_SUCCESS || streamLitePtr == nullptr,
+        HCCL_ERROR("[%s] streamLitePtr is null", __func__), HCCL_E_PTR);
+    auto* const streamLite = static_cast<Hccl::StreamLite*>(streamLitePtr);
     // FlagTaskInfo Report
     Hccl::DfxFlagTaskInfo flagTaskInfo;
     flagTaskInfo.type = Hccl::DfxMainStreamTaskType::TAIL;
-    auto* rtsq = streamLitePtr->GetRtsq();
+    auto* rtsq = streamLite->GetRtsq();
     CHK_PRT_RET(rtsq == nullptr, HCCL_ERROR("[%s] rtsq is null", __func__), HCCL_E_PTR);
     uint16_t streamId = 0;
     uint16_t taskId = 0;
     HcclResult ret = rtsq->GetLastStreamIdAndTaskId(streamId, taskId);
     CHK_PRT_RET(
         ret != HCCL_SUCCESS,
-        HCCL_ERROR("[%s] GetLastStreamIdAndTaskId fail, ret[%d], sqId[%u].", __func__, ret, streamLitePtr->GetSqId()),
+        HCCL_ERROR("[%s] GetLastStreamIdAndTaskId fail, ret[%d], sqId[%u].", __func__, ret, streamLite->GetSqId()),
         ret);
     constexpr uint32_t UINT16_BIT_WIDTH = 16U;
     flagTaskInfo.taskId = (static_cast<uint32_t>(taskId) << UINT16_BIT_WIDTH) | static_cast<uint32_t>(streamId);

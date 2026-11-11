@@ -30,6 +30,11 @@ target_compile_options(hccd PRIVATE
     $<$<CONFIG:Release>:-O3>
 )
 
+# 链接选项
+target_link_options(hccd PRIVATE
+    $<$<BOOL:${BUILD_OPEN_PROJECT}>:-Wl,--no-undefined>
+)
+
 # 源文件列表
 target_sources(hccd PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/hccd.cc
@@ -69,6 +74,7 @@ target_include_directories(hccd PRIVATE
     ${HCOMM_DIR}/pkg_inc/legacy
     ${HCOMM_DIR}/pkg_inc/legacy/hccl
     ${HCOMM_DIR}/src/base_comm/common
+    ${HCOMM_DIR}/src/base_comm/dfx
 
     ${HCOMM_DIR}/src/legacy/ascend910/pub_inc
     ${HCOMM_DIR}/src/legacy/ascend910/pub_inc/inner
@@ -95,17 +101,18 @@ target_include_directories(hccd PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend910/framework/communicator/impl/zero_copy
     ${HCOMM_DIR}/src/legacy/ascend910/framework/communicator/impl/resource_manager
     ${HCOMM_DIR}/src/coll_communicator_mgr/common
+    ${HCOMM_DIR}/src/coll_communicator_mgr/api_c_adpt
     ${HCOMM_DIR}/src/coll_communicator_mgr/rank_graph
     ${HCOMM_DIR}/src/coll_communicator_mgr/communicator
     ${HCOMM_DIR}/src/coll_communicator_mgr/communicator/device
     ${HCOMM_DIR}/src/coll_communicator_mgr/communicator/group_schedule_mgr
     ${HCOMM_DIR}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine/threads
-    ${HCOMM_DIR}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine/notify
     ${HCOMM_DIR}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine
     ${HCOMM_DIR}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_mems
     ${HCOMM_DIR}/src/coll_communicator_mgr/resource_mgr/remote/rank_pairs
     ${HCOMM_DIR}/src/base_comm/resources/endpoints
     ${HCOMM_DIR}/src/coll_communicator_mgr/resource_mgr/local/my_rank/endpoints
+    ${HCOMM_DIR}/src/base_comm/inc
     ${HCOMM_DIR}/src/base_comm/resources/reged_mems
     ${HCOMM_DIR}/src/base_comm/resources/endpoint_pairs
     ${HCOMM_DIR}/src/base_comm/resources/endpoint_pairs/sockets
@@ -178,7 +185,7 @@ target_include_directories(hccd PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/aicpu/daemon
     ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/aicpu/inc
     ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/aicpu/one_sided_component
-    ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/hostdpu
+    ${HCOMM_DIR}/src/base_comm/resources/comm_engine_res/threads/cpu_thread/legacy_dpu_thread
     ${HCOMM_DIR}/src/legacy/ascend950/framework/device_mode
     ${HCOMM_DIR}/src/legacy/ascend950/framework/dfx
     ${HCOMM_DIR}/src/legacy/ascend950/framework/dfx/aicpu
@@ -197,13 +204,11 @@ target_include_directories(hccd PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend950/framework/fault_recovery
     ${HCOMM_DIR}/src/legacy/ascend950/framework/misc
     ${HCOMM_DIR}/src/legacy/ascend950/framework/misc/json_parser
-    ${HCOMM_DIR}/src/legacy/ascend950/framework/misc/mask_event
     ${HCOMM_DIR}/src/legacy/ascend950/framework/misc/whitelist
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/buffer
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/buffer/aicpu
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/connection
-    ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/connection/ub_ci_updater
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/notify
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/notify/aicpu
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/socket
@@ -304,7 +309,6 @@ target_include_directories(hccd PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/ccu_transport
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/connection
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/connection/aicpu
-    ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/connection/ub_ci_updater
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/mem
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/net_dev
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/notify

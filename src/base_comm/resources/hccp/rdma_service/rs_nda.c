@@ -26,7 +26,6 @@
 
 RS_ATTRI_VISI_DEF int RsNdaGetDirectFlag(unsigned int phyId, unsigned int rdevIndex, int *directFlag)
 {
-    struct ibv_device_attr_extend extDevAttr = {0};
     struct RsRdevCb *rdevCb = NULL;
     int ret = 0;
 
@@ -39,12 +38,8 @@ RS_ATTRI_VISI_DEF int RsNdaGetDirectFlag(unsigned int phyId, unsigned int rdevIn
         return ret;
     }
 
-    ret = RsIbvQueryDeviceExtend(rdevCb->ibCtxEx, &extDevAttr);
-    CHK_PRT_RETURN(ret != 0,
-        hccp_err("RsIbvQueryDeviceExtend failed, phyId:%u rdevIndex:%u ret:%d", phyId, rdevIndex, ret), ret);
-
-    if ((extDevAttr.ext_cap & IBV_EXTEND_DEV_NDA) == 0) {
-        hccp_warn_rma("dev not support NDA, phyId:%u rdevIndex:%u ext_cap:0x%x", phyId, rdevIndex, extDevAttr.ext_cap);
+    if ((rdevCb->extDevCap & IBV_EXTEND_DEV_NDA) == 0) {
+        hccp_warn_rma("dev not support NDA, phyId:%u rdevIndex:%u ext_cap:0x%x", phyId, rdevIndex, rdevCb->extDevCap);
         *directFlag = DIRECT_FLAG_NOTSUPP;
         return ret;
     }
@@ -53,29 +48,36 @@ RS_ATTRI_VISI_DEF int RsNdaGetDirectFlag(unsigned int phyId, unsigned int rdevIn
     return ret;
 }
 
-STATIC int RsNdaGetDirectFlagByDevAttr(struct ibv_device_attr *deviceAttr)
+STATIC int RsNdaGetDirectFlagByDevAttr(unsigned int logicId)
 {
-    struct {
-        uint32_t vendorId;
-        uint32_t vendorPartID;
-    } vendorInfoList[] = {
-        {0x19E5U, 0x0230U},
-        {0x19E5U, 0x0231U},
-        {0x19E5U, 0x0232U},
-        {0xCC08U, 0x8200U},
-        {0xCC08U, 0x8201U},
+    /* 支持 D2N UB 直连的 mainboard_id 白名单：天成 POD、A+K Server、A+X Server 系列机型；
+     * 不在白名单内的机型（含 PCIE 标卡等）一律按 DIRECT_FLAG_PCIE 处理 */
+    static const uint8_t ubMainboardIdList[] = {
+        0x03, 0x05, 0x07,                                           /* 天成 POD */
+        0x21, 0x23, 0x25, 0x27, 0x29, 0x2B, 0x2D, 0x2F, 0x31, 0x33, /* A+K Server */
+        0x44, 0x46, 0x48, 0x4A, 0x4C,                               /* A+X Server */
     };
-    unsigned int listSize = sizeof(vendorInfoList) / sizeof(vendorInfoList[0]);
-    unsigned int i;
+    int directFlag = DIRECT_FLAG_PCIE;
+    int64_t mainboardId = 0;
+    unsigned int i = 0;
+    int ret = 0;
 
-    for (i = 0; i < listSize; i++) {
-        if ((deviceAttr->vendor_id == vendorInfoList[i].vendorId) &&
-            (deviceAttr->vendor_part_id == vendorInfoList[i].vendorPartID)) {
-            return DIRECT_FLAG_UB;
+    ret = DlHalGetDeviceInfo(logicId, MODULE_TYPE_SYSTEM, INFO_TYPE_MAINBOARD_ID, &mainboardId);
+    if (ret != 0) {
+        hccp_warn_rma("DlHalGetDeviceInfo unsuccessful, ret:%d logicId:%u, use DIRECT_FLAG_PCIE as default", ret,
+            logicId);
+        return directFlag;
+    }
+
+    for (; i < sizeof(ubMainboardIdList) / sizeof(ubMainboardIdList[0]); i++) {
+        if ((uint64_t)ubMainboardIdList[i] == (uint64_t)mainboardId) {
+            directFlag = DIRECT_FLAG_UB;
+            break;
         }
     }
 
-    return DIRECT_FLAG_PCIE;
+    hccp_info_rma("mainboard_id:0x%llx directFlag:%d", (unsigned long long)mainboardId, directFlag);
+    return directFlag;
 }
 
 STATIC int RsGetNdaPcieDbCb(struct RsNdaCb *ndaCb, uint64_t hva, struct NdaPcieDbCb **ndaDbCb)
@@ -241,8 +243,8 @@ STATIC void RsNdaFreeUbDbCb(struct NdaUbDbCb *ndaDbCb)
 
 STATIC void *RsNdaDbMmapHostVa(struct RsNdaCb *ndaCb, struct doorbell_map_desc *desc)
 {
-    uint64_t alignHva = AlignDown(desc->hva, (uint64_t)RA_RS_4K_PAGE_SIZE);
-    uint64_t alignSize = AlignUp(desc->size, (uint64_t)RA_RS_4K_PAGE_SIZE);
+    uint64_t alignHva = RaRsAlignDown(desc->hva, RA_RS_4K_PAGE_SIZE);
+    uint64_t alignSize = RaRsAlignUp(desc->size, RA_RS_4K_PAGE_SIZE);
     uint64_t offset = desc->hva - alignHva;
     unsigned int logicId = gRsCb->logicId;
     struct NdaPcieDbCb *ndaDbCb = NULL;
@@ -278,7 +280,7 @@ STATIC void RsNdaMapPrivPrepare(struct doorbell_map_desc *desc, struct NdaUbResM
 {
     resMapIn->guid_l = desc->ub_res.guid_l;
     resMapIn->guid_h = desc->ub_res.guid_h;
-    resMapIn->db_idx = desc->ub_res.bits.offset / (uint64_t)RA_RS_4K_PAGE_SIZE;
+    resMapIn->db_idx = desc->ub_res.bits.offset / RA_RS_4K_PAGE_SIZE;
     resMapIn->db_num = 1;
     return;
 }
@@ -322,7 +324,7 @@ map_db:
     }
 
     ndaDbCb->refCnt++;
-    dva = resInfoOut.va + (desc->ub_res.bits.offset % (uint64_t)RA_RS_4K_PAGE_SIZE);
+    dva = resInfoOut.va + (desc->ub_res.bits.offset % RA_RS_4K_PAGE_SIZE);
     return (void *)(uintptr_t)dva;
 }
 
@@ -346,7 +348,7 @@ STATIC void *RsNdaDbMmap(struct doorbell_map_desc *desc)
 STATIC int RsNdaDbUnmapHostVa(struct RsNdaCb *ndaCb, void *ptr, struct doorbell_map_desc *desc)
 {
     (void)ptr;
-    uint64_t alignHva = AlignDown(desc->hva, (uint64_t)RA_RS_4K_PAGE_SIZE);
+    uint64_t alignHva = RaRsAlignDown(desc->hva, RA_RS_4K_PAGE_SIZE);
     unsigned int logicId = gRsCb->logicId;
     struct NdaPcieDbCb *ndaDbCb = NULL;
     int ret = 0;
@@ -442,16 +444,26 @@ STATIC void RsNdaCbInitCb(struct RsNdaCb *ndaCb)
 
 int RsInitNdaCb(struct RsRdevCb *rdevCb)
 {
+    struct ibv_device_attr_extend extDevAttr = {0};
     struct RsNdaCb *ndaCb = NULL;
     int count = 0;
     int ret = 0;
 
-    rdevCb->directFlag = RsNdaGetDirectFlagByDevAttr(&rdevCb->deviceAttr);
+    rdevCb->directFlag = RsNdaGetDirectFlagByDevAttr(rdevCb->rsCb->logicId);
 
     rdevCb->ibCtxEx = RsIbvOpenExtend(rdevCb->ibCtx);
     if (rdevCb->ibCtxEx == NULL) {
         hccp_warn_rma("ibCtxEx is null");
         return 0;
+    }
+
+    ret = RsIbvQueryDeviceExtend(rdevCb->ibCtxEx, &extDevAttr);
+    if (ret != 0) {
+        hccp_warn_rma("RsIbvQueryDeviceExtend unsuccessful, ret:%d", ret);
+        rdevCb->extDevCap = 0;
+        ret = 0;
+    } else {
+        rdevCb->extDevCap = extDevAttr.ext_cap;
     }
 
     count = __sync_fetch_and_add(&rdevCb->rsCb->ndaCbRefCnt, 1);

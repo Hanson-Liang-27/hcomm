@@ -16,15 +16,21 @@ set(src_to_test_list
     host/ut_device_refresh_callback.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/hccl_api_base_test.cc
     ut_HcclRankGraph_API.cc
+    ut_rank_graph_concurrent.cc
     ut_HcomInitCollComm.cc
     comms/aiv/ut_AivUbMemTransport_API_test.cc
     comms/common/ut_orion_adpt_utils.cc
     comms/common/ut_tp_mgr.cc
+    comms/common/ut_base_comm_node_accessors.cc
     comms/common/ut_config_mgr.cc
     comms/common/ut_host_multi_qp_config.cc
     comms/common/ut_rma_buffer_mgr.cc
     comms/comm_engine_res/threads/test_aicpu_ts_thread_class.cc
     comms/comm_engine_res/threads/test_cpu_ts_thread_class.cc
+    comms/comm_engine_res/threads/test_cpu_thread_class.cc
+    comms/comm_engine_res/threads/test_dpu_shmem_mgr.cc
+    comms/comm_engine_res/threads/test_cpu_task_pipe.cc
+    comms/comm_engine_res/threads/test_cpu_thread_service.cc
     comms/comm_engine_res/threads/test_iaicpu_ts_thread_interface.cc
     comms/comm_engine_res/threads/test_thread_api.cc
     comms/comm_engine_res/threads/test_thread_acquire_with_config.cc
@@ -47,6 +53,7 @@ set(src_to_test_list
     comms/api_c_adpt/ut_hcomm_mem_test.cc
     comms/api_c_adpt/ut_hcomm_channel_test.cc
     comms/api_c_adpt/ut_hcomm_channel_config_test.cc
+    comms/api_c_adpt/ut_hcomm_res_ccu_entity_test.cc
     comms/api_c_adpt/ut_hcomm_engine_ctx_test.cc
     comms/api_c_adpt/ut_hcomm_dfx_test.cc
     # endpoint/RegedMemMgr 公共流程抽取归一 UT
@@ -56,20 +63,23 @@ set(src_to_test_list
     comms/endpoints/reged_mems/ut_plugin_reged_mem_mgr.cc
     coll_comms/communicator/ut_coll_comm_test.cc
     coll_comms/communicator/group_schedule_mgr/ut_group_schedule_mgr.cc
+    coll_comms/communicator/op_group_queue_mgr/ut_op_group_queue_mgr.cc
     comms/endpoint_pairs/channels/ut_channel_process_test.cc
     comms/endpoint_pairs/channels/ut_channel_roce_factory.cc
     coll_comms/communicator/aicpu/ut_aicpu_indop_process_test.cc
     host/ut_cpu_roce_endpoint.cc
     host/ut_host_cpu_roce_channel.cc
     host/ut_host_rdma_connection.cc
-    host/ut_server_socket_manager.cc
+    host/ut_server_socket_mgr.cc
     host/ut_cpu_urma_endpoint.cc
     host/ut_host_cpu_urma_channel.cc
     host/ut_host_ub_connection.cc
     host/ut_device_reset_callback.cc
     comms/endpoint_pairs/channels/aicpu/ut_aicpu_ts_hccs_channel.cc
-    comms/endpoint_pairs/channels/aicpu/ut_aicpu_ts_roce_channel_v2.cc
-    comms/endpoint_pairs/channels/aicpu/ut_dev_rdma_connection.cc
+    comms/endpoint_pairs/channels/aicpu/roce_host_loc/ut_aicpu_ts_roce_host_loc_channel.cc
+    comms/endpoint_pairs/channels/aicpu/roce_host_loc/ut_roce_host_loc_connection.cc
+    comms/endpoint_pairs/channels/aicpu/roce_host_loc/ut_roce_host_loc_transport_lite_impl.cc
+    comms/endpoint_pairs/channels/aicpu/roce_host_loc/ut_roce_host_loc_conn_lite.cc
     comms/endpoints/ut_ub_mem_endpoint.cc
     comms/endpoints/reged_mems/ut_roce_mem_test.cc
     comms/endpoints/reged_mems/ut_endpoint_remote_reged_mem_mgr.cc
@@ -88,7 +98,7 @@ set(src_to_test_list
     comms/endpoint_pairs/channels/aicpu/ut_aicpu_ts_p2p_channel.cc
     comms/endpoint_pairs/channels/aicpu/ut_aicpu_ts_uboe_channel.cc
     comms/endpoint_pairs/channels/aicpu/ut_aicpu_ts_ub_rtp_channel.cc
-    comms/endpoint_pairs/channels/aicpu/ut_aicpu_ts_roce_channel.cc
+    comms/endpoint_pairs/channels/aicpu/ut_aicpu_ts_roce_dev_loc_channel.cc
     comms/endpoint_pairs/channels/aicpu/device/ut_aicpu_channel_process.cc
     comms/endpoints/ut_urma_endpoint.cc
     comms/endpoints/ut_aicpu_ts_roce_endpoint.cc
@@ -96,6 +106,7 @@ set(src_to_test_list
     comms/endpoint_pairs/channels/aiv/ut_aiv_ub_mem_channel.cc
     comms/endpoint_pairs/channels/aiv/ut_aiv_ub_mem_transport.cc
     comms/endpoint_pairs/channels/aiv/ut_aiv_urma_channel.cc
+    comms/endpoint_pairs/channels/aiv/ut_aiv_roce_host_loc_channel.cc
     comms/endpoint_pairs/ut_endpoint_pair_mgr.cc
     comms/ccu/ccu_device/ccu_comp/ut_ccu_comp_pub.cc
     coll_comms/communicator/ns_recovery/aicpu/ut_ns_recovery_func_lite.cc
@@ -108,9 +119,7 @@ set(src_to_test_list
     coll_comms/communicator/aicpu/ut_coll_comm_aicpu.cc
     coll_comms/communicator/aicpu/ut_coll_comm_aicpu_destroy_func.cc
     coll_comms/communicator/aicpu/ut_thread_aicpu_mgr.cc
-    coll_comms/communicator/aicpu/ut_notify_aicpu_mgr.cc
     coll_comms/communicator/aicpu/ut_comm_engine_res_aicpu_mgr.cc
-    coll_comms/communicator/aicpu/ut_channel_aicpu_mgr.cc
     coll_comms/communicator/ns_recovery/ut_ns_recovery.cc
     comms/adpt/ut_hcomm_adapter_hccp_test.cc
     comms/endpoints/dfx/ut_endpoint_monitor.cc
@@ -128,6 +137,7 @@ set(src_to_test_list
     coll_comms/rank_graphs/phy_topo_builder/ut_phy_topo_builder.cc
     coll_comms/rank_graphs/rank_graph/ut_net_instance.cc
     coll_comms/rank_graphs/rank_graph/ut_rank_graph.cc
+    coll_comms/rank_graphs/rank_graph/ut_rank_graph_get_links_sort.cc
     coll_comms/rank_graphs/rank_graph_builder/ut_detour_service.cc
     coll_comms/rank_graphs/rank_graph_builder/ut_rank_graph_builder.cc
     coll_comms/rank_graphs/rank_graph_builder/ut_updater_for_64_plus_1.cc
@@ -153,17 +163,21 @@ set(src_to_test_list
 
 add_executable(hccl_utest_test_next_resource ${src_to_test_list})
 target_include_directories(hccl_utest_test_next_resource PRIVATE
+    ${HCCL_CODE_ROOT}/src/base_comm
     ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/cpu_thread
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/device
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/flush
     ${HCCL_CODE_ROOT}/src/base_comm/config_mgr
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/team/hcomm
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/team/hccl
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_mems
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/group_schedule_mgr/
+    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/op_group_queue_mgr/
 
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/endpoints
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/remote/rank_pairs
-    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine_reses/notify
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/rank_graph/common
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/rank_graph/phy_topo
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/rank_graph/phy_topo_builder
@@ -178,11 +192,9 @@ target_include_directories(hccl_utest_test_next_resource PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/coll_comms/rank_graphs/common
     ${CMAKE_CURRENT_SOURCE_DIR}/coll_comms/rank_graphs/rank_graph_64_plus_1
     ${CMAKE_CURRENT_SOURCE_DIR}/coll_comms/rank_graphs/rank_graph_builder
-    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine/notify
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/cluster_monitor
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device/resource_mgr/local/my_rank/comm_engine_reses
-    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device/resource_mgr/remote
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device/c_adpt
 )
 
@@ -240,6 +252,29 @@ target_link_libraries(hccl_utest_ccore_profiling PRIVATE
     $<TARGET_GENEX_EVAL:hccl_utest_test_next_resource,$<TARGET_PROPERTY:hccl_utest_test_next_resource,LINK_LIBRARIES>>)
 add_test(NAME hccl_utest_ccore_profiling COMMAND hccl_utest_ccore_profiling)
 
+# 设备侧线程边界 C API 直接用例（thread.cc 的 CCL_KERNEL_AICPU 分支），范式同 hccl_utest_ccore_profiling。
+add_executable(hccl_utest_thread_device
+    main.cc
+    hccl_api_base_test.cc
+    comms/comm_engine_res/threads/test_thread_device_api.cc
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/thread.cc
+    ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/stream/aicpu/rtsq_base.cc
+    ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/stream/aicpu/rtsq_a5.cc
+    ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/stream/aicpu/stream_lite.cc
+)
+target_include_directories(hccl_utest_thread_device PRIVATE
+    # thread.cc 的 CCL_KERNEL_AICPU 分支 include aicpu_task_cache_manager.h（base_comm/primitives/aicpu/task_cache）
+    ${HCCL_CODE_ROOT}/src/base_comm/primitives/aicpu/task_cache
+    $<TARGET_GENEX_EVAL:hccl_utest_test_next_resource,$<TARGET_PROPERTY:hccl_utest_test_next_resource,INCLUDE_DIRECTORIES>>)
+target_compile_definitions(hccl_utest_thread_device PRIVATE
+    CCL_KERNEL_AICPU
+    $<TARGET_GENEX_EVAL:hccl_utest_test_next_resource,$<TARGET_PROPERTY:hccl_utest_test_next_resource,COMPILE_DEFINITIONS>>)
+target_compile_options(hccl_utest_thread_device PRIVATE
+    $<TARGET_GENEX_EVAL:hccl_utest_test_next_resource,$<TARGET_PROPERTY:hccl_utest_test_next_resource,COMPILE_OPTIONS>>)
+target_link_libraries(hccl_utest_thread_device PRIVATE
+    $<TARGET_GENEX_EVAL:hccl_utest_test_next_resource,$<TARGET_PROPERTY:hccl_utest_test_next_resource,LINK_LIBRARIES>>)
+add_test(NAME hccl_utest_thread_device COMMAND hccl_utest_thread_device)
+
 set(src_to_a3_test_list
     main.cc
     hccl_api_base_test.cc
@@ -252,6 +287,7 @@ add_executable(hccl_utest_test_next_resource_a3 ${src_to_a3_test_list})
 
 #头文件搜索路径
 target_include_directories(hccl_utest_test_next_resource_a3 PRIVATE
+    ${HCCL_CODE_ROOT}/src/base_comm
     ${UT_COMMON_INCLUDE_LIST}
 )
  
@@ -290,3 +326,7 @@ enable_testing()
 add_test(NAME hccl_utest_test_next_resource_a3 COMMAND hccl_utest_test_next_resource_a3)
 
 add_subdirectory(coll_comms/common/loggers)
+
+target_include_directories(hccl_utest_test_next_resource PRIVATE ${HCOMM_RES_TREE_INCLUDES})
+
+target_include_directories(hccl_utest_test_next_resource_a3 PRIVATE ${HCOMM_RES_TREE_INCLUDES})

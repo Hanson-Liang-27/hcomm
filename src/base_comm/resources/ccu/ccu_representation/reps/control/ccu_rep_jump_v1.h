@@ -31,7 +31,7 @@ namespace CcuRep {
             CcuInsGeneratorBase* insGenPtr, const std::string& label, const Variable& targetInstrId,
             const Variable& expectedVar, const Variable& condition);
         void Reference(std::shared_ptr<CcuRepJumpLabel> refRep);
-        void ValidateInsGeneratorForJump();
+        CcuResult ValidateInsGeneratorForJump();
 
         std::shared_ptr<CcuRepJumpLabel> GetJumpLabel() { return jumpLabel; }
 
@@ -67,7 +67,7 @@ namespace CcuRep {
     class CcuRepJump : public CcuRepJumpBase {
     public:
         explicit CcuRepJump(CcuInsGeneratorBase* insGenPtr, const std::string& label, const Variable& targetInstrId);
-        bool Translate(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, const TransDep& dep) override;
+        bool Translate(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& instrId, const TransDep& dep) override;
         std::string Describe() override;
     };
 
@@ -79,7 +79,7 @@ namespace CcuRep {
         CcuRepJumpNE(
             CcuInsGeneratorBase* insGenPtr, const std::string& label, const Variable& targetInstrId,
             const Variable& condition, const Variable& expectedVar); // 仅用于A6翻译
-        bool Translate(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, const TransDep& dep) override;
+        bool Translate(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& instrId, const TransDep& dep) override;
         std::string Describe() override;
     };
 
@@ -91,7 +91,7 @@ namespace CcuRep {
         CcuRepJumpEQ(
             CcuInsGeneratorBase* insGenPtr, const std::string& label, const Variable& targetInstrId,
             const Variable& condition, const Variable& expectedVar); // 仅用于A6翻译
-        bool Translate(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, const TransDep& dep) override;
+        bool Translate(CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& instrId, const TransDep& dep) override;
         std::string Describe() override;
     };
 

@@ -1,18 +1,11 @@
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * This program is free software, you can redistribute it and/or modify it under
- * the terms and conditions of CANN Open Software License Agreement Version 2.0
- * (the "License"). Please refer to the License for details. You may not use
- * this file except in compliance with the License. THIS SOFTWARE IS PROVIDED ON
- * AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS
- * FOR A PARTICULAR PURPOSE. See LICENSE in the root of the software repository
- * for the full text of the License.
- */
-
-/**
- * AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
- * for the full text of the License.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
  */
 
 #ifndef SQE_V85_STUB_H
@@ -38,6 +31,16 @@ enum class Rt91095StarsSqeType {
     RT_91095_SQE_TYPE_CMO = 15,          // CMO
     RT_91095_SQE_TYPE_COND = 20,         // condition
     RT_91095_SQE_TYPE_END = 21,
+};
+
+// WRITE_VALUE SQE 的写宽度(awsize), 取值同 hcomm RtStarsWriteValueSizeType
+enum Rt91095StarsWriteValueSizeType {
+    RT_91095_STARS_WRITE_VALUE_SIZE_TYPE_8BIT = 0,
+    RT_91095_STARS_WRITE_VALUE_SIZE_TYPE_16BIT = 1,
+    RT_91095_STARS_WRITE_VALUE_SIZE_TYPE_32BIT = 2,
+    RT_91095_STARS_WRITE_VALUE_SIZE_TYPE_64BIT = 3,
+    RT_91095_STARS_WRITE_VALUE_SIZE_TYPE_128BIT = 4,
+    RT_91095_STARS_WRITE_VALUE_SIZE_TYPE_256BIT = 5,
 };
 
 struct Rt91095StarsSqeHeader {
@@ -192,8 +195,7 @@ struct Rt91095StarsNotifySqe {
     /* word5 */
     uint32_t waitModeBit : 2;   // bit 0:equal, bit 1:bigger
     uint32_t recordModeBit : 3; // bit 0:add, bit 1:write, bit 2:clear
-    uint32_t bitmap : 1; // only use for conut notify wait, 1 means comapre with
-                         // count value by bit
+    uint32_t bitmap : 1;        // only use for conut notify wait, 1 means comapre with count value by bit
     uint32_t res5 : 26;
 
     /* word6 */
@@ -204,6 +206,38 @@ struct Rt91095StarsNotifySqe {
 
     /* word8-15 */
     uint32_t res7[8];
+};
+
+struct Rt91095StarsWriteValueSqe {
+    /* word0-1 */
+    Rt91095StarsSqeHeader header;
+
+    /* word2 */
+    uint32_t res1;
+
+    /* word3 */
+    uint16_t res2;
+    uint8_t kernelCredit;
+    uint8_t res3;
+
+    /* word4 */
+    uint32_t writeAddrLow;
+
+    /* word5 */
+    uint32_t writeAddrHigh : 17;
+    uint32_t res4 : 3;
+    uint32_t awsize : 3;
+    uint32_t snoop : 1;
+    uint32_t awcache : 4;
+    uint32_t awprot : 3;
+    uint32_t va : 1;
+
+    /* word6-7 */
+    uint32_t res5;
+    uint32_t subType; // use reserved filed
+
+    /* word8-15 */
+    uint32_t writeValuePart[8]; // write value field
 };
 
 struct Rt91095StarsUbdmaDBmodeSqe {

@@ -22,6 +22,8 @@
 #include <stdarg.h>
 #include <vector>
 #include <pthread.h>
+#include <map>
+#include "nlohmann/json.hpp"
 #include "securec.h"
 #include "topo_addr_info.h"
 #include "topo_addr_info_log.h"
@@ -105,20 +107,32 @@ static bool UtLogContains(const std::string& keyword)
     return found;
 }
 
-/* 文件操作 mock：拦截 fopen/fstat/fread，隔离 /etc/hccl_rootinfo.json。
+/* 文件操作 mock：拦截 fopen/fstat/fread/fclose，隔离 /etc/hccl_rootinfo.json。
  * 默认让该路径 fopen 返回 NULL，使 PassThrough 失败，避免真实文件干扰用例。 */
 static struct {
     int passthrough_enable;      /* 1: 对 /etc/hccl_rootinfo.json 返回 tmpfile，启用 PassThrough 路径 */
     int fstat_fail;              /* 1: fstat 返回 -1 */
     size_t fread_short_read;     /* >0: fread 仅返回该字节数（一次性） */
     const char* tmpfile_content; /* passthrough 时写入 tmpfile 的内容 */
-} g_fileMock = {0, 0, 0, NULL};
+    FILE* mock_fp;               /* 最近一次 mock 出的 tmpfile */
+    int mock_fclose_cnt;         /* mock_fp 被 fclose 的次数 */
+} g_fileMock = {0, 0, 0, NULL, NULL, 0};
 
 /* __real_* 由链接器 --wrap 选项解析，此处仅提供声明供编译器类型检查 */
 extern "C" FILE* __real_fopen(const char* path, const char* mode);
 extern "C" int __real_fstat(int fd, struct stat* buf);
 extern "C" size_t __real_fread(void* ptr, size_t size, size_t nmemb, FILE* stream);
 extern "C" int __real_stat(const char* path, struct stat* buf);
+extern "C" int __real_fclose(FILE* stream);
+
+/* 只统计 mock 出的 tmpfile：其余 fclose（其他库/用例自身）不计数，避免无关调用干扰断言 */
+extern "C" int __wrap_fclose(FILE* stream)
+{
+    if (stream != NULL && stream == g_fileMock.mock_fp) {
+        g_fileMock.mock_fclose_cnt++;
+    }
+    return __real_fclose(stream);
+}
 
 /* 对 /etc/hccl_rootinfo.json 默认 stat 失败，使 TopoAddrInfoGetSize 走 mainboard_id 路径 */
 extern "C" int __wrap_stat(const char* path, struct stat* buf)
@@ -142,6 +156,8 @@ extern "C" FILE* __wrap_fopen(const char* path, const char* mode)
         if (fp == NULL) {
             return NULL;
         }
+        g_fileMock.mock_fp = fp;
+        g_fileMock.mock_fclose_cnt = 0;
         if (g_fileMock.tmpfile_content != NULL) {
             size_t n = strlen(g_fileMock.tmpfile_content);
             fwrite(g_fileMock.tmpfile_content, 1, n, fp);
@@ -177,6 +193,8 @@ static void FileMockReset()
     g_fileMock.fstat_fail = 0;
     g_fileMock.fread_short_read = 0;
     g_fileMock.tmpfile_content = NULL;
+    g_fileMock.mock_fp = NULL;
+    g_fileMock.mock_fclose_cnt = 0;
 }
 
 class TopoAddrInfoTest : public testing::Test {
@@ -504,6 +522,12 @@ int mock_halGetDeviceInfo(unsigned int devId, uint32_t moduleType, int32_t infoT
     return 0;
 }
 
+int mock_aclrtGetDeviceCount(uint32_t* count)
+{
+    *count = 0;
+    return 0;
+}
+
 void* mock_dlsym(void* handle, const char* symbol)
 {
     if (strcmp(symbol, "dcmiv2_init") == 0) {
@@ -527,6 +551,14 @@ void* mock_dlsym(void* handle, const char* symbol)
 
     if (strcmp(symbol, "aclrtGetLogicDevIdByUserDevId") == 0) {
         return (void*)mock_convertId;
+    }
+
+    if (strcmp(symbol, "aclrtGetPhyDevIdByUserDevId") == 0) {
+        return (void*)mock_convertId;
+    }
+
+    if (strcmp(symbol, "aclrtGetDeviceCount") == 0) {
+        return (void*)mock_aclrtGetDeviceCount;
     }
 
     if (strcmp(symbol, "halGetDeviceInfo") == 0) {
@@ -797,10 +829,51 @@ TEST_F(TopoAddrInfoTest, ut_rootinfo_for_server_uboe)
     free(buf);
 }
 
+// 解析350L rootinfo JSON并按拆层结构断言: level0=mesh(实例名带mesh组号), level1=clos
+static void Assert350LSplitLayerStructure(const char* buf)
+{
+    nlohmann::json rootinfo = nlohmann::json::parse(buf);
+    // topo_file_path必须指向350L专属拓扑文件(mainboard 0x44的唯一投影)
+    EXPECT_NE(rootinfo["topo_file_path"].get<std::string>().find("atlas_850_3.json"), std::string::npos);
+    ASSERT_EQ(rootinfo["rank_count"].get<int>(), 1);
+    ASSERT_FALSE(rootinfo["rank_list"].empty());
+    const auto& levelList = rootinfo["rank_list"][0]["level_list"];
+    // level0(mesh)+level1(clos)必须存在; RoCE层(level3)依赖真实XML, UT环境不保证生成
+    ASSERT_GE(levelList.size(), 2);
+
+    // 按net_layer索引层级, 屏蔽RoCE层存在与否带来的顺序差异
+    std::map<int, const nlohmann::json*> layers;
+    for (const auto& level : levelList) {
+        layers[level["net_layer"].get<int>()] = &level;
+    }
+    ASSERT_TRUE(layers.count(0) > 0);
+    ASSERT_TRUE(layers.count(1) > 0);
+
+    // level0: mesh层, netType为TOPO_FILE_DESC, 实例名带mesh组号(npu_id=0 -> _mesh0)
+    const nlohmann::json& level0 = *layers[0];
+    EXPECT_EQ(level0["net_type"].get<std::string>(), "TOPO_FILE_DESC");
+    EXPECT_NE(level0["net_instance_id"].get<std::string>().find("_mesh0"), std::string::npos);
+    // mesh EID在level0的地址列表中
+    const std::string level0Addrs = level0["rank_addr_list"].dump();
+    EXPECT_NE(level0Addrs.find("000000000f40030000100000df0088f8"), std::string::npos);
+    EXPECT_NE(level0Addrs.find("000000000f42030000100000df0098f8"), std::string::npos);
+    EXPECT_NE(level0Addrs.find("000000000f41030000100000df0090f8"), std::string::npos);
+
+    // level1: clos层, netType为CLOS, CLOS EID在level1的地址列表中而非level0
+    const nlohmann::json& level1 = *layers[1];
+    EXPECT_EQ(level1["net_type"].get<std::string>(), "CLOS");
+    const std::string level1Addrs = level1["rank_addr_list"].dump();
+    EXPECT_NE(level1Addrs.find("000000000f7f020000100000df00d9f8"), std::string::npos);
+    EXPECT_EQ(level0Addrs.find("000000000f7f020000100000df00d9f8"), std::string::npos);
+
+    // 350L按mesh组拆分level0实例, 与level1的OS级实例ID不同
+    EXPECT_NE(level0["net_instance_id"].get<std::string>(), level1["net_instance_id"].get<std::string>());
+}
+
 TEST_F(TopoAddrInfoTest, ut_rootinfo_for_350L)
 {
     /*
-    打桩350L机型, 预期正常输出, 输出的0层地址中包含一个mesh组网和一个clos组网
+    打桩350L机型, 预期正常输出: level0为按mesh组划分实例的mesh层, level1为clos层
      */
     unsigned int mainboard_id = 0x44;
     char drv_path[256] = "/usr/local/Ascend2";
@@ -844,16 +917,8 @@ TEST_F(TopoAddrInfoTest, ut_rootinfo_for_350L)
     EXPECT_EQ(ret, 0);
     printf("[%s]\n", buf);
 
-    // 校验mesh部分
-    EXPECT_TRUE(strstr(buf, "000000000f40030000100000df0088f8") != NULL);
-    EXPECT_TRUE(strstr(buf, "000000000f42030000100000df0098f8") != NULL);
-    EXPECT_TRUE(strstr(buf, "000000000f41030000100000df0090f8") != NULL);
-    //  校验CLOS地址
-    EXPECT_TRUE(strstr(buf, "000000000f7f020000100000df00d9f8") != NULL);
-
-    // 校验mesh层net type正确
-    EXPECT_TRUE(strstr(buf, "TOPO_FILE_DESC") != NULL);
-    // 校验clos层net type正确
+    // 按350L拆层结构逐层断言: level0/level1的netType、实例名与EID归属
+    Assert350LSplitLayerStructure(buf);
     free(buf);
 }
 
@@ -933,7 +998,7 @@ TEST_F(TopoAddrInfoTest, ut_rootinfo_for_server_uboe_16fm)
     spinfo.super_pod_id = 1;
     spinfo.server_index = 1;
     spinfo.chassis_id = 0x00000000;
-    spinfo.super_pod_type = 3;
+    spinfo.super_pod_type = TOPO_TYPE_SERVER_16FM;
 
     MOCKER(hal_get_mainboard_id).stubs().with(mockcpp::any(), outBoundP(&mainboard_id)).will(returnValue(0));
     MOCKER(hal_get_driver_install_path)
@@ -974,6 +1039,11 @@ TEST_F(TopoAddrInfoTest, ut_rootinfo_for_server_uboe_16fm)
 
     // 校验UBOE IP
     EXPECT_TRUE(strstr(buf, "10.10.20.2") != NULL);
+
+    // 16p fullmesh 的 mesh 层 net instance id 应为超节点级 sp_1
+    EXPECT_TRUE(strstr(buf, "\"net_instance_id\": \"sp_1\"") != NULL);
+    // 不应再出现服务器级 net instance id sp_1_srv_1
+    EXPECT_TRUE(strstr(buf, "\"net_instance_id\": \"sp_1_srv_1\"") == NULL);
 
     free(buf);
 }
@@ -1215,6 +1285,67 @@ TEST_F(TopoAddrInfoTest, Ut_PassThrough_FstatFail)
     int ret = TopoAddrInfoGet(0, buf, &bufSize);
     EXPECT_NE(ret, 0);
     EXPECT_TRUE(UtLogContains("failed to fstat")) << "应输出 fstat 失败日志";
+}
+
+/**
+ * @brief 验证 PassThrough 成功路径回填文件内容并释放 FILE*
+ */
+TEST_F(TopoAddrInfoTest, Ut_PassThrough_Success)
+{
+    const char* content = "0123456789abcdefghij"; /* 20 字节 */
+    g_fileMock.passthrough_enable = 1;
+    g_fileMock.tmpfile_content = content;
+
+    char buf[4096];
+    memset(buf, 0, sizeof(buf));
+    size_t bufSize = sizeof(buf);
+    int ret = TopoAddrInfoGet(0, buf, &bufSize);
+
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(bufSize, strlen(content));
+    EXPECT_STREQ(buf, content);
+    EXPECT_EQ(g_fileMock.mock_fclose_cnt, 1) << "成功路径必须 fclose，否则 FILE* 泄漏";
+}
+
+/**
+ * @brief 验证 PassThrough 的文件大小判定边界：文件大小恰好等于 bufSize 时仍成功
+ */
+TEST_F(TopoAddrInfoTest, Ut_PassThrough_FileSizeEqualsBufSize)
+{
+    const char* content = "0123456789abcdefghij";
+    g_fileMock.passthrough_enable = 1;
+    g_fileMock.tmpfile_content = content;
+
+    char buf[4096];
+    memset(buf, 0, sizeof(buf));
+    size_t bufSize = strlen(content);
+    int ret = TopoAddrInfoGet(0, buf, &bufSize);
+
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(bufSize, strlen(content));
+    EXPECT_EQ(g_fileMock.mock_fclose_cnt, 1);
+}
+
+/**
+ * @brief 验证 PassThrough 的文件大小判定边界：文件大小超出 bufSize 时报错并释放 FILE*
+ */
+TEST_F(TopoAddrInfoTest, Ut_PassThrough_FileSizeExceedsBufSize)
+{
+    g_fileMock.passthrough_enable = 1;
+    g_fileMock.tmpfile_content = "0123456789abcdefghij"; /* 20 字节 */
+
+    /* PassThrough 失败后 TopoAddrInfoGet 回退到 mainboard_id 路径，mock 失败使其快速返回 */
+    unsigned int m = 0;
+    MOCKER(hal_get_mainboard_id).stubs().with(mockcpp::any(), outBoundP(&m)).will(returnValue(-1));
+
+    char buf[4];
+    memset(buf, 0, sizeof(buf));
+    size_t bufSize = sizeof(buf);
+    int ret = TopoAddrInfoGet(0, buf, &bufSize);
+
+    EXPECT_NE(ret, 0);
+    EXPECT_TRUE(UtLogContains("exceeds buffer size")) << "应输出文件超限错误日志";
+    EXPECT_EQ(g_fileMock.mock_fclose_cnt, 1);
 }
 
 /**

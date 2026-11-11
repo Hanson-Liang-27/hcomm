@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <errno.h>
 #include "securec.h"
 #include "user_log.h"
 #include "config_log.h"
@@ -51,7 +52,6 @@ struct RsCtxOps gRaRsCtxOps = {
     .ctxQpBind = RsCtxQpBind,
     .ctxQpUnbind = RsCtxQpUnbind,
     .ctxBatchSendWr = RsCtxBatchSendWr,
-    .ctxUpdateCi = RsCtxUpdateCi,
     .ctxGetAuxInfo = RsCtxGetAuxInfo,
     .ctxGetCrErrInfoList = RsCtxGetCrErrInfoList,
     .ctxNotifyEvent = RsCtxNotifyEvent,
@@ -657,25 +657,6 @@ int RaRsCtxBatchSendWr(char *inBuf, char *outBuf, int *outLen, int *opResult, in
     return 0;
 }
 
-int RaRsCtxUpdateCi(char *inBuf, char *outBuf, int *outLen, int *opResult, int rcvBufLen)
-{
-    (void)outBuf;
-    (void)outLen;
-    union OpCtxUpdateCiData *opData = (union OpCtxUpdateCiData *)(inBuf + sizeof(struct MsgHead));
-    struct RaRsDevInfo devInfo = {0};
-
-    HCCP_CHECK_PARAM_LEN_RET_HOST(sizeof(union OpCtxUpdateCiData), sizeof(struct MsgHead), rcvBufLen, opResult);
-
-    RaRsSetDevInfo(&devInfo, opData->txData.phyId, opData->txData.devIndex);
-    *opResult = gRaRsCtxOps.ctxUpdateCi(&devInfo, opData->txData.jettyId, opData->txData.ci);
-    if (*opResult != 0) {
-        hccp_err("[update_ci][ra_rs_ctx]update ci failed, ret[%d] phyId[%u] devIndex[0x%x] qpId[%u]", *opResult,
-            devInfo.phyId, devInfo.devIndex, opData->txData.jettyId);
-    }
-
-    return 0;
-}
-
 int RaRsCtxGetAuxInfo(char *inBuf, char *outBuf, int *outLen, int *opResult, int rcvBufLen)
 {
     (void)outLen;
@@ -749,8 +730,13 @@ int RaRsCtxNotifyEvent(char *inBuf, char *outBuf, int *outLen, int *opResult, in
     RaRsSetDevInfo(&devInfo, opData->txData.phyId, opData->txData.devIndex);
     *opResult = gRaRsCtxOps.ctxNotifyEvent(&devInfo, &opData->txData.event);
     if (*opResult != 0) {
-        hccp_err("[notify][event]ctxNotifyEvent failed, ret[%d], phyId[%u] devIndex[0x%x]", *opResult, devInfo.phyId,
-            devInfo.devIndex);
+        if (*opResult == -EBUSY) {
+            hccp_warn_rma("[notify][event]ctxNotifyEvent unsuccessful, ret[%d], phyId[%u] devIndex[0x%x]", *opResult,
+                devInfo.phyId, devInfo.devIndex);
+        } else {
+            hccp_err("[notify][event]ctxNotifyEvent failed, ret[%d], phyId[%u] devIndex[0x%x]", *opResult,
+                devInfo.phyId, devInfo.devIndex);
+        }
     }
 
     return 0;

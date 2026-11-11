@@ -35,7 +35,7 @@ HcclResult HcclThreadAcquire(HcclComm comm, CommEngine engine, uint32_t threadNu
 | comm | 输入 | 通信域句柄。<br>HcclComm类型的定义可参见[HcclComm](../../../comm_mgr_c/data_type_definition/HcclComm.md)。 |
 | engine | 输入 | 通信引擎类型。<br>CommEngine类型的定义可参见[CommEngine](../../datatype_definition/CommEngine.md)。 |
 | threadNum | 输入 | 通信线程数量。 |
-| notifyNumPerThread | 输入 | 每个通信线程中的同步资源（Notify）数量。取值范围为：\[0, 65535\]，具体数量限制由具体产品限定。建议根据业务场景合理配置，避免资源不足或浪费。 |
+| notifyNumPerThread | 输入 | 每个通信线程中的同步资源（Notify）数量。取值范围为：\[0, 65535\]（受ThreadConfig字段宽度限制），实际可用数量由底层资源（notify创建、device内存等）决定。建议根据业务场景合理配置，避免资源不足或浪费。 |
 | threads | 输出 | 返回的通信线程句柄。需传入threadNum大小的ThreadHandle类型数组。<br>ThreadHandle类型的定义可参见[ThreadHandle](../../datatype_definition/ThreadHandle.md)。 |
 
 ## 返回值
@@ -48,23 +48,23 @@ HcclResult HcclThreadAcquire(HcclComm comm, CommEngine engine, uint32_t threadNu
 
 2. 当前各产品形态支持的CommEngine范围：
 
-  <!-- npu="950" id6 -->
-  - Ascend 950PR&950DT系列产品：
-    - COMM_ENGINE_CPU_TS
-    - COMM_ENGINE_AICPU_TS
-  <!-- end id6 -->
+   <!-- npu="950" id6 -->
+   - Ascend 950PR&950DT系列产品：
+     - COMM_ENGINE_CPU_TS
+     - COMM_ENGINE_AICPU_TS
+   <!-- end id6 -->
 
-  <!-- npu="A3" id7 -->
-  - Atlas A3系列产品：
-    - COMM_ENGINE_CPU_TS
-    - COMM_ENGINE_AICPU_TS
-  <!-- end id7 -->
+   <!-- npu="A3" id7 -->
+   - Atlas A3系列产品：
+     - COMM_ENGINE_CPU_TS
+     - COMM_ENGINE_AICPU_TS
+   <!-- end id7 -->
 
-  <!-- npu="910b" id8 -->
-  - Atlas A2系列产品：
-    - COMM_ENGINE_CPU_TS
-    - COMM_ENGINE_AICPU_TS
-  <!-- end id8 -->
+   <!-- npu="910b" id8 -->
+   - Atlas A2系列产品：
+     - COMM_ENGINE_CPU_TS
+     - COMM_ENGINE_AICPU_TS
+   <!-- end id8 -->
 
 3. 该接口不支持COMM_ENGINE_AIV和COMM_ENGINE_CCU两种通信引擎。
 4. comm必须为有效的通信域句柄（由通信域创建接口获得，调用期间保持有效）。禁止传入空指针、野指针或已销毁的句柄。

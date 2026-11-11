@@ -24,9 +24,9 @@
 #include "iterator.h"
 #include "types.h"
 #include "topo_common_types.h"
+#include "common/comm_port_constants_pub.h"
 
 namespace Hccl {
-constexpr u32 DEFAULT_LISTENING_PORT = 60001;
 class NetInstance {
 public:
     class ConnInterface {
@@ -116,7 +116,7 @@ public:
             nodeId_ = GenerateNodeId(rankId);
         }
         static NodeId GenerateNodeId(RankId rankId);
-        void AddNetInstance(const std::shared_ptr<NetInstance>& NetInstance);
+        HcclResult AddNetInstance(const std::shared_ptr<NetInstance>& netInst);
         LocalId GetLocalId() const;
         LocalId GetReplacedLocalId() const;
         RankId GetRankId() const;
@@ -241,7 +241,7 @@ public:
     const std::vector<std::shared_ptr<Fabric>>& GetFabrics() const;
     Graph<Node, Link>& GetGraph();
     void AddRankId(const RankId rankId);
-    void AddNode(const std::shared_ptr<Node>& node);
+    HcclResult AddNode(const std::shared_ptr<Node>& node);
     void AddLink(const std::shared_ptr<Link>& link);
     void DeleteLink(const NodeId srcNodeId, const NodeId dstNodeId);
 
@@ -263,8 +263,8 @@ protected:
     std::unordered_map<PlaneId, NodeId> planeId2Node; // 除了创建时，其他是否需要使用
     Graph<Node, Link> vGraph;
 
-    void AddPeer(const std::shared_ptr<Peer>& peer);
-    void AddFabric(const std::shared_ptr<Fabric>& fabric);
+    HcclResult AddPeer(const std::shared_ptr<Peer>& peer);
+    HcclResult AddFabric(const std::shared_ptr<Fabric>& fabric);
 };
 
 class InnerNetInstance : public NetInstance {

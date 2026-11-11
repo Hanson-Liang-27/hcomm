@@ -14,9 +14,9 @@
 #include <memory>
 #include <vector>
 #include <string>
-#include "endpoint_pair.h"
+#include "endpoint_pair/endpoint_pair_pub.h"
 #include "reged_mem_mgr.h"
-#include "rma_buffer_mgr.h"
+#include "common/rma_buffer_mgr_pub.h"
 #include "buffer_key.h"
 #include "local_ub_rma_buffer.h"
 
@@ -38,6 +38,8 @@ public:
     HcclResult
     MemoryExport(const EndpointDesc& endpointDesc, void* memHandle, void** memDesc, uint32_t* memDescLen) override;
     HcclResult GetAllMemHandles(void** memHandles, uint32_t* memHandleNum) override;
+    // 按 handle 反查注册记录的共享指针，供 endpoint 实例级归属记账
+    HcclResult FindHandleRecord(void* memHandle, std::shared_ptr<Hccl::LocalUbRmaBuffer>* out) const;
     HcclResult GetMemDesc(const EndpointDesc endpointDesc, Hccl::LocalUbRmaBuffer* localUbRmaBuffer) const;
 
     RdmaHandle GetRdmaHandle() const { return rdmaHandle_; }

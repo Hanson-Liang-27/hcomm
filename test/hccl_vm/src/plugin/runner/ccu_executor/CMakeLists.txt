@@ -26,14 +26,13 @@ target_include_directories(ccu_executor PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/trans_executor
     ${CMAKE_CURRENT_SOURCE_DIR}/trace
     ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/include/runnerdb
     ${PROJECT_SOURCE_DIR}/include/store
     ${ASCEND_CANN_PACKAGE_PATH}/include
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/profiling
 
-    ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+    ${HCCLVM_CCU_MICROCODE_DIR}
 )
 
 target_link_libraries(ccu_executor PRIVATE

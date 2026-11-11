@@ -200,6 +200,7 @@ RS_ATTRI_VISI_DEF int RsRdevInit(struct rdev rdevInfo, unsigned int notifyType, 
 RS_ATTRI_VISI_DEF int RsRdevInitWithBackup(struct rdev rdevInfo, struct rdev backupRdevInfo, unsigned int notifyType,
     unsigned int *rdevIndex);
 RS_ATTRI_VISI_DEF int RsRdevGetPortStatus(unsigned int phyId, unsigned int rdevIndex, enum PortStatus *status);
+RS_ATTRI_VISI_DEF int RsRdevGetAttr(unsigned int phyId, unsigned int rdevIndex, struct RdevAttr *attr);
 RS_ATTRI_VISI_DEF int RsGetLbMax(unsigned int phyId, unsigned int rdevIndex, int *lbMax);
 RS_ATTRI_VISI_DEF int RsRdevDeinit(unsigned int phyId, unsigned int notifyType, unsigned int rdevIndex);
 
@@ -364,6 +365,15 @@ static inline bool RsIsCustomInterfaceSupported(void)
     productType = RsGetProductType(0);
     return (productType != PRODUCT_TYPE_310p);
 }
+
+static inline bool RsIsClientIpCheckSupported(void)
+{
+    enum ProductType productType;
+    productType = RsGetProductType(0);
+    return (productType == PRODUCT_TYPE_310p || productType == PRODUCT_TYPE_910 || productType == PRODUCT_TYPE_910B ||
+            productType == PRODUCT_TYPE_910_93);
+}
+
 #ifdef __cplusplus
 }
 #endif

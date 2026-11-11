@@ -1,4 +1,4 @@
-﻿# -----------------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------------------------
 # Copyright (c) 2025 Huawei Technologies Co., Ltd.
 # This program is free software, you can redistribute it and/or modify it under the terms and conditions of
 # CANN Open Software License Agreement Version 2.0 (the "License").
@@ -36,9 +36,7 @@ set(hccl_llt_stub
     ${HCCL_LLT_ROOT}/stub/llt_next_orion_ccu_stub.cc
 
     ${HCCL_LLT_ROOT}/stub/llt_hccl_stub_orion_adapter.cc
-    ${HCCL_LLT_ROOT}/stub/llt_hccl_stub_dpu_kernel_entrance.cc
-    ${HCCL_CODE_ROOT}/src/legacy/ascend950/framework/communicator/hostdpu/task_service.cc
-    ${HCCL_CODE_ROOT}/src/legacy/ascend950/framework/communicator/hostdpu/dpu_kernel_entrance.cc
+    ${HCCL_LLT_ROOT}/stub/llt_dca_stub.cc
 )
 
 file(GLOB_RECURSE ALGORITHM_SOURCES "${HCCL_CODE_ROOT}/src/legacy/ascend910/algorithm/*.cc")
@@ -52,6 +50,7 @@ file(GLOB_RECURSE COLL_COMMUNICATOR_MGR "${HCCL_CODE_ROOT}/src/coll_communicator
 list(REMOVE_ITEM COLL_COMMUNICATOR_MGR
     "${HCCL_CODE_ROOT}/src/coll_communicator_mgr/rank_graph/rank_graph_builder/detour_service.cc"
     "${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/profiling/host/dfx_profiling_reporter.cc"
+    "${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/detect_connection_anomalies/detect_connection_anomalies.cc"
 )
 
 set(EXCLUDE_FREAMEWORK_DEVICE_REGEX
@@ -63,6 +62,7 @@ set(EXCLUDE_FREAMEWORK_DEVICE_REGEX
     "${HCCL_CODE_ROOT}/src/legacy/ascend910/framework/device/framework/zero_copy_address_mgr.cc"
     "${HCCL_CODE_ROOT}/src/legacy/ascend910/common/launch_aicpu/launch_aicpu.cc"
     "${HCCL_CODE_ROOT}/src/legacy/ascend910/framework/op_base/src/op_base_device.cc"
+    "${HCCL_CODE_ROOT}/src/legacy/ascend910/framework/plf_resource_runtime_register.cc"
     )
 list(REMOVE_ITEM FRAMEWORK_HOST_SOURCES ${EXCLUDE_FREAMEWORK_DEVICE_REGEX})
 list(REMOVE_ITEM COLL_COMMUNICATOR_MGR ${EXCLUDE_FREAMEWORK_DEVICE_REGEX})
@@ -105,13 +105,14 @@ list(FILTER FRAMEWORK_HOST_SOURCES EXCLUDE REGEX "src/legacy/ascend910/framework
 set(orion_list
     ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/aicpu_ts_thread.cc
     ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/thread.cc
+    ${HCCL_CODE_ROOT}/src/base_comm/common/process_exit_flag.cc
     ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/cpu_ts_thread.cc
 
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/interface/aicpu_ts_thread_interface.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/common/exception/exception_definition.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/transport/aicpu/ub_transport_lite_impl.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/transport/aicpu/p2p_transport_lite_impl.cc
-    ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/transport/aicpu/roce_transport_lite_impl.cc
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/aicpu/roce_host_loc/device/roce_host_loc_transport_lite_impl.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/buffer/buffer.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/buffer/aicpu/rma_buf_slice_lite.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/notify/aicpu/notify_lite.cc
@@ -119,7 +120,7 @@ set(orion_list
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/notify/ipc_remote_notify.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/buffer/aicpu/rma_buffer_lite.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/connection/aicpu/rma_conn_lite.cc
-    ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/connection/aicpu/rdma_conn_lite_v2.cc
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/aicpu/roce_host_loc/device/roce_host_loc_conn_lite.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/buffer/aicpu/rmt_rma_buf_slice_lite.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/connection/aicpu/ub_conn_lite.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/connection/aicpu/ub_conn_lite_mgr.cc
@@ -137,7 +138,6 @@ set(orion_list
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/framework/resource_manager/socket/socket_handle_manager.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/common/hccp_hdc_manager.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/common/tp_qos.cc
-    ${HCCL_CODE_ROOT}/src/legacy/ascend950/framework/communicator/rank_consistency_checker_v2.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/common/checkcrc.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/stream/aicpu/rtsq_a5.cc
     ${HCCL_CODE_ROOT}/src/legacy/ascend950/unified_platform/resource/stream/aicpu/rtsq_base.cc
@@ -145,7 +145,7 @@ set(orion_list
     ${HCCL_CODE_ROOT}/src/base_comm/primitives/aicpu/task_cache/aicpu_task_cache_manager.cc
     ${HCCL_CODE_ROOT}/src/base_comm/primitives/aicpu/task_cache/aicpu_task_cache_entry.cc
     ${HCCL_CODE_ROOT}/src/base_comm/primitives/aicpu/task_cache/aicpu_task_cache.cc
-    ${HCCL_CODE_ROOT}/src/base_comm/primitives/aicpu/aicpu_task_cache_c_adpt.cc
+    ${HCCL_CODE_ROOT}/src/base_comm/primitives/api_c_adpt/aicpu_task_cache_c_adpt.cc
 )
 
 set(hccl_list
@@ -248,7 +248,6 @@ target_include_directories(hccl_llt  PRIVATE
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/config_mgr
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine/threads
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine/threads/order_launch_thread_mgr
-    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine/notify
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_mems
     ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res
@@ -353,6 +352,10 @@ target_include_directories(hccl_llt  PRIVATE
     ${HCCL_CODE_ROOT}/src/legacy/ascend910/framework/device/aicpu_kfc/inc
     ${HCCL_CODE_ROOT}/src/legacy/ascend910/framework/device/aicpu_kfc/common
     ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/cpu_thread
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/cpu_thread/legacy_dpu_thread
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/device
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/flush
 
     # proto.h头文件
     ${CMAKE_BINARY_DIR}/proto/hccl_llt
@@ -394,9 +397,13 @@ target_include_directories(hccl_llt  PRIVATE
     ${HCCL_CODE_ROOT}/src/base_comm/common/
     ${HCCL_CODE_ROOT}/src/base_comm/common/debug
     ${HCCL_CODE_ROOT}/src/base_comm/common/device
+    ${HCCL_CODE_ROOT}/src/base_comm/dfx/aicpu
+    ${HCCL_CODE_ROOT}/src/base_comm/dfx/aicpu/common
     ${HCCL_CODE_ROOT}/src/base_comm/dfx/
     ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels
     ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/aicpu
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/aicpu/roce_host_loc
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/aicpu/roce_host_loc/device
     ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/aiv
     ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/ccu
     ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoint_pairs/channels/host
@@ -457,8 +464,8 @@ target_include_directories(hccl_llt  PRIVATE
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device/c_adpt
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device/resource_mgr/local/my_rank/comm_engine_reses
-    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/device/resource_mgr/remote
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/group_schedule_mgr
+    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/communicator/op_group_queue_mgr
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/config_mgr
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_mems/
@@ -514,6 +521,8 @@ target_include_directories(hccl_llt  PRIVATE
 
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/cluster_monitor
+    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/inconsistentCheck
+    ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/detect_connection_anomalies
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/profiling
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/profiling/aicpu
     ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/profiling/host

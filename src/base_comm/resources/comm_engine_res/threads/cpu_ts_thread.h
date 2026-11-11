@@ -29,13 +29,15 @@ public:
     HcclResult DeInit() override;
     std::string& GetUniqueId() override;
     uint32_t GetNotifyNum() const override;
+    size_t GetNotifySize() const override;
     LocalNotify* GetNotify(uint32_t index) const override;
     HcclResult SupplementNotify(uint32_t notifyNum) override;
 
     // A3 Stream & A5 Stream
-    bool IsDeviceA5() const override;
+    bool IsDeviceA5() const override { return devType_ == DevType::DEV_TYPE_950 || devType_ == DevType::DEV_TYPE_960; };
     Stream* GetStream() const override;
     void* GetStreamLitePtr() const override;
+    s32 GetStreamId() const override;
     void LaunchTask() const override;
     void TryLaunchTask() const override;
 
@@ -52,6 +54,13 @@ public:
     bool GetMaster() const override;
     void SetIsMaster(bool isMaster) override;
 
+    HcclResult GetExportRtsqInfo(int32_t& streamId, uint32_t& sqId);
+#ifndef CCL_KERNEL_AICPU
+    // 本线程导出到目标引擎时持有的 Entity；生命周期随本线程对象。
+    HcclResult PreAllocThreadEntity(ThreadHandle& handle, CommEngine targetEngine);
+    ThreadEntityResources* GetThreadEntityResources(CommEngine targetEngine) const;
+#endif
+
 private:
     bool isMaster_{false};
     struct HcclStreamInfo {
@@ -67,6 +76,7 @@ private:
         uint64_t sqCqContextSize = 0; // 记录sqeContext大小
     };
     std::string& UpdateUniqueId();
+    HcclResult EnsureExportStream();
     HcclResult DeInitImpl();
     rtStream_t rtStream_ = nullptr;
     bool isDeviceSide_ = false;
@@ -75,8 +85,8 @@ private:
     uint32_t devId_ = INVALID_UINT;
     NotifyLoadType notifyLoadType_ = NotifyLoadType::HOST_NOTIFY;
     std::unique_ptr<Stream> stream_;
-    DevType devType_ = DevType::DEV_TYPE_COUNT;
     std::vector<std::unique_ptr<LocalNotify>> notifys_; // 正常路径自建自拥有
+    DevType devType_ = DevType::DEV_TYPE_COUNT;
     std::vector<LocalNotify*> injectedNotifys_; // GE保序注入的借用引用（对象归管理器，非空时GetNotify/序列化走此数组）
 
     std::unique_ptr<Stream> streamDevice_; // 在把用户的stream生成的thread导出到device时使用

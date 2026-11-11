@@ -169,12 +169,12 @@ struct OpcodeInterfaceInfo gRaInterfaceInfoList[] = {
     {RA_RS_CTX_QP_BIND, 0},
     {RA_RS_CTX_QP_UNBIND, 0},
     {RA_RS_CTX_BATCH_SEND_WR, 0},
-    {RA_RS_CTX_UPDATE_CI, 0},
     {RA_RS_CTX_GET_AUX_INFO, 0},
     {RA_RS_CTX_GET_CR_ERR_INFO_LIST, 0},
     {RA_RS_CTX_GET_UB_CONTEXT, 0},
     {RA_RS_CTX_NOTIFY_EVENT, 0},
     {RA_RS_GET_NET_API_VERSION, 0},
+    {RA_RS_BATCH_GET_INTERFACE_VERSION, 0},
 
     // inner opcode version
     {RA_RS_HDC_SESSION_CLOSE, 0},
@@ -384,12 +384,13 @@ STATIC int HdcSendRecvPktRecvCheck(int rcvBufLen, unsigned int outDataLen, struc
 
 STATIC int HdcSendRecvPkt(unsigned int phyId, void *sendRcvBuf, unsigned int inBufLen, unsigned int outBufLen)
 {
-    int ret;
-    char *recvBuf = NULL;
     struct drvHdcMsg *pMsgRcv = NULL, *pMsgSnd = NULL;
-    int rcvBufLen = 0;
-
     struct MsgHead *recvMsgHead = NULL;
+    char *recvBuf = NULL;
+    int rcvBufLen = 0;
+    int tmpRet = 0;
+    int value = 0;
+    int ret;
 
     RA_PTHREAD_MUTEX_LOCK(&gRaHdc[phyId].lock);
     HDC_SESSION session = gRaHdc[phyId].session;
@@ -417,8 +418,10 @@ STATIC int HdcSendRecvPkt(unsigned int phyId, void *sendRcvBuf, unsigned int inB
     }
     ret = HdcSendRecvPktRecv(session, phyId, pMsgRcv, &recvBuf, &rcvBufLen);
     if (ret == -DRV_ERROR_WAIT_TIMEOUT) {
-        hccp_err("[send_recv][pkt]HDC broken, pkt recv err ret(%d) phyId(%u)", ret, phyId);
         gRaHdc[phyId].lastRecvStatus = ret;
+        tmpRet = DlHalHdcGetSessionAttr(session, HDC_SESSION_ATTR_DFX, &value);
+        hccp_err("[send_recv][pkt]HDC broken, pkt recv err ret(%d) phyId(%u) tmpRet(%d) value(%d)", ret, phyId, tmpRet,
+            value);
         goto msg_err;
     }
     if (ret) {
@@ -428,7 +431,20 @@ STATIC int HdcSendRecvPkt(unsigned int phyId, void *sendRcvBuf, unsigned int inB
     RA_PTHREAD_MUTEX_UNLOCK(&gRaHdc[phyId].lock);
     recvMsgHead = (struct MsgHead *)recvBuf;
     ret = HdcSendRecvPktRecvCheck(rcvBufLen, outBufLen, recvMsgHead, pMsgRcv);
-    CHK_PRT_RETURN(ret, hccp_err("[send_recv][pkt]HDC pkt recv check ret(%d) phyId(%u)", ret, phyId), ret);
+    if (ret != 0) {
+        RA_PTHREAD_MUTEX_LOCK(&gRaHdc[phyId].lock);
+        if (gRaHdc[phyId].session == NULL) {
+            RA_PTHREAD_MUTEX_UNLOCK(&gRaHdc[phyId].lock);
+            hccp_err("[send_recv][pkt]HDC pkt recv check ret(%d) phyId(%u)", ret, phyId);
+            return ret;
+        }
+
+        tmpRet = DlHalHdcGetSessionAttr(gRaHdc[phyId].session, HDC_SESSION_ATTR_DFX, &value);
+        RA_PTHREAD_MUTEX_UNLOCK(&gRaHdc[phyId].lock);
+        hccp_err("[send_recv][pkt]HDC pkt recv check ret(%d) phyId(%u) tmpRet(%d) value(%d)", ret, phyId, tmpRet,
+            value);
+        return ret;
+    }
 
     ret = memcpy_s(sendRcvBuf, outBufLen, recvBuf, rcvBufLen);
     if (ret) {
@@ -468,8 +484,12 @@ STATIC int MsgHeadCheck(struct MsgHead *sendRcvHead, unsigned int opcode, int rs
     }
 
     ret = (sendRcvHead->opcode != opcode) || (sendRcvHead->msgDataLen != msgDataLen);
-
-    return (ret != 0 ? -EPERM : 0);
+    CHK_PRT_RETURN(ret != 0,
+        hccp_err("[process][ra_hdc_msg]sendRcvHead->opcode:%u != opcode:%u or "
+                 "sendRcvHead->msgDataLen:%u != msgDataLen:%u",
+            sendRcvHead->opcode, opcode, sendRcvHead->msgDataLen, msgDataLen),
+        -EPERM);
+    return 0;
 }
 
 int RaHdcProcessMsg(unsigned int opcode, unsigned int phyId, char *data, unsigned int dataSize)
@@ -668,16 +688,62 @@ STATIC int RaHdcGetOpcodeVersion(unsigned int phyId, unsigned int interfaceOpcod
     return 0;
 }
 
+STATIC int RaHdcBatchGetOpcodeVersion(unsigned int phyId, unsigned int num)
+{
+    union OpBatchGetVersionData versionInfo = {0};
+    unsigned int batchVersion = 0;
+    unsigned int txOpcodeNum;
+    unsigned int i;
+    int ret;
+
+    CHK_PRT_RETURN(num > MAX_BATCH_OPCODE_NUM,
+        hccp_warn_init("[get][ra_hdc_all_opcode_version]num(%u) exceeds MAX_BATCH_OPCODE_NUM(%u), fallback phyId(%u)",
+            num, MAX_BATCH_OPCODE_NUM, phyId),
+        -EPROTONOSUPPORT);
+
+    ret = RaHdcGetOpcodeVersion(phyId, RA_RS_BATCH_GET_INTERFACE_VERSION, &batchVersion);
+    CHK_PRT_RETURN(ret != 0 || batchVersion < RA_RS_OPCODE_BASE_VERSION,
+        hccp_warn_init("[get][ra_hdc_all_opcode_version]batch not support, ret(%d) batchVersion(%u) phyId(%u)", ret,
+            batchVersion, phyId),
+        -EPROTONOSUPPORT);
+
+    versionInfo.txData.opcodeNum = num;
+    txOpcodeNum = versionInfo.txData.opcodeNum;
+    for (i = 0; i < versionInfo.txData.opcodeNum; i++) {
+        versionInfo.txData.opcode[i] = gRaInterfaceInfoList[i].opcode;
+    }
+
+    ret = RaHdcProcessMsg(RA_RS_BATCH_GET_INTERFACE_VERSION, phyId, (char *)&versionInfo,
+        sizeof(union OpBatchGetVersionData));
+    CHK_PRT_RETURN(ret != 0,
+        hccp_warn_init("[get][ra_hdc_all_opcode_version]batch unsuccessful, fallback ret(%d) phyId(%u)", ret, phyId),
+        ret);
+
+    CHK_PRT_RETURN(versionInfo.rxData.opcodeNum != txOpcodeNum,
+        hccp_warn_init("[get][ra_hdc_all_opcode_version]opcodeNum mismatch, rxNum(%u) txNum(%u) phyId(%u)",
+            versionInfo.rxData.opcodeNum, txOpcodeNum, phyId),
+        -EPIPE);
+
+    for (i = 0; i < versionInfo.rxData.opcodeNum; i++) {
+        gRaInterfaceInfoList[i].version = versionInfo.rxData.version[i];
+    }
+    return 0;
+}
+
 void RaHdcGetAllOpcodeVersion(unsigned int phyId)
 {
-    int num = sizeof(gRaInterfaceInfoList) / sizeof(gRaInterfaceInfoList[0]);
+    unsigned int num = sizeof(gRaInterfaceInfoList) / sizeof(gRaInterfaceInfoList[0]);
+    unsigned int i;
     int ret;
-    int i;
+
+    if (RaHdcBatchGetOpcodeVersion(phyId, num) == 0) {
+        return;
+    }
 
     for (i = 0; i < num; i++) {
         ret = RaHdcGetOpcodeVersion(phyId, gRaInterfaceInfoList[i].opcode, &gRaInterfaceInfoList[i].version);
         if (ret != 0) {
-            hccp_warn_rma("ra_hdc_get_opcode_version unsuccessful, ret[%d], opcode[%d]", ret,
+            hccp_warn_init("ra_hdc_get_opcode_version unsuccessful, ret[%d], opcode[%u]", ret,
                 gRaInterfaceInfoList[i].opcode);
             continue;
         }

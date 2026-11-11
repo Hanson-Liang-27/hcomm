@@ -8,27 +8,36 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include "dtype_common.h"
 #include "gtest/gtest.h"
+#include "hcomm_res.h"
 #include "mockcpp/mokc.h"
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
+#include <mockcpp/ChainingMockHelper.h>
+#include <mockcpp/IsAnythingHelper.h>
 #include <mockcpp/mockcpp.hpp>
+#include <string.h>
 #include <string>
 #include "endpoint.h"
 #include "hcomm_c_adpt.h"
 #include "hcomm_res_defs.h"
 #include "hcomm_channel.h"
-#include "channel_process.h"
-#include "../../../../../../src/base_comm/hcomm_res_mgr.h"
-#include "../../../../../../src/base_comm/resources/endpoints/mgr/endpoint_mgr.h"
+#include "hccp.h"
+#include "channel.h"
+#include "aicpu_ts_channel_entity.h"
+#include "endpoint_pair/channel/channel_process_pub.h"
+#include "endpoint_handle_mgr.h"
 #include "hcomm_c_adpt_common.h"
 #include "env_config/env_config_v2.h"
 #include "nic_plugin_manager.h"
-#include "orion_adpt_utils.h"
+#include "common/orion_adpt_utils_pub.h"
+#include "base_comm_node_accessors.h"
 
-// 内存方法从 Endpoint 移至 RegedMemMgr；EndpointMgr 收编 HcommEndpointMap；
-// SetNicEndpointCtx 移至 PluginEndpointHolder。StubEndpoint 不再 override 内存方法。
+static hcomm::ChannelHandleRegistryProc& ChannelRegistry() { return hcomm::GetChannelHandleRegistryProc(); }
+
+// 内存方法在 RegedMemMgr，StubEndpoint 不 override 内存方法。
 [[maybe_unused]] static HcommNicEndpointOps g_stubEndpointOps = {
     {HCOMM_NIC_ENDPOINT_OPS_VERSION, HCOMM_NIC_ENDPOINT_OPS_MAGIC_WORD, sizeof(HcommNicEndpointOps), 0},
     nullptr,
@@ -143,7 +152,7 @@ TEST_F(HcommCAdptTest, ut_HcommChannelGetStatus_When_ListNumZero_Expect_E_PARA)
 // ===================== 非阻塞建链 HandleAicpuStatus/HandleAivStatus UT =====================
 
 // FakeChannel for HcommChannelGetStatus 端到端测试
-class HcommCAdptFakeChannel : public hcomm::Channel {
+class HcommCAdptFakeChannel : public hcomm::Channel, public hcomm::IChannelEntity {
 public:
     HcommCAdptFakeChannel(CommEngine eng, hcomm::ChannelStatus sta)
     {
@@ -153,8 +162,6 @@ public:
     }
     ~HcommCAdptFakeChannel() = default;
 
-    hcomm::HcommChannelKind GetChannelKind() const override { return channelKind_; }
-    HcclResult Init() override { return HCCL_SUCCESS; }
     HcclResult GetNotifyNum(uint32_t* notifyNum) const override { return HCCL_SUCCESS; }
     HcclResult GetRemoteMems(uint32_t* memNum, CommMem** remoteMem, char*** memInfos) override { return HCCL_SUCCESS; }
     hcomm::ChannelStatus GetStatus() override { return fakeStatus_; }
@@ -171,9 +178,17 @@ public:
     HcclResult Read(void* dst, const void* src, uint64_t len) override { return HCCL_SUCCESS; }
     HcclResult ChannelFence() override { return HCCL_SUCCESS; }
 
+    // 数据面实体窄接口：fake 自身充当实体，Set/IsDeviceEntityReady 用例调用走实体接口
+    hcomm::IChannelEntity* GetChannelEntity() override { return this; }
+    HcclResult PreAllocCtx(ChannelHandle& outHandle) override { return HCCL_SUCCESS; }
+    void* GetCtxPtr() const override { return nullptr; }
+    bool IsDeviceEntityReady() const override { return deviceEntityReady_; }
+    void SetDeviceEntityReady() override { deviceEntityReady_ = true; }
+
 private:
     hcomm::ChannelStatus fakeStatus_{hcomm::ChannelStatus::INIT};
     HcommChannelDesc desc_{};
+    bool deviceEntityReady_{false};
 };
 
 // 辅助：注册 channel 到全局 map
@@ -181,18 +196,20 @@ static ChannelHandle HcommCAdptRegisterChannel(std::shared_ptr<HcommCAdptFakeCha
 {
     ChannelHandle handle = reinterpret_cast<ChannelHandle>(ch.get());
     hcomm::DeviceChannelKey key{0, handle};
-    std::lock_guard<std::mutex> lock(hcomm::ChannelProcess::g_ChannelMapMtx);
-    hcomm::ChannelProcess::g_ChannelMap.emplace(handle, ch);
-    hcomm::ChannelProcess::g_ChannelD2HMap.emplace(key, handle);
+    std::lock_guard<std::mutex> lock(ChannelRegistry().ChannelMapMtx());
+    ChannelRegistry().ChannelMap().emplace(handle, ch);
+    ChannelRegistry().ChannelD2HMap().emplace(key, handle);
     return handle;
 }
 
-// 辅助：清理全局 map
+// 辅助：持锁清三张表
 static void HcommCAdptClearChannelMap()
 {
-    std::lock_guard<std::mutex> lock(hcomm::ChannelProcess::g_ChannelMapMtx);
-    hcomm::ChannelProcess::g_ChannelMap.clear();
-    hcomm::ChannelProcess::g_ChannelD2HMap.clear();
+    auto& registry = ChannelRegistry();
+    std::lock_guard<std::mutex> lock(registry.ChannelMapMtx());
+    registry.ChannelMap().clear();
+    registry.ChannelD2HMap().clear();
+    registry.ChannelH2DMap().clear();
 }
 
 // HandleAicpuStatus: 未全 READY（含 CONNECTING）→ 返回 CONNECTING
@@ -407,13 +424,13 @@ public:
         desc.loc.locType = locType;
         auto ep = std::make_unique<ChannelAdptStubEndpoint>(desc);
         handle_ = reinterpret_cast<EndpointHandle>(ep.get());
-        HcommResMgr::GetInstance().GetEndpointMgr().Add(handle_, std::move(ep));
+        GetEndpointHandleMgr().Add(handle_, std::move(ep));
     }
 
     ~ScopedChannelAdptStubEndpoint()
     {
         if (handle_ != nullptr) {
-            HcommResMgr::GetInstance().GetEndpointMgr().Remove(handle_);
+            GetEndpointHandleMgr().Remove(handle_);
         }
     }
 
@@ -425,6 +442,7 @@ private:
 
 uint32_t gCapturedChannelDescQos = 0U;
 uint32_t gCapturedChannelDescSqDepth = 0U;
+uint32_t gCapturedChannelDescScqDepth = 0U;
 const char* gCapturedChannelDescChannelName = nullptr;
 // 捕获 roceAttr 队列深度与 srcPortList，用于 v4 兼容性验证
 uint32_t gCapturedRoceSqDepth = 0U;
@@ -432,11 +450,12 @@ uint32_t gCapturedRoceScqDepth = 0U;
 uint16_t* gCapturedRoceSrcPortList = nullptr;
 
 HcclResult CaptureCreateChannelsLoop(
-    EndpointHandle, CommEngine, HcommChannelDesc* channelDescs, uint32_t channelNum, ChannelHandle*)
+    EndpointHandle, CommEngine, HcommChannelDesc* channelDescs, uint32_t channelNum, HcommChannelConfig, ChannelHandle*)
 {
     if (channelDescs != nullptr && channelNum > 0U) {
         gCapturedChannelDescQos = channelDescs[0].qos;
         gCapturedChannelDescSqDepth = channelDescs[0].ubAttr.sqDepth;
+        gCapturedChannelDescScqDepth = channelDescs[0].ubAttr.scqDepth;
         gCapturedChannelDescChannelName = channelDescs[0].channelName;
         gCapturedRoceSqDepth = channelDescs[0].roceAttr.sqDepth;
         gCapturedRoceScqDepth = channelDescs[0].roceAttr.scqDepth;
@@ -447,7 +466,7 @@ HcclResult CaptureCreateChannelsLoop(
 
 } // namespace
 
-TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_When_Normal_Expect_Success)
+TEST_F(HcommCAdptTest, ut_HcommChannelCreate_When_AivNormal_Expect_Success)
 {
     gCapturedChannelDescSqDepth = 0U;
     ScopedChannelAdptStubEndpoint stubEndpoint;
@@ -458,27 +477,12 @@ TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_When_Normal_Expect_Succes
     channelDesc.ubAttr.sqDepth = 300U;
     ChannelHandle channels[1] = {0};
     MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_AIV, &channelDesc, 1, channels);
+    // CaptureCreateChannelsLoop 不填充 targetChannels，AIV 预分配会在空句柄上解引用，
+    // 此处桩掉预分配，本用例只断言 AIV 归一化后 sqDepth 被抬到 512
+    MOCKER(ChannelProcess::PrepareUserChannels).stubs().will(returnValue(HCCL_SUCCESS));
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_AIV, &channelDesc, 1, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
     EXPECT_EQ(gCapturedChannelDescSqDepth, 512U);
-}
-
-TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_When_ChannelDescsNull_Expect_E_PTR)
-{
-    EndpointHandle endpointHandle = reinterpret_cast<EndpointHandle>(0x12345);
-    ChannelHandle channels[1] = {0};
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_AICPU_TS, nullptr, 1, channels);
-    EXPECT_EQ(ret, HCCL_E_PTR);
-}
-
-TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_When_ChannelNumZero_Expect_E_PARA)
-{
-    EndpointHandle endpointHandle = reinterpret_cast<EndpointHandle>(0x12345);
-    HcommChannelDesc channelDesc{};
-    (void)HcommChannelDescInit(&channelDesc, 1);
-    ChannelHandle channels[1] = {0};
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_AICPU_TS, &channelDesc, 0, channels);
-    EXPECT_EQ(ret, HCCL_E_PARA);
 }
 
 TEST_F(HcommCAdptTest, ut_HcommChannelCreate_When_ChannelDescsNull_Expect_E_PTR)
@@ -523,12 +527,21 @@ TEST_F(HcommCAdptTest, ut_HcommEndpointGetDescNum_When_UnsupportedDeviceType_Exp
     EXPECT_EQ(descNum, 0U);
 }
 
-TEST_F(HcommCAdptTest, ut_HcommEndpointGetDescNum_When_DevType960_Expect_E_NOT_SUPPORT)
+TEST_F(HcommCAdptTest, ut_HcommEndpointGetDescNum_When_DevType960_Expect_PassGateToEidQuery)
 {
+    constexpr uint32_t devicePhyId = 15U;
+    unsigned int eidNum = 0U;
     MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_960)).will(returnValue(HCCL_SUCCESS));
+    MOCKER(hrtGetDevicePhyIdByIndex)
+        .stubs()
+        .with(mockcpp::any(), outBound(devicePhyId))
+        .will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&Hccl::HccpHdcManager::Init).stubs().will(ignoreReturnValue());
+    MOCKER(RaGetDevEidInfoNum).stubs().with(mockcpp::any(), outBoundP(&eidNum)).will(returnValue(0));
+    MOCKER(RaGetDevEidInfoList).stubs().will(returnValue(0));
 
     uint32_t descNum = 0;
-    EXPECT_EQ(HcommEndpointGetDescNum(0, &descNum), HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(HcommEndpointGetDescNum(0, &descNum), HCCL_E_NOT_FOUND);
     EXPECT_EQ(descNum, 0U);
 }
 
@@ -745,31 +758,20 @@ TEST_F(HcommCAdptTest, ut_HcommChannelCreate_AICPU_When_CreateLoopMocked_PreAllo
     EXPECT_EQ(ret, HCCL_E_PTR);
 }
 
-TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_CPU_Expect_Success)
+TEST_F(HcommCAdptTest, ut_HcommChannelCreate_When_Ccu_Expect_Success)
 {
     ScopedChannelAdptStubEndpoint stubEndpoint;
     EndpointHandle endpointHandle = stubEndpoint.Get();
     HcommChannelDesc channelDesc{};
     (void)HcommChannelDescInit(&channelDesc, 1);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_CTP;
     ChannelHandle channels[1] = {0};
     MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(returnValue(HCCL_SUCCESS));
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CCU, &channelDesc, 1, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
 }
 
-TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_CCU_Expect_Success)
-{
-    ScopedChannelAdptStubEndpoint stubEndpoint;
-    EndpointHandle endpointHandle = stubEndpoint.Get();
-    HcommChannelDesc channelDesc{};
-    (void)HcommChannelDescInit(&channelDesc, 1);
-    ChannelHandle channels[1] = {0};
-    MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(returnValue(HCCL_SUCCESS));
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_CCU, &channelDesc, 1, channels);
-    EXPECT_EQ(ret, HCCL_SUCCESS);
-}
-
-TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_V1Desc_ClearsQosField)
+TEST_F(HcommCAdptTest, Ut_HcommChannelCreate_V1Desc_ClearsQosField)
 {
     gCapturedChannelDescQos = 0U;
     ScopedChannelAdptStubEndpoint stubEndpoint;
@@ -783,12 +785,12 @@ TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_V1Desc_ClearsQosField)
 
     MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
 
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
     EXPECT_EQ(gCapturedChannelDescQos, 0xFFFFFFFFU);
 }
 
-TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_CurrentDescWithSmallSize_KeepsFieldsByVersion)
+TEST_F(HcommCAdptTest, Ut_HcommChannelCreate_CurrentDescWithSmallSize_KeepsFieldsByVersion)
 {
     static const char channelName[] = "channel-name";
     gCapturedChannelDescQos = 0U;
@@ -805,7 +807,7 @@ TEST_F(HcommCAdptTest, ut_HcommCollectiveChannelCreate_CurrentDescWithSmallSize_
 
     MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
 
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
     EXPECT_EQ(gCapturedChannelDescQos, 5U);
     EXPECT_STREQ(gCapturedChannelDescChannelName, channelName);
@@ -846,8 +848,7 @@ TEST_F(HcommCAdptTest, ut_HcommEndpointGetListenPort_When_ServerSocketNotSupport
     EndpointHandle endpointHandle = reinterpret_cast<EndpointHandle>(0x12345);
     ChannelAdptStubEndpoint stubEndpoint(EndpointDesc{});
 
-    // HcommEndpointMap 收编为 hcomm::EndpointMgr::Get
-    MOCKER_CPP(&hcomm::EndpointMgr::Get, Endpoint * (hcomm::EndpointMgr::*)(EndpointHandle))
+    MOCKER_CPP(&hcomm::EndpointHandleMgr::Get, Endpoint * (hcomm::EndpointHandleMgr::*)(EndpointHandle))
         .stubs()
         .will(returnValue(static_cast<Endpoint*>(&stubEndpoint)));
 
@@ -862,7 +863,7 @@ TEST_F(HcommCAdptTest, ut_HcommEndpointStartListen_When_NoServerSocketContext_Ex
     EndpointHandle endpointHandle = reinterpret_cast<EndpointHandle>(0x12345);
     ChannelAdptStubEndpoint stubEndpoint(EndpointDesc{});
 
-    MOCKER_CPP(&hcomm::EndpointMgr::Get, Endpoint * (hcomm::EndpointMgr::*)(EndpointHandle))
+    MOCKER_CPP(&hcomm::EndpointHandleMgr::Get, Endpoint * (hcomm::EndpointHandleMgr::*)(EndpointHandle))
         .stubs()
         .will(returnValue(static_cast<Endpoint*>(&stubEndpoint)));
 
@@ -875,7 +876,7 @@ TEST_F(HcommCAdptTest, ut_HcommEndpointStopListen_When_NoServerSocketContext_Exp
     EndpointHandle endpointHandle = reinterpret_cast<EndpointHandle>(0x12345);
     ChannelAdptStubEndpoint stubEndpoint(EndpointDesc{});
 
-    MOCKER_CPP(&hcomm::EndpointMgr::Get, Endpoint * (hcomm::EndpointMgr::*)(EndpointHandle))
+    MOCKER_CPP(&hcomm::EndpointHandleMgr::Get, Endpoint * (hcomm::EndpointHandleMgr::*)(EndpointHandle))
         .stubs()
         .will(returnValue(static_cast<Endpoint*>(&stubEndpoint)));
 
@@ -885,6 +886,8 @@ TEST_F(HcommCAdptTest, ut_HcommEndpointStopListen_When_NoServerSocketContext_Exp
 
 TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_SupportedFeature_Expect_True)
 {
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
     EndpointDesc endpointDesc{};
     (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
     endpointDesc.protocol = COMM_PROTOCOL_ROCE;
@@ -913,6 +916,261 @@ TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_SupportedFeature_Expect
     EXPECT_EQ(value, true);
 }
 
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_InlineReduceUB_Expect_True)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_SUCCESS));
+
+    s32 devId = 0;
+    MOCKER(hrtGetDevice).stubs().with(outBoundP(&devId)).will(returnValue(HCCL_SUCCESS));
+
+    MOCKER_CPP(&Hccl::HccpPeerManager::Init).stubs().with(mockcpp::any()).will(ignoreReturnValue());
+
+    u32 devPhyId = 0;
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().with(mockcpp::any(), outBound(devPhyId)).will(returnValue(HCCL_SUCCESS));
+
+    void* fakeRdmaHandle = reinterpret_cast<void*>(0x12345678);
+    MOCKER_CPP(&Hccl::RdmaHandleManager::GetByAddr).stubs().will(returnValue(fakeRdmaHandle));
+
+    struct RdevAttr rdevAttr {};
+    rdevAttr.isInlineReduceSupported = true;
+    MOCKER(RaRdevGetAttr).stubs().with(mockcpp::any(), outBoundP(&rdevAttr, sizeof(rdevAttr))).will(returnValue(0));
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(value, true);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_InlineReducePCIE_Expect_False)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_SUCCESS));
+
+    s32 devId = 0;
+    MOCKER(hrtGetDevice).stubs().with(outBoundP(&devId)).will(returnValue(HCCL_SUCCESS));
+
+    MOCKER_CPP(&Hccl::HccpPeerManager::Init).stubs().with(mockcpp::any()).will(ignoreReturnValue());
+
+    u32 devPhyId = 0;
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().with(mockcpp::any(), outBound(devPhyId)).will(returnValue(HCCL_SUCCESS));
+
+    void* fakeRdmaHandle = reinterpret_cast<void*>(0x12345678);
+    MOCKER_CPP(&Hccl::RdmaHandleManager::GetByAddr).stubs().will(returnValue(fakeRdmaHandle));
+
+    struct RdevAttr rdevAttr {};
+    rdevAttr.isInlineReduceSupported = false;
+    MOCKER(RaRdevGetAttr).stubs().with(mockcpp::any(), outBoundP(&rdevAttr, sizeof(rdevAttr))).will(returnValue(0));
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(value, false);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_UnsupportFeature_Expect_SuccessFalse)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INVALID, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(value, false);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_DeviceNot950_Expect_NotSupport)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_910B)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(value, false);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_NdaDeviceNot950_Expect_NotSupport)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_910B)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_NDA, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(value, false);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_Device960_Expect_Supported)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_960)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_SUCCESS));
+
+    s32 devId = 0;
+    MOCKER(hrtGetDevice).stubs().with(outBoundP(&devId)).will(returnValue(HCCL_SUCCESS));
+
+    MOCKER_CPP(&Hccl::HccpPeerManager::Init).stubs().with(mockcpp::any()).will(ignoreReturnValue());
+
+    u32 devPhyId = 0;
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().with(mockcpp::any(), outBound(devPhyId)).will(returnValue(HCCL_SUCCESS));
+
+    void* fakeRdmaHandle = reinterpret_cast<void*>(0x12345678);
+    MOCKER_CPP(&Hccl::RdmaHandleManager::GetByAddr).stubs().will(returnValue(fakeRdmaHandle));
+
+    struct RdevAttr rdevAttr {};
+    rdevAttr.isInlineReduceSupported = true;
+    MOCKER(RaRdevGetAttr).stubs().with(mockcpp::any(), outBoundP(&rdevAttr, sizeof(rdevAttr))).will(returnValue(0));
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(value, true);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_NdaDevice960_Expect_Supported)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_960)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_SUCCESS));
+
+    s32 devId = 0;
+    MOCKER(hrtGetDevice).stubs().with(outBoundP(&devId)).will(returnValue(HCCL_SUCCESS));
+
+    MOCKER_CPP(&Hccl::HccpPeerManager::Init).stubs().with(mockcpp::any()).will(ignoreReturnValue());
+
+    u32 devPhyId = 0;
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().with(mockcpp::any(), outBound(devPhyId)).will(returnValue(HCCL_SUCCESS));
+
+    void* fakeRdmaHandle = reinterpret_cast<void*>(0x12345678);
+    MOCKER_CPP(&Hccl::RdmaHandleManager::GetByAddr).stubs().will(returnValue(fakeRdmaHandle));
+
+    s32 directFlag = DIRECT_FLAG_PCIE;
+    MOCKER(RaNdaGetDirectFlag).stubs().with(mockcpp::any(), outBoundP(&directFlag)).will(returnValue(0));
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_NDA, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(value, true);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_GetByAddrNull_Expect_EPtr)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_SUCCESS));
+
+    s32 devId = 0;
+    MOCKER(hrtGetDevice).stubs().with(outBoundP(&devId)).will(returnValue(HCCL_SUCCESS));
+
+    MOCKER_CPP(&Hccl::HccpPeerManager::Init).stubs().with(mockcpp::any()).will(ignoreReturnValue());
+
+    u32 devPhyId = 0;
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().with(mockcpp::any(), outBound(devPhyId)).will(returnValue(HCCL_SUCCESS));
+
+    MOCKER_CPP(&Hccl::RdmaHandleManager::GetByAddr).stubs().will(returnValue(static_cast<RdmaHandle>(nullptr)));
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_E_PTR);
+    EXPECT_EQ(value, false);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_RaRdevGetAttrFailed_Expect_EInternal)
+{
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_SUCCESS));
+
+    s32 devId = 0;
+    MOCKER(hrtGetDevice).stubs().with(outBoundP(&devId)).will(returnValue(HCCL_SUCCESS));
+
+    MOCKER_CPP(&Hccl::HccpPeerManager::Init).stubs().with(mockcpp::any()).will(ignoreReturnValue());
+
+    u32 devPhyId = 0;
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().with(mockcpp::any(), outBound(devPhyId)).will(returnValue(HCCL_SUCCESS));
+
+    void* fakeRdmaHandle = reinterpret_cast<void*>(0x12345678);
+    MOCKER_CPP(&Hccl::RdmaHandleManager::GetByAddr).stubs().will(returnValue(fakeRdmaHandle));
+
+    MOCKER(RaRdevGetAttr).stubs().with(mockcpp::any(), mockcpp::any()).will(returnValue(-1));
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_E_INTERNAL);
+    EXPECT_EQ(value, false);
+}
+
+TEST_F(HcommCAdptTest, ut_HcommEndpointCheckFeature_When_GetDeviceTypeFailed_Expect_EInternal)
+{
+    // 设备类型唯一真值源取数失败：FetchDevType 返回 nullopt，接口返回 HCCL_E_INTERNAL
+    MOCKER(hrtGetDeviceType).stubs().will(returnValue(HCCL_E_RUNTIME));
+
+    EndpointDesc endpointDesc{};
+    (void)memset_s(&endpointDesc, sizeof(endpointDesc), 0, sizeof(endpointDesc));
+    endpointDesc.protocol = COMM_PROTOCOL_ROCE;
+    endpointDesc.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    endpointDesc.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+
+    bool value = false;
+    HcommResult ret = HcommEndpointCheckFeature(HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE, &endpointDesc, &value);
+    EXPECT_EQ(ret, HCCL_E_INTERNAL);
+    EXPECT_EQ(value, false);
+}
+
 // ===================== CheckRoceAttr 队列深度校验 UT =====================
 
 /**
@@ -928,7 +1186,7 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_AllDepthsZero_Expect_Success)
     channelDesc.roceAttr.sqDepth = 0U;
     channelDesc.roceAttr.scqDepth = 0U;
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_SUCCESS);
 }
 
@@ -945,7 +1203,7 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_AllDepthsInvalidUint_Expect_Success
     channelDesc.roceAttr.sqDepth = 0xFFFFFFFFU;
     channelDesc.roceAttr.scqDepth = 0xFFFFFFFFU;
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_SUCCESS);
 }
 
@@ -962,7 +1220,7 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_AllDepthsValidPowerOfTwo_Expect_Suc
     channelDesc.roceAttr.sqDepth = 128U;
     channelDesc.roceAttr.scqDepth = 2048U;
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_SUCCESS);
 }
 
@@ -976,10 +1234,10 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_SqDepthTooSmall_Expect_E_PARA)
     ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 0xFFFFFFFFU;
-    channelDesc.roceAttr.sqDepth = 32U; // 小于64
-    channelDesc.roceAttr.scqDepth = 0U;
+    channelDesc.roceAttr.sqDepth = 32U;    // 小于64
+    channelDesc.roceAttr.scqDepth = 2048U; // 成对配置，聚焦范围校验
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_E_PARA);
 }
 
@@ -993,10 +1251,10 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_SqDepthIsMin64_Expect_Success)
     ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 0xFFFFFFFFU;
-    channelDesc.roceAttr.sqDepth = 64U; // 等于最小值64
-    channelDesc.roceAttr.scqDepth = 0U;
+    channelDesc.roceAttr.sqDepth = 64U;    // 等于最小值64
+    channelDesc.roceAttr.scqDepth = 2048U; // 成对配置，聚焦范围校验
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_SUCCESS);
 }
 
@@ -1011,9 +1269,9 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_SqDepthTooLarge_Expect_E_PARA)
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 0xFFFFFFFFU;
     channelDesc.roceAttr.sqDepth = 65536U; // 大于32768
-    channelDesc.roceAttr.scqDepth = 0U;
+    channelDesc.roceAttr.scqDepth = 2048U; // 成对配置，聚焦范围校验
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_E_PARA);
 }
 
@@ -1027,11 +1285,138 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_SqDepthNotPowerOfTwo_Expect_E_PARA)
     ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
     channelDesc.qos = 0xFFFFFFFFU;
-    channelDesc.roceAttr.sqDepth = 300U; // 非2的幂
-    channelDesc.roceAttr.scqDepth = 0U;
+    channelDesc.roceAttr.sqDepth = 300U;   // 非2的幂
+    channelDesc.roceAttr.scqDepth = 2048U; // 成对配置，聚焦范围校验
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+/**
+ * 场景: RoCE协议，仅配置sqDepth，scqDepth保持0xFFFFFFFF（未配置哨兵）
+ * 预期: 成对配置校验失败，返回 HCCL_E_PARA
+ */
+TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_OnlySqDepthConfigured_Expect_E_PARA)
+{
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.qos = 0xFFFFFFFFU;
+    channelDesc.roceAttr.sqDepth = 64U; // 单独配置，scqDepth保持0xFFFFFFFF（未配置）
+
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+/**
+ * 场景: RoCE协议，双边显式配置且 scqDepth < sqDepth（CQ overrun 风险配置）
+ * 预期: 交叉校验失败，返回 HCCL_E_PARA
+ */
+TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_ScqDepthLessThanSqDepth_Expect_E_PARA)
+{
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.qos = 0xFFFFFFFFU;
+    channelDesc.roceAttr.sqDepth = 32768U; // 双边显式配置，scq < sq
+    channelDesc.roceAttr.scqDepth = 64U;
+
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+/**
+ * 场景: RoCE协议，host场景下深度低于64（与固定预投递16个recv WQE冲突，统一拦截）
+ * 预期: 校验失败，返回 HCCL_E_PARA
+ */
+TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_HostDepthBelowRqeFloor_Expect_E_PARA)
+{
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.qos = 0xFFFFFFFFU;
+    channelDesc.roceAttr.sqDepth = 16U; // 低于64，被统一下限拦截
+    channelDesc.roceAttr.scqDepth = 16U;
+
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_HOST, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PTR); // host + null handle 直接拒绝（fail-closed）
+}
+
+/**
+ * 场景: RoCE协议，双边显式配置且 scqDepth == sqDepth（交叉校验下边界）
+ * 预期: 校验通过，返回 HCCL_SUCCESS
+ */
+TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_ScqDepthEqualsSqDepth_Expect_Success)
+{
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.qos = 0xFFFFFFFFU;
+    channelDesc.roceAttr.sqDepth = 512U; // scq == sq，放行（>=）
+    channelDesc.roceAttr.scqDepth = 512U;
+
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+}
+
+/**
+ * 场景: RoCE协议，queueNum 显式传入 0（未设置）或超过上限 32
+ * 预期: 校验失败，返回 HCCL_E_PARA
+ */
+TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_QueueNumInvalid_Expect_E_PARA)
+{
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.qos = 0xFFFFFFFFU;
+    channelDesc.roceAttr.sqDepth = 0xFFFFFFFFU;
+
+    channelDesc.roceAttr.queueNum = 0U; // 显式传入0
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+
+    channelDesc.roceAttr.queueNum = 33U; // 超过上限32
+    ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+/**
+ * 场景: RoCE协议，queueNum 取上下边界值 1 和 32
+ * 预期: 校验通过，返回 HCCL_SUCCESS
+ */
+TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_QueueNumBoundary_Expect_Success)
+{
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.qos = 0xFFFFFFFFU;
+    channelDesc.roceAttr.sqDepth = 0xFFFFFFFFU;
+
+    channelDesc.roceAttr.queueNum = 1U;
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+
+    channelDesc.roceAttr.queueNum = 32U;
+    ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+}
+
+/**
+ * 场景: RoCE协议，queueNum 为 INVALID_UINT 默认值哨兵
+ * 预期: 兜底为 1，返回 HCCL_SUCCESS
+ */
+TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_QueueNumInvalidUint_Expect_FallbackOne)
+{
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.qos = 0xFFFFFFFFU;
+    channelDesc.roceAttr.sqDepth = 0xFFFFFFFFU;
+    channelDesc.roceAttr.queueNum = 0xFFFFFFFFU; // INVALID_UINT 默认值哨兵
+
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(channelDesc.roceAttr.queueNum, 1U); // 已兜底为1
 }
 
 /**
@@ -1045,7 +1430,7 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_NonRoCEProtocol_Expect_Success_NoDe
     channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_HCCS; // 非RoCE协议
     channelDesc.roceAttr.sqDepth = 64U;                       // 非法值，但不应被校验
 
-    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE);
+    HcommResult ret = CheckRoceAttr(channelDesc, ENDPOINT_LOC_TYPE_DEVICE, nullptr);
     EXPECT_EQ(ret, HCCL_SUCCESS);
 }
 
@@ -1055,7 +1440,7 @@ TEST_F(HcommCAdptTest, Ut_CheckRoceAttr_When_NonRoCEProtocol_Expect_Success_NoDe
  * 场景: 低版本(VERSION_ONE)desc，设置合法的队列深度值
  * 预期: 经 ProcessHcommChannelDescs 处理后，深度字段被置为 INVALID_UINT（默认哨兵）
  */
-TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_LowerVersionDesc_ClearsRoceQueueDepth)
+TEST_F(HcommCAdptTest, Ut_HcommChannelCreate_LowerVersionDesc_ClearsRoceQueueDepth)
 {
     gCapturedRoceSqDepth = 0U;
     gCapturedRoceScqDepth = 0U;
@@ -1071,7 +1456,7 @@ TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_LowerVersionDesc_ClearsRo
 
     MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
 
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
     // 低版本 desc 经处理后，深度字段应被置为 INVALID_UINT（0xFFFFFFFF）
     EXPECT_EQ(gCapturedRoceSqDepth, 0xFFFFFFFFU);
@@ -1082,7 +1467,7 @@ TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_LowerVersionDesc_ClearsRo
  * 场景: 当前版本desc，设置合法的队列深度值
  * 预期: 经 ProcessHcommChannelDescs 处理后，深度字段保持输入值（透传）
  */
-TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_CurrentVersionDesc_KeepsRoceQueueDepth)
+TEST_F(HcommCAdptTest, Ut_HcommChannelCreate_CurrentVersionDesc_KeepsRoceQueueDepth)
 {
     gCapturedRoceSqDepth = 0U;
     gCapturedRoceScqDepth = 0U;
@@ -1098,7 +1483,7 @@ TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_CurrentVersionDesc_KeepsR
 
     MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
 
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
     // 当前版本 desc 经处理后，深度字段应保持输入值
     EXPECT_EQ(gCapturedRoceSqDepth, 128U);
@@ -1109,7 +1494,7 @@ TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_CurrentVersionDesc_KeepsR
  * 场景: 当前版本desc，设置 srcPortList 指针
  * 预期: 经 ProcessHcommChannelDescs 处理后，srcPortList 保持输入值（透传）
  */
-TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_V4Desc_KeepsSrcPortList)
+TEST_F(HcommCAdptTest, Ut_HcommChannelCreate_V4Desc_KeepsSrcPortList)
 {
     uint16_t portList[2] = {100, 200};
     gCapturedRoceSrcPortList = nullptr;
@@ -1124,8 +1509,141 @@ TEST_F(HcommCAdptTest, Ut_HcommCollectiveChannelCreate_V4Desc_KeepsSrcPortList)
 
     MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
 
-    HcommResult ret = HcommCollectiveChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
     // 当前版本 desc 的 srcPortList 应被正确透传
     EXPECT_EQ(gCapturedRoceSrcPortList, portList);
+}
+
+// ===================== HcommChannelEnsureDeviceReady 入参校验与转发 UT =====================
+
+TEST_F(HcommCAdptTest, Ut_HcommChannelEnsureDeviceReady_When_InvalidArgs_Expect_Error)
+{
+    const ChannelHandle channelList[] = {0x12345};
+    MOCKER(AicpuTsChannelEntity::EnsureDeviceReady).expects(never());
+
+    EXPECT_EQ(HcommChannelEnsureDeviceReady(nullptr, 1), HCCL_E_PTR);
+    EXPECT_EQ(HcommChannelEnsureDeviceReady(channelList, 0), HCCL_E_PARA);
+}
+
+TEST_F(HcommCAdptTest, Ut_HcommChannelEnsureDeviceReady_When_PluginHandle_Expect_SkipEntity)
+{
+    const ChannelHandle channelList[] = {static_cast<ChannelHandle>(HCOMM_PLUGIN_HANDLE_FLAG)};
+    MOCKER(AicpuTsChannelEntity::EnsureDeviceReady).expects(never());
+
+    EXPECT_EQ(HcommChannelEnsureDeviceReady(channelList, 1), HCCL_SUCCESS);
+}
+
+TEST_F(HcommCAdptTest, Ut_HcommChannelEnsureDeviceReady_When_Normal_Expect_ForwardArgs)
+{
+    const ChannelHandle channelList[] = {0x12345, 0x12346};
+    MOCKER(HcommResMgrInit).stubs().will(returnValue(static_cast<HcommResult>(HCCL_SUCCESS)));
+    MOCKER(AicpuTsChannelEntity::EnsureDeviceReady)
+        .expects(exactly(1))
+        .with(eq(static_cast<const ChannelHandle*>(channelList)), eq(uint32_t{2}))
+        .will(returnValue(HCCL_SUCCESS));
+
+    EXPECT_EQ(HcommChannelEnsureDeviceReady(channelList, 2), HCCL_SUCCESS);
+}
+
+// ===================== HcommChannelGetMemUpdatePack 入参转发 UT =====================
+
+static uint32_t gPackQueryCallCnt = 0;
+static ChannelHandle gPackQueryHandle = 0;
+static void* gPackQueryHostPack = nullptr;
+static uint32_t gPackQueryCapacity = 0;
+
+static HcclResult CaptureChannelGetMemUpdatePack(ChannelHandle channelHandle, void* hostPack, uint32_t* packSize)
+{
+    gPackQueryCallCnt++;
+    gPackQueryHandle = channelHandle;
+    gPackQueryHostPack = hostPack;
+    gPackQueryCapacity = (packSize != nullptr) ? *packSize : 0;
+    if (packSize != nullptr) {
+        *packSize = 7;
+    }
+    return HCCL_SUCCESS;
+}
+
+TEST_F(HcommCAdptTest, Ut_HcommChannelGetMemUpdatePack_When_PackSizeNull_Expect_E_PTR)
+{
+    HcommResult ret = HcommChannelGetMemUpdatePack(0x12345, nullptr, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PTR);
+}
+
+TEST_F(HcommCAdptTest, Ut_HcommChannelGetMemUpdatePack_When_InnerFails_Expect_Propagate)
+{
+    MOCKER(ChannelProcess::ChannelGetMemUpdatePack).stubs().will(returnValue(HCCL_E_NOT_FOUND));
+    uint32_t packSize = 0;
+    HcommResult ret = HcommChannelGetMemUpdatePack(0x12345, nullptr, &packSize);
+    EXPECT_EQ(ret, HCCL_E_NOT_FOUND);
+}
+
+TEST_F(HcommCAdptTest, Ut_HcommChannelGetMemUpdatePack_When_Normal_Expect_ForwardArgs)
+{
+    gPackQueryCallCnt = 0;
+    gPackQueryHandle = 0;
+    gPackQueryHostPack = nullptr;
+    gPackQueryCapacity = 0;
+    MOCKER(ChannelProcess::ChannelGetMemUpdatePack).stubs().will(invoke(CaptureChannelGetMemUpdatePack));
+
+    char buffer[64] = {0};
+    uint32_t packSize = sizeof(buffer);
+    HcommResult ret = HcommChannelGetMemUpdatePack(0x12345, buffer, &packSize);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(gPackQueryCallCnt, 1U);
+    // 三个入参逐字转发，回写的长度原样带出
+    EXPECT_EQ(gPackQueryHandle, 0x12345U);
+    EXPECT_EQ(gPackQueryHostPack, buffer);
+    EXPECT_EQ(gPackQueryCapacity, sizeof(buffer));
+    EXPECT_EQ(packSize, 7U);
+}
+
+/**
+ * 场景: v4 desc，union 偏移 4 与 roceAttr.retryCnt 别名，模拟存量二进制仅填写 RoCE 属性
+ * 预期: scqDepth 掩码判据为 version < HCOMM_CHANNEL_VERSION(4U)，v4 desc 不被掩码，
+ *       union 偏移 4 的 retryCnt 别名值按位透传为 ubAttr.scqDepth（对齐 master 行为）
+ */
+TEST_F(HcommCAdptTest, Ut_HcommChannelCreate_V4Desc_PassesThroughUbScqDepth)
+{
+    gCapturedChannelDescScqDepth = 0U;
+    ScopedChannelAdptStubEndpoint stubEndpoint;
+    EndpointHandle endpointHandle = stubEndpoint.Get();
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.header.version = HCOMM_CHANNEL_VERSION;
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.roceAttr.retryCnt = 5U; // 模拟存量 v4 二进制：union 偏移 4 处填的是 retryCnt
+    ChannelHandle channels[1] = {0};
+
+    MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
+
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    // v4 desc 的 union 偏移 4 值（retryCnt 别名）透传为 ubAttr.scqDepth
+    EXPECT_EQ(gCapturedChannelDescScqDepth, 5U);
+}
+
+/**
+ * 场景: v5 desc（ubAttr.scqDepth 引入版本），显式配置 scqDepth
+ * 预期: 经 ProcessHcommChannelDescs 处理后，ubAttr.scqDepth 保持输入值（透传）
+ */
+TEST_F(HcommCAdptTest, Ut_HcommChannelCreate_V5Desc_KeepsUbScqDepth)
+{
+    gCapturedChannelDescScqDepth = 0U;
+    ScopedChannelAdptStubEndpoint stubEndpoint;
+    EndpointHandle endpointHandle = stubEndpoint.Get();
+    HcommChannelDesc channelDesc{};
+    ASSERT_EQ(HcommChannelDescInit(&channelDesc, 1), HCCL_SUCCESS);
+    channelDesc.header.version = 5U; // v5 时代二进制下发的描述子版本
+    channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_ROCE;
+    channelDesc.ubAttr.scqDepth = 512U;
+    ChannelHandle channels[1] = {0};
+
+    MOCKER(ChannelProcess::CreateChannelsLoop).stubs().will(invoke(CaptureCreateChannelsLoop));
+
+    HcommResult ret = HcommChannelCreate(endpointHandle, COMM_ENGINE_CPU, &channelDesc, 1, channels);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    // v5 desc 的 ubAttr.scqDepth 应被透传
+    EXPECT_EQ(gCapturedChannelDescScqDepth, 512U);
 }

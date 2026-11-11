@@ -11,12 +11,12 @@
 set(hccl_utest_dfx_list
     main.cc
     ut_dfx.cc
-    ut_channel_profiling_adpt.cc
 )
 
 add_executable(hccl_utest_dfx ${hccl_utest_dfx_list})
 
 target_include_directories(hccl_utest_dfx PRIVATE
+    ${HCCL_CODE_ROOT}/src/base_comm
     ${UT_COMMON_INCLUDE_LIST}
 )
 
@@ -54,3 +54,5 @@ add_dependencies(hccl_utest_dfx hccl_llt)
 
 enable_testing()
 add_test(NAME hccl_utest_dfx COMMAND hccl_utest_dfx)
+
+target_include_directories(hccl_utest_dfx PRIVATE ${HCOMM_RES_TREE_INCLUDES})

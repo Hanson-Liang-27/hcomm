@@ -11,16 +11,16 @@
 set(src_list
     aicpu_channel_process.cc
     dev_aicpu_ts_channel_mgr.cc
-    dev_aicpu_ts_roce_channel.cc
+    dev_aicpu_ts_roce_dev_loc_channel.cc
     aicpu_ts_urma_channel_kernel.cc
     dev_aicpu_ts_hccs_channel.cc
 )
 
-if(TARGET ccl_kernel)
-    target_sources(ccl_kernel PRIVATE
+if(TARGET base_comm_aicpu)
+    target_sources(base_comm_aicpu PRIVATE
         ${src_list}
     )
-    target_include_directories(ccl_kernel PRIVATE
+    target_include_directories(base_comm_aicpu PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/..
     )

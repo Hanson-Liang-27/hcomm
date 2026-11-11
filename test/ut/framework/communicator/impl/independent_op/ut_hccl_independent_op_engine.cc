@@ -18,7 +18,9 @@
 #include "hcomm_primitives.h"
 #include "launch_aicpu.h"
 #include "hccl_rank_graph.h"
-#include "aicpu_launch_manager.h"
+#include "comm_engine/aicpu_launch_manager_pub.h"
+#include "aicpu_thread_launch_mgr.h"
+#include "thread.h"
 #include "llt_hccl_stub_rank_graph.h"
 
 using namespace hccl;
@@ -67,27 +69,8 @@ TEST_F(HcclIndependentOpEngineTest, Ut_HcclThreadAcquire_When_Param_Is_Invalid_E
 
 // -----HcclThreadAcquire接口host侧用例-------
 const CommEngine g_hostEngine = CommEngine::COMM_ENGINE_CPU;
-TEST_F(HcclIndependentOpEngineTest, Ut_HcclThreadAcquire_When_Alloced_Threads_Morethan_Quota_Expect_Unavailable)
-{
-    bool isDeviceSide = false;
-    MOCKER(GetRunSideIsDevice).stubs().with(outBound(isDeviceSide)).will(returnValue(HCCL_SUCCESS));
 
-    u32 info = 1;
-    MOCKER(hrtDrvGetPlatformInfo).stubs().with(outBoundP(&info, sizeof(info))).will(returnValue(HCCL_SUCCESS));
-
-    ThreadHandle thread1[2] = {0};
-    HcclResult ret = HcclThreadAcquire(comm, g_hostEngine, 2, 2, thread1);
-    EXPECT_EQ(ret, HCCL_SUCCESS);
-    for (int i = 0; i < 2; i++) {
-        EXPECT_NE(thread1[i], 0);
-    }
-
-    ThreadHandle thread3[2] = {0};
-    ret = HcclThreadAcquire(comm, g_hostEngine, 1, 65535, thread3);
-    EXPECT_EQ(ret, HCCL_E_UNAVAIL);
-}
-
-// 默认数量
+// 默认数量：未配置池规格时无软件总量上限，仅 ThreadConfig uint16 边界（65535）在入口拦截
 TEST_F(HcclIndependentOpEngineTest, Ut_HcclThreadAcquire_When_Alloced_Notify_Morethan_Quota_Expect_Unavailable)
 {
     ThreadHandle thread1[2] = {0};
@@ -200,7 +183,7 @@ TEST_F(HcclIndependentOpEngineTest, Ut_HcclThreadExportToCommEngine_When_Engine_
     bool isDeviceSide{false};
     MOCKER(GetRunSideIsDevice).stubs().with(outBound(isDeviceSide)).will(returnValue(HCCL_SUCCESS));
     MOCKER_CPP(&hcclComm::GetAicpuCommState).stubs().will(returnValue(true));
-    MOCKER_CPP(&AicpuLaunchMgr::ThreadKernelLaunchForComm).stubs().will(returnValue(0));
+    MOCKER_CPP(&AicpuThreadLaunchMgr::ThreadKernelLaunchForComm).stubs().will(returnValue(0));
     MOCKER_CPP(&HcclCommProfiling::ReportKernel).stubs().will(returnValue(0));
     MOCKER_CPP(&CommEngineResMgr::HcclThreadExportToCommEngine).stubs().will(returnValue(HCCL_SUCCESS));
 

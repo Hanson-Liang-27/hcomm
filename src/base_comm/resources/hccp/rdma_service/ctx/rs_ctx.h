@@ -32,12 +32,10 @@ struct RsJettyImportInfo {
     struct RaRsJettyImportInfo info;
 };
 
-int RsGetChipProtocol(unsigned int chipId, enum NetworkMode hccpMode, enum ProtocolTypeT *protocol,
-    unsigned int logicId);
 int RsCtxApiInit(enum NetworkMode hccpMode, enum ProtocolTypeT protocol);
 int RsCtxApiDeinit(enum NetworkMode hccpMode, enum ProtocolTypeT protocol);
-bool RsCtxIsPcieStd(unsigned int devId);
-bool RsCtxGetContextNotSupported(unsigned int mode, unsigned int phyId);
+bool RsCtxIsPcieStd(unsigned int logicId);
+bool RsCtxGetContextNotSupported(unsigned int mode, unsigned int logicId);
 
 RS_ATTRI_VISI_DEF int RsGetDevEidInfoNum(unsigned int phyId, unsigned int *num);
 RS_ATTRI_VISI_DEF int RsGetDevEidInfoList(unsigned int phyId, struct HccpDevEidInfo infoList[], unsigned int startIndex,
@@ -80,7 +78,6 @@ RS_ATTRI_VISI_DEF int RsCtxQpBind(struct RaRsDevInfo *devInfo, struct RsCtxQpInf
 RS_ATTRI_VISI_DEF int RsCtxQpUnbind(struct RaRsDevInfo *devInfo, unsigned int qpId);
 RS_ATTRI_VISI_DEF int RsCtxBatchSendWr(struct WrlistBaseInfo *baseInfo, struct BatchSendWrData *wrData,
     struct SendWrResp *wrResp, struct WrlistSendCompleteNum *wrlistNum);
-RS_ATTRI_VISI_DEF int RsCtxUpdateCi(struct RaRsDevInfo *devInfo, unsigned int qpId, uint16_t ci);
 RS_ATTRI_VISI_DEF int RsCtxQpQueryBatch(struct RaRsDevInfo *devInfo, unsigned int ids[], struct JettyAttr attr[],
     unsigned int *num);
 RS_ATTRI_VISI_DEF int RsCtxGetAuxInfo(struct RaRsDevInfo *devInfo, struct HccpAuxInfoIn *infoIn,

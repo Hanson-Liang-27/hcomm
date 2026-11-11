@@ -9,15 +9,15 @@
  */
 
 #include "dpu_comm_dfx.h"
-#include "dfx_dlprof_function.h"
-#include "dpu_kernel_entrance.h"
-#include "channel_profiling_adpt.h"
+#include "dfx/prof_utils_pub.h"
+#include "coll_comm_mgr.h"
+#include "dfx/channel_profiling_adpt_pub.h"
 
 namespace hccl {
 
 std::mutex DpuCommDfx::taskIdMutex_;
 std::unordered_map<u32, u32> DpuCommDfx::streamIdToTaskId_;
-
+std::atomic<u32> DpuCommDfx::g_nextChannelStreamIdBase{DpuCommDfx::CHANNEL_STREAM_ID_BASE};
 DpuCommDfx::DpuCommDfx() {}
 
 DpuCommDfx::~DpuCommDfx() { dpuCallback_ = nullptr; }
@@ -29,6 +29,8 @@ void DpuCommDfx::Init(
     commTag_ = commTag;
     enqueueTaskFunc_ = std::move(enqueueFunc);
     getCurrDfxOpInfoFunc_ = std::move(getCurrOpInfoFunc);
+    channelStreamIdBase_ = g_nextChannelStreamIdBase.fetch_add(CHANNEL_STREAM_ID_RANGE, std::memory_order_relaxed);
+    nextChannelStreamId_ = channelStreamIdBase_;
     dpuCallback_ = [this](const Hccl::TaskParam& taskParam, u64 handle) {
         return this->AddDpuTaskInfoCallback(taskParam, handle);
     };
@@ -61,6 +63,7 @@ HcclResult DpuCommDfx::AddDpuTaskInfoCallback(const Hccl::TaskParam& taskParam, 
     if (taskParam.taskType != Hccl::TaskParamType::TASK_DPU_KERNEL) {
         dpuTaskInfo_ = {taskId, streamId};
     }
+    localTaskParam.reportStreamId = GetReportStreamId(streamId);
     HCCL_INFO(
         "[%s] streamId[%u], taskId[%u], aicpuTaskId[%llu], npuDevId[%u].", __func__, streamId, taskId,
         localTaskParam.aicpuTaskId, static_cast<u32>(localTaskParam.npuDevId));
@@ -112,7 +115,7 @@ void DpuCommDfx::CacheWNotify(
     }
     auto& info = it->second;
     if (taskParam.isFailed) {
-        failTime = Hccl::DfxDlProfFunction::GetInstance().dlMsprofSysCycleTime();
+        failTime = hcomm::GetProfCycleTime();
         failedTaskParam = std::make_shared<Hccl::TaskParam>(taskParam);
         failedTaskParam->endTime = failTime;
         failedTaskParam->aicpuTaskId = aicpuTaskId_;
@@ -161,6 +164,7 @@ HcclResult DpuCommDfx::EnqueueWNotifyFailed(
         cachedTaskParam->endTime = failTime;
         cachedTaskParam->aicpuTaskId = aicpuTaskId_;
         cachedTaskParam->npuDevId = deviceId_;
+        cachedTaskParam->reportStreamId = GetReportStreamId(failedStreamId);
         u32 taskId = GetTaskId(dpuStreamId_);
         dpuTaskInfo_ = {taskId, failedStreamId};
         HCCL_INFO(
@@ -170,6 +174,7 @@ HcclResult DpuCommDfx::EnqueueWNotifyFailed(
     if (needEnqueueFailed) {
         u32 taskId = GetTaskId(dpuStreamId_);
         dpuTaskInfo_ = {taskId, failedStreamId};
+        failedTaskParam->reportStreamId = GetReportStreamId(failedStreamId);
         HCCL_INFO("[%s] W+Notify failed, direct enqueue, handle[0x%llx], taskId[%u].", __func__, handle, taskId);
         return enqueueTaskFunc_(failedStreamId, taskId, *failedTaskParam, handle, dpuOpInfo);
     }
@@ -195,7 +200,7 @@ DpuCommDfx::HandleFenceOrDrain(const Hccl::TaskParam& taskParam, u64 handle, std
         info.totalSize = 0;
         needEnqueue = true;
         auto sidIt = channelStreamIdMap_.find(handle);
-        fenceStreamId = (sidIt != channelStreamIdMap_.end()) ? sidIt->second - CHANNEL_STREAM_ID_BASE : dpuStreamId_;
+        fenceStreamId = (sidIt != channelStreamIdMap_.end()) ? sidIt->second : dpuStreamId_;
     }
     if (needEnqueue) {
         writeTaskParam->taskType = Hccl::TaskParamType::TASK_DPU_WRITE_WITH_NOTIFY;
@@ -203,6 +208,7 @@ DpuCommDfx::HandleFenceOrDrain(const Hccl::TaskParam& taskParam, u64 handle, std
         writeTaskParam->endTime = taskParam.endTime;
         writeTaskParam->aicpuTaskId = aicpuTaskId_;
         writeTaskParam->npuDevId = deviceId_;
+        writeTaskParam->reportStreamId = GetReportStreamId(fenceStreamId);
 
         u32 taskId = GetTaskId(dpuStreamId_);
         dpuTaskInfo_ = {taskId, fenceStreamId};
@@ -229,11 +235,11 @@ u32 DpuCommDfx::GetDpuChannelStreamId(u64 handle)
 {
     auto it = channelStreamIdMap_.find(handle);
     if (it != channelStreamIdMap_.end()) {
-        u32 reportStreamId = it->second - CHANNEL_STREAM_ID_BASE;
+        u32 stored = it->second;
         HCCL_INFO(
             "[%s] commTag[%s] channel stream id for handle[0x%llx]: stored[%u], report[%u]", __func__, commTag_.c_str(),
-            handle, it->second, reportStreamId);
-        return reportStreamId;
+            handle, stored, stored - channelStreamIdBase_);
+        return stored;
     }
     HCCL_ERROR(
         "[%s] commTag[%s] handle[0x%llx] not found, fallback to dpuStreamId_[%u].", __func__, commTag_.c_str(), handle,
@@ -253,16 +259,16 @@ void DpuCommDfx::SetDpuTaskOpInfo(std::shared_ptr<Hccl::DfxOpInfo> dfxOpInfo)
 
 std::shared_ptr<Hccl::DfxOpInfo> DpuCommDfx::GetDpuTaskOpInfo()
 {
-    void* taskexpShmem = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(GetSerMapMutex());
-        taskexpShmem = FindTaskExpMem(commTag_, deviceId_);
-        if (taskexpShmem == nullptr) {
-            HCCL_WARNING(
-                "[%s] commTag[%s] deviceId[%u] not found in g_taskExpMemMap, fallback to GetCurrDfxOpInfo", __func__,
-                commTag_.c_str(), deviceId_);
-            return getCurrDfxOpInfoFunc_();
-        }
+    // 收编后异常区随 DPU 线程走 ThreadMgr 链，不再跨 so 读 g_taskExpMemMap；经 commTag_(=commId) 反查。
+    // expRef 须活到本函数用完地址：keepAlive 是异常区所在实体的保活引用
+    DpuTaskExpMemRef expRef;
+    (void)CollCommMgr::GetInstance().GetDpuTaskExpMem(commTag_, expRef);
+    void* taskexpShmem = expRef.addr;
+    if (taskexpShmem == nullptr) {
+        HCCL_WARNING(
+            "[%s] commTag[%s] deviceId[%u] not found in taskExpMem, fallback to GetCurrDfxOpInfo", __func__,
+            commTag_.c_str(), deviceId_);
+        return getCurrDfxOpInfoFunc_();
     }
     constexpr u32 OPINDEX_OFFSET = 5;
     u32 opIndex = 0;

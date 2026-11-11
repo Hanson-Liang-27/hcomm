@@ -71,7 +71,7 @@ int RsGetIpv6ScopeId(struct in6_addr localIp)
     int ret, i;
 
     ret = getifaddrs(&ifaddr);
-    CHK_PRT_RETURN(ret == -1, hccp_err("get ifaddrs failed, ret[%d]", ret), -ESYSFUNC);
+    CHK_PRT_RETURN(ret == -1, hccp_err("get ifaddrs failed, ret[%d] errno[%d]", ret, errno), -ESYSFUNC);
     /* Walk through linked list, maintaining head pointer so we can free list later */
     for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET6) {
@@ -274,13 +274,14 @@ int RsDrvSslBindFd(struct RsConnInfo *conn, int fd)
     int ret;
     if (conn->ssl == NULL) {
         conn->ssl = ssl_adp_new(gRsCb->clientSslCtx);
-        CHK_PRT_RETURN(conn->ssl == NULL, hccp_err("server ssl ctx alloc failed"), -ENOMEM);
+        CHK_PRT_RETURN(conn->ssl == NULL, hccp_err("server ssl ctx alloc failed, fd:%d, tag:%s", fd, conn->tag),
+            -ENOMEM);
     }
 
     ssl_adp_set_mode(conn->ssl, SSL_MODE_AUTO_RETRY);
     ret = ssl_adp_set_fd(conn->ssl, fd);
     if (ret != 1) {
-        hccp_err("bind connfd and ssl failed, ret %d", ret);
+        hccp_err("bind connfd and ssl failed, fd:%d, ret:%d, tag:%s", fd, ret, conn->tag);
         goto out;
     }
 
@@ -294,7 +295,7 @@ out:
     return -EINVAL;
 }
 
-int RsDrvConnect(int fd, struct RsIpAddrInfo *serverIp, struct RsIpAddrInfo *clientIp, uint16_t port)
+int RsDrvConnect(struct RsConnInfo *conn)
 {
     union RsSocketaddr clientAddr = {0};
     socklen_t clientAddrLen = 0;
@@ -302,19 +303,20 @@ int RsDrvConnect(int fd, struct RsIpAddrInfo *serverIp, struct RsIpAddrInfo *cli
     int errNo;
     int ret;
 
-    hccp_info_socket("IP(%s) port %d family %d fd:%d begin", serverIp->readAddr, port, clientIp->family, fd);
-    if (clientIp->family == AF_INET) {
+    hccp_info_socket("IP(%s) port %d family %d fd:%d begin, tag:%s", conn->serverIp.readAddr, conn->port,
+        conn->clientIp.family, conn->connfd, conn->tag);
+    if (conn->clientIp.family == AF_INET) {
         struct sockaddr_in addr = {0};
-        addr.sin_family = clientIp->family;
-        addr.sin_port = htons(port);
-        addr.sin_addr = serverIp->binAddr.addr;
-        ret = connect(fd, &addr, sizeof(addr));
+        addr.sin_family = conn->clientIp.family;
+        addr.sin_port = htons(conn->port);
+        addr.sin_addr = conn->serverIp.binAddr.addr;
+        ret = connect(conn->connfd, &addr, sizeof(addr));
     } else {
         struct sockaddr_in6 addr = {0};
-        addr.sin6_family = clientIp->family;
-        addr.sin6_port = htons(port);
-        addr.sin6_addr = serverIp->binAddr.addr6;
-        ret = connect(fd, &addr, sizeof(addr));
+        addr.sin6_family = conn->clientIp.family;
+        addr.sin6_port = htons(conn->port);
+        addr.sin6_addr = conn->serverIp.binAddr.addr6;
+        ret = connect(conn->connfd, &addr, sizeof(addr));
     }
 
     if (ret) {
@@ -327,25 +329,29 @@ int RsDrvConnect(int fd, struct RsIpAddrInfo *serverIp, struct RsIpAddrInfo *cli
          * if the errno is EINTR, it can not retry directly,
          * otherwise it will directly return an error
          */
-        hccp_warn_socket("connect not success, need to try again! server IP:%s, port:%d, fd:%d, ret:%d, errNo:%d",
-            serverIp->readAddr, port, fd, ret, errNo);
+        hccp_warn_socket(
+            "connect not success, need to try again! server IP:%s, port:%d, fd:%d, ret:%d, errNo:%d, tag:%s",
+            conn->serverIp.readAddr, conn->port, conn->connfd, ret, errNo, conn->tag);
 
         return -errNo;
     }
 
 out:
-    clientAddrLen = (clientIp->family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
-    getsockname(fd, (struct sockaddr *)&clientAddr, &clientAddrLen);
-    clientPort = (clientIp->family == AF_INET) ? ntohs(clientAddr.sAddr.sin_port) : ntohs(clientAddr.sAddr6.sin6_port);
+    clientAddrLen = (conn->clientIp.family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+    getsockname(conn->connfd, (struct sockaddr *)&clientAddr, &clientAddrLen);
+    clientPort = (conn->clientIp.family == AF_INET) ? ntohs(clientAddr.sAddr.sin_port)
+                                                    : ntohs(clientAddr.sAddr6.sin6_port);
 
-    if ((clientPort < 60000) || (clientPort > 60015)) { // HCCL默认监听60000-60015端口,如client使用该端口，记录EVENT日志
-        hccp_info_socket("client connect success. client family %d addr %s:%u, server addr %s:%u, fd:%d",
-            clientIp->family, clientIp->readAddr, clientPort, serverIp->readAddr, port, fd);
+    // HCCL默认监听60000-60031端口(控制面60016-60031,数据面60000-60015)
+    if ((clientPort < 60000) || (clientPort > 60031)) {
+        hccp_info_socket("client connect success. client family %d addr %s:%u, server addr %s:%u, fd:%d, tag:%s",
+            conn->clientIp.family, conn->clientIp.readAddr, clientPort, conn->serverIp.readAddr, conn->port,
+            conn->connfd, conn->tag);
     } else {
-        hccp_run_info("client connect success. client family %d addr %s:%u, server addr %s:%u, fd:%d", clientIp->family,
-            clientIp->readAddr, clientPort, serverIp->readAddr, port, fd);
+        hccp_run_info("client connect success. client family %d addr %s:%u, server addr %s:%u, fd:%d, tag:%s",
+            conn->clientIp.family, conn->clientIp.readAddr, clientPort, conn->serverIp.readAddr, conn->port,
+            conn->connfd, conn->tag);
     }
-
     return 0;
 }
 
@@ -715,9 +721,11 @@ int RsFindWhiteListNode(struct RsWhiteList *rsSocketWhiteList, struct SocketWlis
     for (; (&whiteListTmp->list) != &rsSocketWhiteList->whiteList;
          whiteListTmp = whiteListTmp2,
          whiteListTmp2 = list_entry(whiteListTmp2->list.next, struct RsWhiteListInfo, list)) {
-        hccp_info_socket("client_ip %s 0x%08x, expectIp %s 0x%08x", whiteListTmp->clientIp.readAddr,
-            whiteListTmp->clientIp.binAddr.addr.s_addr, expectIp.readAddr, expectIp.binAddr.addr.s_addr);
-        if ((!RsCompareIpAddr(&whiteListTmp->clientIp, &expectIp)) &&
+        hccp_info_socket("client_ip %s 0x%08x, expectIp %s 0x%08x, tag:%.*s, expectTag:%.*s",
+            whiteListTmp->clientIp.readAddr, whiteListTmp->clientIp.binAddr.addr.s_addr, expectIp.readAddr,
+            expectIp.binAddr.addr.s_addr, SOCK_CONN_TAG_SIZE, whiteListTmp->tag, SOCK_CONN_TAG_SIZE,
+            whiteListExpect->tag);
+        if ((!RsIsClientIpCheckSupported() || !RsCompareIpAddr(&whiteListTmp->clientIp, &expectIp)) &&
             (strncmp(whiteListTmp->tag, whiteListExpect->tag, SOCK_CONN_TAG_SIZE) == 0)) {
             *whiteListNode = whiteListTmp;
             return 0;

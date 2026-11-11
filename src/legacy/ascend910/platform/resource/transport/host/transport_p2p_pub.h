@@ -14,7 +14,7 @@
 #include <sstream>
 
 #include "transport_base_pub.h"
-#include "rma_buffer_mgr.h"
+#include "common/rma_buffer_mgr_pub.h"
 
 namespace hccl {
 using HcclMemExMgr = hcomm::RmaBufferMgr<hccl::BufferKey<uintptr_t, u64>, std::shared_ptr<HcclMemEx>>;
@@ -170,7 +170,7 @@ protected:
     HcclMemExMgr localHcclMemExMgr_;
     HcclMemExMgr remoteHcclMemExMgr_;
 
-private:
+protected:
     HcclResult ParseSpecifyLink(LinkTypeInServer& linkType);
     void SetMemIncludeFlag();
     HcclResult ConstructMemIncludeInfoForSend(u8*& exchangeDataPtr, u64& exchangeDataBlankSize);

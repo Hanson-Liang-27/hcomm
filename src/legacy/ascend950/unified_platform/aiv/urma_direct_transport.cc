@@ -182,7 +182,7 @@ bool UrmaDirectTransport::IsResReady()
 void UrmaDirectTransport::RecvExchangeData()
 {
     recvData.resize(exchangeDataSize);
-    socket->RecvAsync(reinterpret_cast<u8*>(recvData.data()), recvData.size());
+    socket->RecvAsync(recvData.data(), recvData.size());
 
     HCCL_INFO("recv data %s, size=%zu", GetLinkDescInfo().c_str(), recvData.size());
 }
@@ -207,8 +207,8 @@ HcclResult UrmaDirectTransport::ConnVecUnpackProc(BinaryStream& binaryStream, bo
         if (commonLocRes.connVec[i]->GetStatus() != RmaConnStatus::READY) {
             HCCL_INFO(
                 "parse and import pos=%u, rmt dto to connection[%s]", pos, commonLocRes.connVec[i]->Describe().c_str());
-            commonLocRes.connVec[i]->ParseRmtExchangeDto(rmtDto);
-            commonLocRes.connVec[i]->ImportRmtDto();
+            CHK_RET(commonLocRes.connVec[i]->ParseRmtExchangeDto(rmtDto));
+            CHK_RET(commonLocRes.connVec[i]->ImportRmtDto());
             result = true;
         }
     }
@@ -249,20 +249,23 @@ void UrmaDirectTransport::RmtBufferVecUnpackProc(u32 locNum, BinaryStream& binar
     }
 }
 
-bool UrmaDirectTransport::RecvDataProcess()
+HcclResult UrmaDirectTransport::RecvDataProcess()
 {
     HCCL_INFO(
         "RecvDataProcess: link=%s, size=%zu, exchangeDataSize=%u", GetLinkDescInfo().c_str(), recvData.size(),
         exchangeDataSize);
     BinaryStream binaryStream(recvData);
-    HandshakeMsgUnpack(binaryStream);
-    RmtBufferVecUnpackProc(bufferNum, binaryStream, rmtBufferVec);
+    TRY_CATCH_RETURN(HandshakeMsgUnpack(binaryStream););
+    TRY_CATCH_RETURN(RmtBufferVecUnpackProc(bufferNum, binaryStream, rmtBufferVec););
     bool result = false;
-    if (ConnVecUnpackProc(binaryStream, result) != HcclResult::HCCL_SUCCESS) {
-        HCCL_ERROR("[%s] ConnVecUnpackProc failed", __func__);
-        return false;
+    CHK_RET(ConnVecUnpackProc(binaryStream, result));
+    if (result) {
+        urmaStatus = UrmaStatus::PROCESS_DATA;
+    } else {
+        urmaStatus = UrmaStatus::RECV_FIN;
+        SetBaseStatusReady();
     }
-    return result;
+    return HCCL_SUCCESS;
 }
 
 bool UrmaDirectTransport::IsConnsReady()
@@ -288,7 +291,7 @@ void UrmaDirectTransport::RecvFinish()
 {
     recvFinishMsg.resize(FINISH_MSG_SIZE);
     HCCL_INFO("start recv Finish Msg %s [%s]", GetLinkDescInfo().c_str(), FINISH_MSG);
-    socket->RecvAsync(reinterpret_cast<u8*>(recvFinishMsg.data()), FINISH_MSG_SIZE);
+    socket->RecvAsync(recvFinishMsg.data(), FINISH_MSG_SIZE);
     HCCL_INFO("end recv Finish Msg %s [%s]", GetLinkDescInfo().c_str(), FINISH_MSG);
 }
 
@@ -318,11 +321,10 @@ TransportStatus UrmaDirectTransport::GetStatus()
             urmaStatus = UrmaStatus::RECV_DATA;
             break;
         case UrmaStatus::RECV_DATA:
-            if (RecvDataProcess()) { // 收消息中，如果设置到connection的建链，则需要发送 finish
-                urmaStatus = UrmaStatus::PROCESS_DATA;
-            } else { // 不需要发送finish，则将transport状态调整为 ready
-                urmaStatus = UrmaStatus::RECV_FIN;
-                SetBaseStatusReady();
+            if (RecvDataProcess() != HCCL_SUCCESS) {
+                baseStatus = TransportStatus::CONNECT_FAILED;
+                HCCL_ERROR("[%s] RecvDataProcess failed", __func__);
+                return baseStatus;
             }
             break;
         case UrmaStatus::PROCESS_DATA:

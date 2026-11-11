@@ -13,9 +13,38 @@
 #   level1/ : HCCP通信域/控制面接口劫持 (hccl_proxy_level1)
 #   level2/ : Runtime/CANN底层接口劫持 (hccl_proxy_level2, 含aiv_kernel)
 #   common/ : 各层级共用的源码与头文件 (无独立构建目标, 编入level2)
+#   stat/   : 劫持层资源统计, 编入proxy库, 不进主进程
 
 message(STATUS "TOP_DIR: ${TOP_DIR}")
 message(STATUS "ASCEND_CANN_PACKAGE_PATH: ${ASCEND_CANN_PACKAGE_PATH}")
+
+# level1 裁剪模式不依赖 hcomm 源码仓: 下列 hcomm 头文件路径组留空(不产出悬空 -I),
+# 经变量占位保持 PROXY_INC_DIRS 中其余路径的相对顺序与全量构建逐字节一致
+if(NOT BUILD_LEVEL1_ONLY)
+    set(PROXY_HCOMM_INC_DIRS_A
+        ${HCOMM_CODE_ROOT}/src/pub_inc
+        ${HCOMM_CODE_ROOT}/src/framework/communicator/impl/independent_op/rank_graph
+        ${HCOMM_CODE_ROOT}/src/framework/inc
+        ${HCOMM_CODE_ROOT}/src/platform/hccp/external_depends/inc/log
+    )
+    set(PROXY_HCOMM_INC_DIRS_B
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/pub_inc
+    )
+    set(PROXY_HCOMM_INC_DIRS_C
+        ${HCOMM_CODE_PLATFORM}/hccp
+        ${HCOMM_CODE_PLATFORM}/hccp/inc
+        ${HCOMM_CODE_PLATFORM}/hccp/inc/network
+        ${HCOMM_CODE_PLATFORM}/hccp/external_depends/ccu
+        ${HCOMM_CODE_ROOT}/src/base_comm/inc
+        # hcomm头文件(适配hcomm PR#2167)
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp/inc
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp/inc/network
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp/external_depends/ccu
+        ${HCOMM_CODE_ROOT}/src/legacy/ascend910/pub_inc
+    )
+endif()
 
 set(PROXY_INC_DIRS
         # hccl_proxy依赖的HCCL业务代码头文件, 这里的头文件有要求: 开源用户可获取
@@ -24,16 +53,13 @@ set(PROXY_INC_DIRS
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/profiling
         ${ASCEND_CANN_PACKAGE_PATH}/include
         ${ASCEND_CANN_PACKAGE_PATH}/include/hccl
-        ${HCOMM_CODE_ROOT}/src/pub_inc
-        ${HCOMM_CODE_ROOT}/src/framework/communicator/impl/independent_op/rank_graph
-        ${HCOMM_CODE_ROOT}/src/framework/inc
-        ${HCOMM_CODE_ROOT}/src/platform/hccp/external_depends/inc/log
+        ${PROXY_HCOMM_INC_DIRS_A}
         # hccl_proxy依赖的Checker L2其他模块的头文件
         ${HCOMM_VM_ROOT_PATH}/include
         ${HCOMM_VM_ROOT_PATH}/src/store
-        ${HCOMM_VM_ROOT_PATH}/src/runnerdb
         # cann包头文件
         ${ASCEND_CANN_PACKAGE_PATH}/include/driver
+        ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/driver
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hccl
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/base
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/trace
@@ -42,10 +68,8 @@ set(PROXY_INC_DIRS
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime/runtime/rts
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/aicpu
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/aicpu/tsd
-        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
-        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/pub_inc
+        ${PROXY_HCOMM_INC_DIRS_B}
         # hccl_vm头文件
-        ${HCOMM_VM_ROOT_PATH}/include/runnerdb
         ${HCOMM_VM_ROOT_PATH}/include/store
         ${HCOMM_VM_ROOT_PATH}/include/topo
         ${HCOMM_VM_ROOT_PATH}/src/cmd
@@ -53,17 +77,9 @@ set(PROXY_INC_DIRS
         ${HCCL_VM_SRC}
         ${HCCL_VM_SRC}/store
         # hcomm头文件
-        ${HCOMM_CODE_PLATFORM}/hccp
-        ${HCOMM_CODE_PLATFORM}/hccp/inc
-        ${HCOMM_CODE_PLATFORM}/hccp/inc/network
-        ${HCOMM_CODE_PLATFORM}/hccp/external_depends/ccu
-        # hcomm头文件(适配hcomm PR#2167)
-        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp
-        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp/inc
-        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp/inc/network
-        ${HCOMM_CODE_ROOT}/src/base_comm/resources/hccp/external_depends/ccu
-        ${HCOMM_CODE_ROOT}/src/legacy/ascend910/pub_inc
+        ${PROXY_HCOMM_INC_DIRS_C}
         # hccl_proxy模块内部头文件
+        ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/common
 )
 
@@ -72,7 +88,7 @@ set(PROXY_COMPILE_OPTS
         -fno-common
         -fno-strict-aliasing
         -pipe
-        -O0
+        -O2
         -g
         -D_GLIBCXX_USE_CXX11_ABI=0
 )
@@ -82,18 +98,20 @@ set(PROXY_LINK_LIBS
         -Wl,--start-group
         log
         common
-        runnerdb
-        modeldb
+        stat
+        runtime_state
+        operation_data
+
         store
         -Wl,--end-group
         -Wl,--no-whole-archive
         dl
         rt
-        sqlite3
         JSON::JSON
         ${ASCEND_CANN_PACKAGE_PATH}/${CANN_ARCH_DIR}/lib64/libc_sec.a
 )
 
+add_subdirectory(stat)
 add_subdirectory(level0)
 add_subdirectory(level1)
 add_subdirectory(level2)

@@ -12,17 +12,10 @@ set(src_list
     rma_conn_lite.cc
     ub_conn_lite.cc
     ub_conn_lite_mgr.cc
-    rdma_conn_lite_v2.cc
 )
 
 if(TARGET hccl_v2)
     target_sources(hccl_v2 PRIVATE
-        ${src_list}
-    )
-endif()
-
-if(TARGET ccl_kernel)
-    target_sources(ccl_kernel PRIVATE
         ${src_list}
     )
 endif()

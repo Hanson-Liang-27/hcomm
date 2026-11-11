@@ -35,7 +35,9 @@ global:
     CcuFuncBlockEnd;
     CcuFuncBlockLookup;
     CcuFuncCall;
+    CcuFuncCallByAddr;
     CcuFuncDefineInArg;
+    CcuFuncNamedBlockBegin;
     CcuIfBegin;
     CcuIfBeginVar;
     CcuIfElse;
@@ -202,6 +204,7 @@ global:
     HcclGetRootInfoScalable;
     HcclGetTopoDesc;
     HcclGroupEnd;
+    HcclGroupEnqueueOp;
     HcclGroupStart;
     HcclGroupStatusGet;
     HcclProfilingReportOp;
@@ -329,6 +332,7 @@ global:
     HcommBatchTransferOnThread;
     HcommCcuEventAlloc;
     HcommCcuEventGetAddr;
+    HcommCcuFunctionGet;
     HcommCcuGetMemToken;
     HcommCcuCascCntAlloc;
     HcommCcuCascCntGetMem;
@@ -360,6 +364,7 @@ global:
     HcommChannelDrainOnThread;
     HcommChannelFence;
     HcommChannelFenceOnThread;
+    HcommChannelGetRemoteMems;
     HcommChannelGetStatus;
     HcommChannelNotifyRecord;
     HcommChannelNotifyRecordOnThread;
@@ -420,6 +425,8 @@ global:
     _CcuLoopBodyExit;
     extern "C++" {
         "Hccl::ChangedRankInfo::Deserialize(ascend_nlohmann::json_abi_v3_11_3::basic_json<std::map, std::vector, std::string, bool, long, unsigned long, double, std::allocator, ascend_nlohmann::json_abi_v3_11_3::adl_serializer, std::vector<unsigned char, std::allocator<unsigned char> >, void> const&, Hccl::RankTableSource)";  # _ZN4Hccl15ChangedRankInfo11DeserializeERKN15ascend_nlohmann16json_abi_v3_11_310basic_jsonISt3mapSt6vectorSsblmdSaNS2_14adl_serializerES5_IhSaIhEEvEENS_15RankTableSourceE
+        "Hccl::FlushManager::Flush()";  # _ZN4Hccl12FlushManager5FlushEv
+        "Hccl::FlushManager::GetInstance()";  # _ZN4Hccl12FlushManager11GetInstanceEv
         "Hccl::GetCommAddr(CommAddr&, Hccl::IpAddress const&)";  # _ZN4Hccl11GetCommAddrER8CommAddrRKNS_9IpAddressE
         "Hccl::LinkProtocolToCommProtocol(Hccl::LinkProtocol const&)";  # _ZN4Hccl26LinkProtocolToCommProtocolERKNS_12LinkProtocolE
         "Hccl::NetInstance::ConnInterface::Describe() const";  # _ZNK4Hccl11NetInstance13ConnInterface8DescribeEv
@@ -455,7 +462,7 @@ global:
         "Hccl::PhyTopo::Link::GetSourceIFace()";  # _ZN4Hccl7PhyTopo4Link14GetSourceIFaceEv
         "Hccl::PhyTopoBuilder::Build(std::string const&)";  # _ZN4Hccl14PhyTopoBuilder5BuildERKSs
         "Hccl::PhyTopoBuilder::GetInstance()";  # _ZN4Hccl14PhyTopoBuilder11GetInstanceEv
-        "Hccl::RankGraph::CreateSubRankGraph(std::vector<unsigned int, std::allocator<unsigned int> > const&) const";  # _ZNK4Hccl9RankGraph18CreateSubRankGraphERKSt6vectorIjSaIjEE
+        "Hccl::RankGraph::CreateSubRankGraph(std::vector<unsigned int, std::allocator<unsigned int> > const&, std::unique_ptr<Hccl::RankGraph, std::default_delete<Hccl::RankGraph> >&) const";  # _ZNK4Hccl9RankGraph18CreateSubRankGraphERKSt6vectorIjSaIjEERSt10unique_ptrIS0_St14default_deleteIS0_EE
         "Hccl::RankGraph::Dump() const";  # _ZNK4Hccl9RankGraph4DumpEv
         "Hccl::RankGraph::GetEndpointDesc(unsigned int, unsigned int, unsigned int*, EndpointDesc*) const";  # _ZNK4Hccl9RankGraph15GetEndpointDescEjjPjP12EndpointDesc
         "Hccl::RankGraph::GetEndpointInfo(unsigned int, EndpointDesc const*, EndpointAttr, unsigned int, void*) const";  # _ZNK4Hccl9RankGraph15GetEndpointInfoEjPK12EndpointDesc12EndpointAttrjPv
@@ -466,7 +473,7 @@ global:
         "Hccl::RankGraph::GetLevels(int) const";  # _ZNK4Hccl9RankGraph9GetLevelsEi
         "Hccl::RankGraph::GetLocalId(int) const";  # _ZNK4Hccl9RankGraph10GetLocalIdEi
         "Hccl::RankGraph::GetLocalInstRanks(unsigned int, std::vector<unsigned int, std::allocator<unsigned int> >&, unsigned int&) const";  # _ZNK4Hccl9RankGraph17GetLocalInstRanksEjRSt6vectorIjSaIjEERj
-        "Hccl::RankGraph::GetLocalInstSize(unsigned int) const";  # _ZNK4Hccl9RankGraph16GetLocalInstSizeEj
+        "Hccl::RankGraph::GetLocalInstSize(unsigned int, unsigned int&) const";  # _ZNK4Hccl9RankGraph16GetLocalInstSizeEjRj
         "Hccl::RankGraph::GetMyRank() const";  # _ZNK4Hccl9RankGraph9GetMyRankEv
         "Hccl::RankGraph::GetNetInstanceByRankId(unsigned int, int)";  # _ZN4Hccl9RankGraph22GetNetInstanceByRankIdEji
         "Hccl::RankGraph::GetNetInstanceByRankId(unsigned int, int) const";  # _ZNK4Hccl9RankGraph22GetNetInstanceByRankIdEji
@@ -494,6 +501,11 @@ global:
         "hcomm::CcuRep::CcuV2::ParseInstrV2(hcomm::CcuRep::CcuInstr const*)";  # _ZN5hcomm6CcuRep5CcuV212ParseInstrV2EPKNS0_8CcuInstrE
         "hcomm::CcuRep::GetTokenInfo(unsigned long, unsigned long)";  # _ZN5hcomm6CcuRep12GetTokenInfoEmm
         "hcomm::CcuRep::ParseInstr(hcomm::CcuRep::CcuInstr const*)";  # _ZN5hcomm6CcuRep10ParseInstrEPKNS0_8CcuInstrE
+        "hcomm::HostCpuRoceChannel::SetDfxCallback(std::function<HcclResult (Hccl::TaskParam const&, unsigned long long)>)";  # _ZN5hcomm18HostCpuRoceChannel14SetDfxCallbackESt8functionIF10HcclResultRKN4Hccl9TaskParamEyEE
+        "LaunchContext::GetNotifyWaitTimeOut(unsigned int&)";  # _ZN13LaunchContext20GetNotifyWaitTimeOutERj
+        "LaunchContext::LaunchContext()";  # _ZN13LaunchContextC1Ev
+        "LaunchContext::SetLaunchMode(char const*, HcommLaunchMode)";  # _ZN13LaunchContext13SetLaunchModeEPKc15HcommLaunchMode
+        "LaunchContext::SetNotifyWaitTimeOut(unsigned int)";  # _ZN13LaunchContext20SetNotifyWaitTimeOutEj
         "typeinfo for Hccl::NetInstance::Peer";  # _ZTIN4Hccl11NetInstance4PeerE
     };
 local:

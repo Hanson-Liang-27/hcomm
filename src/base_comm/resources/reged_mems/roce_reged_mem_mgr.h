@@ -17,9 +17,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include "endpoint_pair.h"
+#include "endpoint_pair/endpoint_pair_pub.h"
 #include "reged_mem_mgr.h"
-#include "rma_buffer_mgr.h"
+#include "common/rma_buffer_mgr_pub.h"
 #include "buffer_key.h"
 #include "../../../../../legacy/ascend950/unified_platform/resource/buffer/local_rdma_rma_buffer_v2.h"
 #include "remote_rma_buffer.h"
@@ -29,9 +29,12 @@
 namespace hcomm {
 /**
  * @note Host RoCE 本端 MR：
- *  - 非 MemAlloc 路径（HOST / useAllocMemBase_=false）：走原 localRdmaRmaBufferMgr_
- *  - MemAlloc 路径（useAllocMemBase_ && DEVICE）：每次 GetMemAllocAddrRange，按 allocKey 在
- *    allocToMrMap_ 去重；Unregister 以 handleToAllocKey_ 判别
+ *  - 非 MemAlloc 路径（HOST / useAllocMemBase_=false / 用户窗超出 AddressRange 上界）：
+ *    走原 localRdmaRmaBufferMgr_
+ *  - MemAlloc 路径（useAllocMemBase_ && DEVICE && 用户窗落在 AddressRange 内）：
+ *    按 allocKey 在 allocToMrMap_ 去重；Unregister 以 handleToAllocKey_ 判别
+ *  - VMM 分块映射：单次 aclrtMemGetAddressRange 往往只覆盖一块物理映射，用户窗仅
+ *    超出上界时 isInAllocRange=false，回退 legacy。VMM 切窗去重不在本路径处理。
  *
  *  useAllocMemBase_ 含义：
  *  - 本质：Host 网卡与 NPU 之间的 D2N 通路为 UB（非 PCIe）时，Device MR 需按
@@ -60,12 +63,14 @@ public:
     HcclResult
     MemoryExport(const EndpointDesc& endpointDesc, void* memHandle, void** memDesc, uint32_t* memDescLen) override;
     HcclResult GetAllMemHandles(void** memHandles, uint32_t* memHandleNum) override;
+    // 按 handle 反查注册记录的共享指针，供实例级归属记账
+    HcclResult FindHandleRecord(void* memHandle, std::shared_ptr<Hccl::LocalRdmaRmaBuffer>* out) const;
     HcclResult GetMemDesc(const EndpointDesc endpointDesc, Hccl::LocalRdmaRmaBuffer* localRdmaRmaBuffer) const;
 
     RdmaHandle GetRdmaHandle() const { return rdmaHandle_; }
 
 private:
-    HcclResult GetMemAllocAddrRange(const HcommMem& mem, MemKey& allocKey) const;
+    HcclResult GetMemAllocAddrRange(const HcommMem& mem, MemKey& allocKey, bool& isInAllocRange) const;
 
     HcclResult
     RegisterByMemAllocAddrRange(const HcommMem& mem, const char* memTag, void** memHandle, const MemKey& allocKey);

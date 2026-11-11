@@ -1325,7 +1325,11 @@ int RaPeerRdevInit(struct RaRdmaHandle *rdmaHandle, unsigned int notifyType, str
     PEER_PTHREAD_MUTEX_LOCK(&gRaPeerMutex[rdevInfo.phyId]);
     ret = RsRdevInit(rdevInfo, notifyType, rdevIndex);
     if (ret) {
-        hccp_err("[init][ra_peer_rdev] rs_rdev_init failed[%d], phyId[%u]", ret, rdevInfo.phyId);
+        if (ret == -ENOLINK) {
+            hccp_warn_rma("[init][ra_peer_rdev] rs_rdev_init unsuccessful[%d], phyId[%u]", ret, rdevInfo.phyId);
+        } else {
+            hccp_err("[init][ra_peer_rdev] rs_rdev_init failed[%d], phyId[%u]", ret, rdevInfo.phyId);
+        }
         PEER_PTHREAD_MUTEX_UNLOCK(&gRaPeerMutex[rdevInfo.phyId]);
         goto notify_base_addr_uninit;
     }
@@ -1351,6 +1355,21 @@ int RaPeerRdevGetPortStatus(struct RaRdmaHandle *rdmaHandle, enum PortStatus *st
     PEER_PTHREAD_MUTEX_UNLOCK(&gRaPeerMutex[phyId]);
     if (ret != 0) {
         hccp_err("[get][ra_peer_port_status]RsRdevGetPortStatus failed ret(%d) phyId(%u)", ret, phyId);
+    }
+    return ret;
+}
+
+int RaPeerRdevGetAttr(struct RaRdmaHandle *rdmaHandle, struct RdevAttr *attr)
+{
+    unsigned int phyId = rdmaHandle->rdevInfo.phyId;
+    int ret;
+
+    PEER_PTHREAD_MUTEX_LOCK(&gRaPeerMutex[phyId]);
+    RsSetCtx(phyId);
+    ret = RsRdevGetAttr(phyId, rdmaHandle->rdevIndex, attr);
+    PEER_PTHREAD_MUTEX_UNLOCK(&gRaPeerMutex[phyId]);
+    if (ret != 0) {
+        hccp_err("[get][ra_peer_rdev_attr]RsRdevGetAttr failed ret:%d, phyId:%u", ret, phyId);
     }
     return ret;
 }

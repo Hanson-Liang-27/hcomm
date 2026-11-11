@@ -13,9 +13,8 @@
 #include <string>
 #include <unordered_map>
 #include "json_parser.h"
-#include "invalid_params_exception.h"
-#include "exception_util.h"
 #include "adapter_error_manager_pub.h"
+#include "common/hccl_log_keywords_pub.h"
 #include "rank_table_report_macro.h"
 
 namespace Hccl {
@@ -29,24 +28,41 @@ const unordered_map<string, NetType> RankLevelInfo::strToNetType = (unordered_ma
     {"TOPO_FILE_DESC", NetType::TOPO_FILE_DESC},
     {"CLOS", NetType::CLOS}});
 
-void RankLevelInfo::DeserializeNetLayerInfo(const nlohmann::json& rankLevelInfoJson, RankTableSource source)
+HcclResult RankLevelInfo::DeserializeNetLayerInfo(const nlohmann::json& rankLevelInfoJson, RankTableSource source)
 {
-    std::string msgNetlayer = "error occurs when parser object of propName \"net_layer\"";
-    std::string msgNetinstid = "error occurs when parser object of propName \"net_instance_id\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgNetlayer, (netLayer = GetJsonPropertyUInt(rankLevelInfoJson, "net_layer")),
-        rankLevelInfoJson, "net_layer", "0 ~ UINT32_MAX", source);
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgNetinstid, (netInstId = GetJsonProperty(rankLevelInfoJson, "net_instance_id")),
-        rankLevelInfoJson, "net_instance_id", "non-empty string", source);
+    HcclResult ret = GetJsonPropertyUInt(rankLevelInfoJson, "net_layer", true, 0, netLayer);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(rankLevelInfoJson, "net_layer", "0 ~ UINT32_MAX", source);
+        return ret;
+    }
+    ret = GetJsonProperty(rankLevelInfoJson, "net_instance_id", true, netInstId);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(rankLevelInfoJson, "net_instance_id", "non-empty string", source);
+        return ret;
+    }
 
     if (netLayer > MAX_VALUE_NETLAYER) {
-        THROW<InvalidParamsException>(
-            StringFormat("netLayer[%u] out of range [%u] to [%u]", netLayer, MIN_VALUE_U32, MAX_VALUE_NETLAYER));
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>(
+                {std::to_string(netLayer), "net_layer", "[0, " + std::to_string(MAX_VALUE_NETLAYER) + "]"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] net_layer[%u] is out of range [0, %u]", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), netLayer,
+            MAX_VALUE_NETLAYER);
+        return HCCL_E_PARA;
     }
     if (netInstId.length() < MIN_VALUE_NETID || netInstId.length() > MAX_VALUE_NETID) {
-        THROW<InvalidParamsException>(StringFormat(
-            "netInstId length[%zu] out of range [%u] to [%u]", netInstId.length(), MIN_VALUE_NETID, MAX_VALUE_NETID));
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>(
+                {netInstId, "net_instance_id",
+                 "length [" + std::to_string(MIN_VALUE_NETID) + ", " + std::to_string(MAX_VALUE_NETID) + "]"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] net_instance_id length[%zu] out of range [%u, %u]",
+            LOG_KEYWORDS_INIT_GROUP.c_str(), LOG_KEYWORDS_RANKTABLE_CHECK.c_str(),
+            HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), netInstId.length(), MIN_VALUE_NETID, MAX_VALUE_NETID);
+        return HCCL_E_PARA;
     }
 
     netAttr = rankLevelInfoJson.value<std::string>("net_attr", "");
@@ -55,34 +71,52 @@ void RankLevelInfo::DeserializeNetLayerInfo(const nlohmann::json& rankLevelInfoJ
 
     if (rankLevelInfoJson.contains("net_type")) {
         string netTypeStr;
-        std::string msgNettype = "error occurs when parser object of propName \"net_type\"";
-        TRY_CATCH_THROW_REPORT(
-            InvalidParamsException, msgNettype, (netTypeStr = GetJsonProperty(rankLevelInfoJson, "net_type")),
-            rankLevelInfoJson, "net_type", "non-empty string", source);
+        ret = GetJsonProperty(rankLevelInfoJson, "net_type", true, netTypeStr);
+        if (ret != HCCL_SUCCESS) {
+            ReportJsonConfigError(rankLevelInfoJson, "net_type", "non-empty string", source);
+            return ret;
+        }
         if (!IsStringInNetType(netTypeStr)) {
-            THROW<InvalidParamsException>(StringFormat("[RankLevelInfo::%s] failed with Invalid netType. ", __func__));
+            RPT_INPUT_ERR(
+                true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+                std::vector<std::string>(
+                    {netTypeStr, "net_type", "1DMESH/2DMESH/A3_SERVER/A2_AX_SERVER/TOPO_FILE_DESC/CLOS"}));
+            HCCL_ERROR(
+                "[%s][%s] errNo[0x%016llx] invalid net_type[%s]", LOG_KEYWORDS_INIT_GROUP.c_str(),
+                LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), netTypeStr.c_str());
+            return HCCL_E_PARA;
         }
         netType = strToNetType.at(netTypeStr);
     }
+    return HCCL_SUCCESS;
 }
 
-void RankLevelInfo::DeserializeRankAddrs(const nlohmann::json& rankLevelInfoJson, RankTableSource source)
+HcclResult RankLevelInfo::DeserializeRankAddrs(const nlohmann::json& rankLevelInfoJson, RankTableSource source)
 {
     nlohmann::json rank_addrs;
-    std::string msgAddrs = "error occurs when parser object of propName \"rank_addrs\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgAddrs, (GetJsonPropertyList(rankLevelInfoJson, "rank_addr_list", rank_addrs)),
-        rankLevelInfoJson, "rank_addr_list", "array", source);
+    HcclResult ret = GetJsonPropertyList(rankLevelInfoJson, "rank_addr_list", rank_addrs);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(rankLevelInfoJson, "rank_addr_list", "array", source);
+        return ret;
+    }
     for (auto& addr : rank_addrs) {
         AddressInfo addressInfo;
-        addressInfo.Deserialize(addr, source);
+        CHK_RET(addressInfo.Deserialize(addr, source));
         rankAddrs.emplace_back(addressInfo);
     }
     if (rankAddrs.size() > MAX_VALUE_RANKADDR_SIZE) {
-        THROW<InvalidParamsException>(StringFormat(
-            "rank_addr_list [%u] out of range [%u] to [%u]", rankAddrs.size(), MIN_VALUE_RANKADDR_SIZE,
-            MAX_VALUE_RANKADDR_SIZE));
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>(
+                {std::to_string(rankAddrs.size()), "rank_addr_list size",
+                 "[0, " + std::to_string(MAX_VALUE_RANKADDR_SIZE) + "]"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] rank_addr_list size[%zu] out of range [0, %u]", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rankAddrs.size(),
+            MAX_VALUE_RANKADDR_SIZE);
+        return HCCL_E_PARA;
     }
+    return HCCL_SUCCESS;
 }
 
 void RankLevelInfo::BuildPortAddrMap()
@@ -101,11 +135,12 @@ void RankLevelInfo::BuildPortAddrMap()
     }
 }
 
-void RankLevelInfo::Deserialize(const nlohmann::json& rankLevelInfoJson, RankTableSource source)
+HcclResult RankLevelInfo::Deserialize(const nlohmann::json& rankLevelInfoJson, RankTableSource source)
 {
-    DeserializeNetLayerInfo(rankLevelInfoJson, source);
-    DeserializeRankAddrs(rankLevelInfoJson, source);
+    CHK_RET(DeserializeNetLayerInfo(rankLevelInfoJson, source));
+    CHK_RET(DeserializeRankAddrs(rankLevelInfoJson, source));
     BuildPortAddrMap();
+    return HCCL_SUCCESS;
 }
 
 string RankLevelInfo::Describe() const
@@ -148,7 +183,7 @@ RankLevelInfo::RankLevelInfo(BinaryStream& binStream)
     }
 }
 
-void RankLevelInfo::GetBinStream(BinaryStream& binStream) const
+HcclResult RankLevelInfo::GetBinStream(BinaryStream& binStream) const
 {
     binStream << netLayer << netInstId << netAttr << static_cast<u32>(netType);
     binStream << static_cast<u32>(pcieFallback);
@@ -157,10 +192,11 @@ void RankLevelInfo::GetBinStream(BinaryStream& binStream) const
         "[%s] net_layer[%u] net_instance_id[%s] netType[%s] addrs size[%u]", __func__, netLayer, netInstId.c_str(),
         netType.Describe().c_str(), rankAddrs.size());
     if (rankAddrs.size() == 0) {
-        return;
+        return HCCL_SUCCESS;
     }
     for (auto& rankAddr : rankAddrs) {
-        rankAddr.GetBinStream(binStream);
+        CHK_RET(rankAddr.GetBinStream(binStream));
     }
+    return HCCL_SUCCESS;
 }
 } // namespace Hccl

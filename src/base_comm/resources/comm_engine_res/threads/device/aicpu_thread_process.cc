@@ -9,10 +9,12 @@
  */
 
 #include "aicpu_thread_process.h"
-#include <iomanip>
+#include "common/dev_type_utils_pub.h"
 #include "exception_handle.h"
 #include "stream_lite.h"
 #include "aicpu_rtsq_poll_daemon.h"
+#include "cpu_device_thread.h"
+#include "cpu_device_thread_registry.h"
 
 using namespace hccl;
 
@@ -27,6 +29,11 @@ HcclResult AicpuThreadProcess::InitThreads(ThreadMgrAicpuParam* param)
 {
     CHK_PTR_NULL(param);
     u32 threadNum = param->threadNum;
+    auto** deviceHandle = static_cast<HcommThreadEntity**>(param->deviceHandle);
+    CHK_PTR_NULL(deviceHandle);
+    for (u32 i = 0; i < threadNum; ++i) {
+        CHK_PTR_NULL(deviceHandle[i]);
+    }
     std::vector<std::shared_ptr<Thread>> outThreads;
     outThreads.reserve(threadNum);
     std::string hcomId(param->hcomId);
@@ -41,16 +48,18 @@ HcclResult AicpuThreadProcess::InitThreads(ThreadMgrAicpuParam* param)
         };
     }
 
-    ThreadHandle* threadArray = static_cast<ThreadHandle*>(param->deviceHandle);
-    // 空指针校验
-    CHK_PTR_NULL(threadArray);
     for (size_t i = 0; i < threadNum; ++i) {
-        threadArray[i] = reinterpret_cast<ThreadHandle>(outThreads[i].get()); // 拷贝裸指针
-        HCCL_INFO("[AicpuThreadProcess][%s] threadArray[%zu] = [%lu]", __func__, i, threadArray[i]);
-        int32_t ret = HcommThreadRegisterDfx(threadArray[i], defaultDfxCallback_);
+        ThreadHandle rawHandle = reinterpret_cast<ThreadHandle>(outThreads[i].get());
+        deviceHandle[i]->compatThreadHandle = rawHandle;
+        HCCL_INFO("[AicpuThreadProcess][%s] threadHandle[%zu] = [%lu]", __func__, i, rawHandle);
+        // DPU 线程不持有设备流资源，DFX 注册按 fakeDeviceRes_ 拦截（与 L2 ThreadAicpuMgr 同口径）
+        if (outThreads[i]->IsFakeDeviceRes()) {
+            continue;
+        }
+        int32_t ret = HcommThreadRegisterDfx(rawHandle, defaultDfxCallback_);
         if (ret != 0) {
             HCCL_WARNING(
-                "[AicpuThreadProcess][%s] HcommThreadRegisterDfx is unsuccessful, ret[%d], threadArray[%zu]", __func__,
+                "[AicpuThreadProcess][%s] HcommThreadRegisterDfx is unsuccessful, ret[%d], deviceHandle[%zu]", __func__,
                 ret, i);
         }
     }
@@ -81,8 +90,8 @@ HcclResult AicpuThreadProcess::AicpuThreadInit(ThreadMgrAicpuParam* param)
             ret);
     }
 
-    if (static_cast<DevType>(param->deviceType) == DevType::DEV_TYPE_950
-        || static_cast<DevType>(param->deviceType) == DevType::DEV_TYPE_960) {
+    // 谓词经 hrtSetlocalDeviceType 取数；原站点忽略失败，按 value_or(false) 兜底不启后台线程
+    if (hcomm::EqualToOrGreaterThan950().value_or(false)) {
         InitBackGroundThread();
     }
     return HCCL_SUCCESS;
@@ -90,23 +99,39 @@ HcclResult AicpuThreadProcess::AicpuThreadInit(ThreadMgrAicpuParam* param)
 
 HcclResult AicpuThreadProcess::AicpuThreadDestroy(ThreadMgrAicpuParam* param)
 {
+    CHK_PTR_NULL(param);
     HCCL_INFO("[AicpuThreadProcess][%s] threadNum[%u]", __func__, param->threadNum);
 
     bool needStopBgThread = false;
     {
         std::unique_lock<std::shared_mutex> rwlock(mutex_);
-        ThreadHandle* threadArray = static_cast<ThreadHandle*>(param->deviceHandle);
-        if (threadArray == nullptr) {
-            HCCL_ERROR("[AicpuThreadProcess][%s] threadArray is nullptr", __func__);
+        auto** deviceHandle = static_cast<HcommThreadEntity**>(param->deviceHandle);
+        if (deviceHandle == nullptr) {
+            HCCL_ERROR("[AicpuThreadProcess][%s] deviceHandle is nullptr", __func__);
             return HCCL_E_PTR;
         }
 
         for (u32 i = 0; i < param->threadNum; ++i) {
-            ThreadHandle handle = threadArray[i];
+            if (deviceHandle[i] == nullptr) {
+                HCCL_WARNING("[AicpuThreadProcess][%s] skip null device entity[%u]", __func__, i);
+                continue;
+            }
+            const ThreadHandle handle = deviceHandle[i]->compatThreadHandle;
+            if (handle == 0) {
+                HCCL_WARNING("[AicpuThreadProcess][%s] skip empty thread handle[%u]", __func__, i);
+                continue;
+            }
+            // DPU 线程由 L2 建实体并在 device 侧登记，销毁恒走这里：无论本容器里有没有该句柄，
+            // 都先按句柄摘一次登记（幂等），避免留下指向已析构实体的悬垂映射
+            bool isCpuDeviceThread = EraseCpuDeviceThread(handle);
             auto it = std::find_if(threads_.begin(), threads_.end(), [handle](const std::shared_ptr<Thread>& ptr) {
                 return reinterpret_cast<ThreadHandle>(ptr.get()) == handle;
             });
             if (it == threads_.end()) {
+                if (isCpuDeviceThread) {
+                    HCCL_DEBUG("[AicpuThreadProcess][%s] destroyed cpu device thread handle[0x%llx]", __func__, handle);
+                    continue;
+                }
                 HCCL_WARNING("[AicpuThreadProcess][%s] thread handle[0x%llx] not found in threads_", __func__, handle);
                 continue;
             }
@@ -178,19 +203,39 @@ HcclResult AicpuThreadProcess::ResumeThread(
     CHK_PTR_NULL(param);
     u32 threadNum = param->threadNum;
     std::string hcomId(param->hcomId);
-    ThreadHandle* threadArray = static_cast<ThreadHandle*>(param->deviceHandle);
-    for (u32 i = 0; i < threadNum; ++i) {
-        std::string thdUniqueId(param->threadParam[i], THREAD_UNIQUE_ID_MAX_SIZE);
-        if (UNLIKELY(HcclCheckLogLevel(HCCL_LOG_INFO))) {
-            std::ostringstream oss;
-            oss << "threadParam[" << i << "] raw bytes: ";
-            constexpr u32 HEX_WIDTH = 2;
-            for (u32 j = 0; j < THREAD_UNIQUE_ID_MAX_SIZE; ++j) {
-                oss << std::hex << std::setw(HEX_WIDTH) << std::setfill('0')
-                    << static_cast<unsigned int>(static_cast<unsigned char>(param->threadParam[i][j])) << " ";
-            }
-            HCCL_INFO("[AicpuThreadProcess][%s] %s", __func__, oss.str().c_str());
+    auto** deviceHandle = static_cast<HcommThreadEntity**>(param->deviceHandle);
+    if (isSupplementNotify) {
+        CHK_PTR_NULL(deviceHandle);
+        for (u32 i = 0; i < threadNum; ++i) {
+            CHK_PTR_NULL(deviceHandle[i]);
         }
+    }
+    for (u32 i = 0; i < threadNum; ++i) {
+        // CPU 线程建专属实体：无 notify 序列化描述，也不下发 uid，须先于 uid 解析分派
+        bool isCpuDeviceThread = false;
+        std::shared_ptr<Thread> cpuDeviceThread;
+        HcclResult makeRet = MakeCpuDeviceThread(
+            param->threadType, param->hcomId, param->deviceLogicId, param->deviceType, isCpuDeviceThread,
+            cpuDeviceThread);
+        if (makeRet != HCCL_SUCCESS) {
+            // 实体已在 MakeCpuDeviceThread 内登记进 registry，失败须先摘除本批已登记句柄，
+            // 否则 outThreads 随本函数返回析构后，registry 成为唯一强引用、实体永久泄漏
+            for (const auto& created : outThreads) {
+                (void)EraseCpuDeviceThread(reinterpret_cast<ThreadHandle>(created.get()));
+            }
+            return makeRet;
+        }
+        if (isCpuDeviceThread) {
+            outThreads.emplace_back(std::move(cpuDeviceThread));
+            continue;
+        }
+        uint32_t uidLen = 0;
+        const char* uidData = GetThreadUid(param, i, uidLen);
+        CHK_PRT_RET(
+            uidData == nullptr,
+            HCCL_ERROR("[AicpuThreadProcess][%s] thread[%u] uid invalid, uidLen[%u]", __func__, i, uidLen),
+            HCCL_E_PARA);
+        std::string thdUniqueId(uidData, uidLen);
         std::shared_ptr<AicpuTsThread> thread;
         EXCEPTION_CATCH((thread = std::make_shared<AicpuTsThread>(thdUniqueId)), return HCCL_E_PTR);
         thread->SetCommEngine(param->engine);
@@ -198,10 +243,11 @@ HcclResult AicpuThreadProcess::ResumeThread(
         std::string notifyDesc;
         CHK_RET(thread->GetNotifyByUniqueId(notifyNum, notifyDesc));
         if (isSupplementNotify) {
-            AicpuTsThread* threadPtr = reinterpret_cast<AicpuTsThread*>(threadArray[i]);
+            const ThreadHandle handle = deviceHandle[i]->compatThreadHandle;
+            AicpuTsThread* threadPtr = reinterpret_cast<AicpuTsThread*>(handle);
             CHK_PTR_NULL(threadPtr);
             HCCL_INFO(
-                "[%s]threadIdx[%u], threadHandle[%llu], notifyNum[%u], newNotifyNum[%u]", __func__, i, threadArray[i],
+                "[%s]threadIdx[%u], threadHandle[%llu], notifyNum[%u], newNotifyNum[%u]", __func__, i, handle,
                 threadPtr->GetNotifyNum(), notifyNum);
             CHK_RET(threadPtr->SupplementNotify(notifyNum, notifyDesc));
         } else {
@@ -212,6 +258,9 @@ HcclResult AicpuThreadProcess::ResumeThread(
                     hcomId.c_str(), param->threadNum, i);
                 return ret;
             }
+            CHK_PTR_NULL(deviceHandle);
+            CHK_PTR_NULL(deviceHandle[i]);
+            CHK_RET(thread->FillThreadEntityRtsq(*deviceHandle[i]));
             outThreads.emplace_back(thread);
         }
     }

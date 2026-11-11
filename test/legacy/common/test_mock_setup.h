@@ -34,7 +34,7 @@
             .stubs()                                                                                      \
             .with(mockcpp::any(), outBoundP(fakeName, sizeof(fakeName)), mockcpp::any());                 \
         MOCKER(HrtNotifyGetOffset).stubs().will(returnValue(fakeOffset));                                 \
-        MOCKER(HrtGetDeviceType).stubs().will(returnValue(DevType(DevType::DEV_TYPE_950)));               \
+        MOCKER(HrtGetDeviceType).stubs().will(returnValue(Hccl::DevType(Hccl::DevType::DEV_TYPE_950)));   \
     } while (0)
 
 /**
@@ -52,7 +52,7 @@
         MOCKER(CcuDeviceManager::ReleaseCke).defaults().will(returnValue(HcclResult::HCCL_SUCCESS));    \
         MOCKER(HrtGetDevice).defaults().will(returnValue(0));                                           \
         MOCKER(HrtRaUbUnimportJetty).defaults().will(returnValue(0));                                   \
-        MOCKER(HrtGetDeviceType).defaults().will(returnValue(DevType::DEV_TYPE_950));                   \
+        MOCKER(HrtGetDeviceType).defaults().will(returnValue(Hccl::DevType::DEV_TYPE_950));             \
         MOCKER(HrtGetDevicePhyIdByUserDevId).defaults().will(returnValue(static_cast<DevId>(0)));       \
         MOCKER(HrtRaUbCreateJetty).defaults().will(returnValue(HrtRaUbJettyCreatedOutParam()));         \
         MOCKER(HraGetDieAndFuncId).defaults().will(returnValue(std::pair<uint32_t, uint32_t>(0, 0)));   \
@@ -70,7 +70,7 @@
  */
 #define SETUP_CNT_NOTIFY_MOCKS()                                                               \
     do {                                                                                       \
-        MOCKER(HrtGetDeviceType).stubs().will(returnValue(DevType::DEV_TYPE_910A2));           \
+        MOCKER(HrtGetDeviceType).stubs().will(returnValue(Hccl::DevType::DEV_TYPE_910A2));     \
         MOCKER(HrtGetDevice).stubs().will(returnValue(0));                                     \
         MOCKER(HrtGetDevicePhyIdByUserDevId).stubs().will(returnValue(static_cast<DevId>(1))); \
         MOCKER(HrtCntNotifyCreate).stubs().will(returnValue((void*)(fakeNotifyHandleAddr)));   \
@@ -92,7 +92,7 @@
         MOCKER(CcuDeviceManager::ReleaseCke).defaults().will(returnValue(HcclResult::HCCL_SUCCESS));    \
         MOCKER(HrtGetDevice).defaults().will(returnValue(0));                                           \
         MOCKER(HrtRaUbUnimportJetty).defaults().will(returnValue(0));                                   \
-        MOCKER(HrtGetDeviceType).defaults().will(returnValue(DevType::DEV_TYPE_950));                   \
+        MOCKER(HrtGetDeviceType).defaults().will(returnValue(Hccl::DevType::DEV_TYPE_950));             \
         MOCKER(HrtGetDevicePhyIdByUserDevId).defaults().will(returnValue(static_cast<DevId>(0)));       \
         MOCKER(HrtRaUbCreateJetty).defaults().will(returnValue(HrtRaUbJettyCreatedOutParam()));         \
         MOCKER(HraGetDieAndFuncId).defaults().will(returnValue(std::pair<uint32_t, uint32_t>(0, 0)));   \
@@ -167,7 +167,7 @@
     do {                                                                                                            \
         MOCKER(HrtSetDevice).stubs().with(mockcpp::any()).will(ignoreReturnValue());                                \
         MOCKER(HrtGetDevice).stubs().will(returnValue(0));                                                          \
-        MOCKER(HrtGetDeviceType).stubs().will(returnValue(DevType(DevType::DEV_TYPE_950)));                         \
+        MOCKER(HrtGetDeviceType).stubs().will(returnValue(Hccl::DevType(Hccl::DevType::DEV_TYPE_950)));             \
         MOCKER(HrtOpenTsdProcess)                                                                                   \
             .stubs()                                                                                                \
             .with(mockcpp::any(), mockcpp::any())                                                                   \
@@ -175,11 +175,20 @@
         MOCKER(HrtRaTlvInit).stubs().with(mockcpp::any()).will(returnValue(HcclResult::HCCL_SUCCESS));              \
         MOCKER(HrtGetDevicePhyIdByUserDevId).stubs().with(mockcpp::any()).will(returnValue(static_cast<DevId>(1))); \
         MOCKER(RaInit).stubs().with(mockcpp::any()).will(returnValue(0));                                           \
-        MOCKER(RaTlvInit).stubs().with(mockcpp::any()).will(returnValue(0));                                        \
-        MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void (CommunicatorImpl::*)(const std::string&))                \
+        MOCKER(RaTlvInit)                                                                                           \
             .stubs()                                                                                                \
             .with(mockcpp::any())                                                                                   \
-            .will(ignoreReturnValue());                                                                             \
+            .will(invoke(+[](struct TlvInitInfo*, unsigned int*, void** tlvHandle) {                                \
+                static char fakeTlvHandle;                                                                          \
+                if (tlvHandle != nullptr) {                                                                         \
+                    *tlvHandle = &fakeTlvHandle;                                                                    \
+                }                                                                                                   \
+                return 0;                                                                                           \
+            }));                                                                                                    \
+        MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult (CommunicatorImpl::*)(const std::string&))          \
+            .stubs()                                                                                                \
+            .with(mockcpp::any())                                                                                   \
+            .will(returnValue(HcclResult::HCCL_SUCCESS));                                                           \
         MOCKER_CPP(&CommunicatorImpl::InitNotifyManager).stubs().will(ignoreReturnValue());                         \
         MOCKER_CPP(&CommunicatorImpl::InitStreamManager).stubs().will(ignoreReturnValue());                         \
         MOCKER_CPP(&CommunicatorImpl::InitSocketManager).stubs().will(ignoreReturnValue());                         \

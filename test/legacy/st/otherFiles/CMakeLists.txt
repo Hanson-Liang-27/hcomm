@@ -29,7 +29,6 @@ target_sources(hccl_v2_stest
         st_instructions.cc
         st_connections_builder.cc
         st_prim_rules.cc
-        st_hccl_sqe_v82.cc
         st_hccl_sqe.cc
         st_sqe_mgr.cc
 
@@ -44,7 +43,6 @@ target_sources(hccl_v2_stest
         st_coll_service_default_impl.cc
         st_alg_component_stub.cc
 
-        st_mask_event.cc
         st_coll_service_ai_cpu_impl.cc
         st_interpreter.cc
 )

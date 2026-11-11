@@ -78,6 +78,9 @@ public:
     HcclResult CheckSocketStatus(std::string socketOpreator);
     HcclResult UpdateMemInfo(std::vector<LocalRmaBuffer*>& bufferVecTemp);
 
+    // 打包当前全量对端条目（头部 entryNum + 逐条 RmaBufEntryLite 字段），供 device 侧按地址 upsert 进 rmt 表
+    std::vector<char> GetMemUpdatePack() const;
+
     // hostUb使用
     HcclResult GetRemoteSeg(const void* addr, u64 len, u64* seg);
 
@@ -141,8 +144,8 @@ private:
     void CntNotifyDescPack(BinaryStream& binaryStream);
     HcclResult CntNotifyDescUnpack(BinaryStream& binaryStream);
 
-    HcclResult
-    RmtBufferVecUnpackProc(u32 locNum, BinaryStream& binaryStream, RemoteBufferVec& bufferVec, UbRmtBufType type);
+    HcclResult RmtBufferVecUnpackProc(
+        u32 locNum, BinaryStream& binaryStream, RemoteBufferVec& bufferVec, UbRmtBufType type, bool skipExisting);
     HcclResult ConnVecUnpackProc(BinaryStream& binaryStream, bool& needSendFinish);
 
     void FillRmtRmaBufferVec(RemoteRmaBuffer* rmaBuffer, UbRmtBufType type);

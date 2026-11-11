@@ -9,16 +9,17 @@
  */
 
 #include "order_launch_thread_mgr.h"
+#include "hcomm_res.h"
 #include "acl/acl_rt.h"
 #include "orion_adapter_rts.h"
 #include "adapter_rts_common.h"
 #include "local_notify.h" // GE保序notify以LocalNotify对象管理（所有权转移模型，正常路径创建/销毁）
 #include "coll_comm.h"
-#include "hcclCommOp.h"
 #include "sal_pub.h"
-#include "prof_cycle_time.h"
-#include "hcomm_c_adpt.h"
-#include "hcomm_thread_c_adpt.h"
+#include "comm_engine/thread/dfx/thread_dfx_pub.h"
+#include "dfx/prof_utils_pub.h"
+#include "comm_engine/thread/thread_c_adpt_pub.h"
+#include "comm_engine/thread/thread_pub.h"
 
 namespace hccl {
 
@@ -176,7 +177,7 @@ HcclResult OrderLaunchThreadMgr::GetCurrentContext(u64& currentContext) const
     aclError ret = aclrtGetCurrentContext(&rtCtx);
     CHK_PRT_RET(
         ret != ACL_SUCCESS, HCCL_ERROR("[%s]aclrtGetCurrentContext failed, ret[%d]", __func__, ret), HCCL_E_RUNTIME);
-    currentContext = reinterpret_cast<u64>(rtCtx);
+    currentContext = ReinterpretAs<u64>(rtCtx);
     CHK_PRT_RET(
         currentContext == UINT64_MAX, HCCL_ERROR("[%s]GetCurrentContext failed, context is INVALID_U64", __func__),
         HCCL_E_RUNTIME);
@@ -325,11 +326,10 @@ HcclResult OrderLaunchThreadMgr::EnsureOrderThread(
         // 失败保持INVALID便于识别，不影响主流程
         s32 streamId = INVALID_INT;
         if (targetThread != 0) {
-            void* streamInfo = nullptr;
+            ThreadResTypeStream stream = nullptr;
             HcommResult resRet
-                = HcommThreadResGetInfo(targetThread, THREAD_RES_TYPE_STREAM, sizeof(streamInfo), &streamInfo);
-            if (resRet == HCCL_SUCCESS && streamInfo != nullptr) {
-                ThreadResTypeStream stream = static_cast<ThreadResTypeStream>(streamInfo);
+                = HcommThreadResGetInfo(targetThread, THREAD_RES_TYPE_STREAM, sizeof(ThreadResTypeStream), &stream);
+            if (resRet == HCCL_SUCCESS && stream != nullptr) {
                 (void)hrtGetStreamId(stream, streamId);
             } else {
                 HCCL_WARNING("[%s] get stream info failed, ret[%d], thread[0x%llx]", __func__, resRet, targetThread);
@@ -405,11 +405,10 @@ ThreadHandle OrderLaunchThreadMgr::GetHcomAttachedThreadByGroup(const std::strin
         std::vector<std::unique_ptr<LocalNotify>> notifys;
         notifys.reserve(ORDER_THREAD_NOTIFY_NUM);
         for (u32 i = 0; i < ORDER_THREAD_NOTIFY_NUM; i++) {
-            std::unique_ptr<LocalNotify> notify(new (std::nothrow) LocalNotify());
-            if (notify == nullptr) {
-                HCCL_ERROR("[%s] new LocalNotify failed, group[%s], index[%u]", __func__, group.c_str(), i);
-                return 0; // 已建的随局部unique_ptr析构自动回收
-            }
+            std::unique_ptr<LocalNotify> notify;
+            EXCEPTION_CATCH(notify = std::make_unique<LocalNotify>(),
+                            HCCL_ERROR("[%s] new LocalNotify failed, group[%s], index[%u]", __func__, group.c_str(), i);
+                            return 0);
             HcclResult createRet = notify->Init(NotifyLoadType::HOST_NOTIFY);
             if (createRet != HCCL_SUCCESS) {
                 HCCL_ERROR(
@@ -439,7 +438,7 @@ ThreadHandle OrderLaunchThreadMgr::GetHcomAttachedThreadByGroup(const std::strin
 
     ThreadHandle thread = 0;
     HcommResult ret = HcommThreadAcquireByNotify(
-        static_cast<rtStream_t>(streamIt->second), reinterpret_cast<void**>(rawNotifys.data()),
+        static_cast<rtStream_t>(streamIt->second), ReinterpretAs<void**>(rawNotifys.data()),
         static_cast<uint32_t>(rawNotifys.size()), &thread);
     if (ret != HCCL_SUCCESS) {
         // 线程仅借用（其内部失败路径析构只清引用不碰对象）；对象保留在map中供下次建链复用
@@ -496,8 +495,8 @@ HcclResult OrderLaunchThreadMgr::OrderLaunchThreadAcquire(
     thread = 0;
 
     HCCL_DEBUG(
-        "[%s] begin, useType[%d], group[%s], notifyNumPerThread[%u]", __func__, static_cast<s32>(useType),
-        group.c_str(), notifyNumPerThread);
+        "[%s] begin, HcclDedicatedThreadType[%d], group[%s], notifyNumPerThread[%u]", __func__,
+        static_cast<s32>(useType), group.c_str(), notifyNumPerThread);
 
     u64 beginTime = hcomm::GetProfCycleTime();
 
@@ -526,7 +525,8 @@ HcclResult OrderLaunchThreadMgr::OrderLaunchThreadAcquire(
             break;
         }
         default:
-            HCCL_ERROR("[%s] invalid useType[%d] for order launch", __func__, static_cast<s32>(useType));
+            HCCL_ERROR(
+                "[%s] invalid HcclDedicatedThreadType[%d] for order launch", __func__, static_cast<s32>(useType));
             return HCCL_E_PARA;
     }
 
@@ -537,7 +537,7 @@ HcclResult OrderLaunchThreadMgr::OrderLaunchThreadAcquire(
         CHK_RET(RegisterDfx(collComm, useType, thread, beginTime, group));
     }
 
-    HCCL_INFO("[%s] success, useType[%d], thread[0x%llx]", __func__, static_cast<s32>(useType), thread);
+    HCCL_INFO("[%s] success, HcclDedicatedThreadType[%d], thread[0x%llx]", __func__, static_cast<s32>(useType), thread);
     return HCCL_SUCCESS;
 }
 

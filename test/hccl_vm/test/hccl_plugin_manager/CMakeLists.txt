@@ -20,7 +20,6 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/include/store
-    ${CMAKE_SOURCE_DIR}/include/runnerdb
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/store
     ${CMAKE_SOURCE_DIR}/src/utils
@@ -41,6 +40,7 @@ link_directories(
 
 add_executable(test_hccl_plugin_manager
     ${HOME}/ut_hccl_plugin_manager_test.cc
+    ${HOME}/cmd_base_utils_stub.cc
     ${CMAKE_SOURCE_DIR}/src/plugin/hccl_plugin_manager.cc
     ${CMAKE_SOURCE_DIR}/src/plugin/hccl_plugin.cc
     ${CMAKE_SOURCE_DIR}/src/utils/sim_log.cc

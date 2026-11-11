@@ -1,3 +1,4 @@
+#include "ccu_device.h"
 /**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -9,6 +10,7 @@
  */
 
 #include "rdma_handle_manager.h"
+#include "dfx/device/dfx_res_pub.h"
 #include "socket/socket.h"
 #include "sal.h"
 
@@ -33,6 +35,8 @@
 #include "notify_lite.h"
 #include "stream_lite.h"
 #include "rtsq_base.h"
+#include "rtsq_a5.h"
+#include "sqe.h"
 #include "ub_conn_lite_mgr.h"
 #include "rmt_rma_buf_slice_lite.h"
 #include "aicpu_res_package_helper.h"
@@ -89,6 +93,10 @@
 #include "../../../legacy/ascend950/framework/dfx/common/global_mirror_tasks.h"
 #include "../../../legacy/ascend950/framework/dfx/common/circular_queue.h"
 #include "dfx_profiling_handler.h"
+#include "hcclCommOp.h"
+#include "comm_engine/thread/dfx/thread_dfx_pub.h"
+#include "comm_engine/thread/thread_pub.h"
+#include "op_mode.h"
 #include "dfx_profiling_reporter.h"
 #include "../../../legacy/ascend950/framework/dfx/aicpu/profiling/profiling_handler_lite.h"
 #include "../../../legacy/ascend950/framework/dfx/aicpu/profiling/profiling_reporter_lite.h"
@@ -183,7 +191,7 @@ void Socket::Listen()
     socketStatus = SocketStatus::LISTENING;
     std::cout << "Socket Server, listen." << std::endl;
 }
-void Socket::RecvAsync(u8* recvBuf, u32 size) { return; }
+void Socket::RecvAsync(void* recvBuf, u32 size) { return; }
 
 bool Socket::Listen(u32& port)
 {
@@ -315,6 +323,12 @@ QpHandle HrtRaQpCreate(RdmaHandle rdmaHandle, int flag, int qpMode) { return (Qp
 
 int HrtGetRaQpStatus(QpHandle qpHandle) { return 0; }
 
+u32 HrtGetQpNum(QpHandle qpHandle)
+{
+    (void)qpHandle;
+    return 0;
+}
+
 SocketHandle HostSocketHandleManager::Get(unsigned int, Hccl::IpAddress const&) { return (void*)0x12345678; }
 
 SocketHandle HostSocketHandleManager::Create(unsigned int, Hccl::IpAddress const&) { return (void*)0x12345678; }
@@ -332,13 +346,35 @@ SocketStatus Socket::GetStatus(u32 timeout) { return SocketStatus::OK; }
 bool Socket::Send(const void* sendBuf, u32 size) const { return true; }
 bool Socket::Recv(void* recvBuf, u32 size) const { return true; }
 
-RtsqBase::RtsqBase(u32 devPhyId, u32 streamId, u32 sqId) : devPhyId_(devPhyId), streamId_(streamId), sqId_(sqId) {}
+RtsqBase::RtsqBase(u32 devPhyId, u32 streamId, u32 sqId) : devPhyId_(devPhyId), streamId_(streamId), sqId_(sqId)
+{
+    // UT 环境无硬件可查，给出合法 SQ 深度，避免 RtsqA5 取 SQE 缓存时对 sqDepth_ 取模除零
+    sqDepth_ = AC_SQE_MAX_CNT;
+}
+
 void RtsqBase::Reset(bool reset) { (void)reset; }
+
+// aicpu::GetSqeId 为 aicpu 框架提供的弱符号，UT 环境需提供强定义，供 RtsqBase 构造函数申请 taskId
+namespace aicpu {
+    void GetSqeId(const uint32_t num, uint32_t& start, uint32_t& end)
+    {
+        start = 1;
+        end = start + num;
+    }
+} // namespace aicpu
 
 HcclResult
 RtsqBase::GetSqeHeaderFieldsBySqIdx(u32 sqIdx, uint16_t& streamId, uint16_t& taskId, u8& sqeType, u32& notifyId) const
 {
     return HCCL_SUCCESS;
+}
+
+StreamLite::StreamLite(std::vector<char>& uniqueId)
+{
+    (void)uniqueId;
+    id = 0;
+    sqId = 0;
+    rtsq = std::make_unique<RtsqA5>(devPhyId, id, sqId);
 }
 
 StreamLite::StreamLite(u32 id, u32 sqIds, u32 phyId, u32 cqIds) : id(id), sqId(sqIds), devPhyId(phyId), cqId(cqIds)
@@ -391,7 +427,7 @@ const void* StreamLite::GetLatestDfxOpInfo() const
 
 u32 GetKernelExecTimeoutFromEnvConfig() { return 0; }
 
-std::vector<ModuleData> AicpuResPackageHelper::ParsePackedData(std::vector<char, std::allocator<char>>&) const
+std::vector<ModuleData> AicpuResPackageHelper::ParsePackedData(const std::vector<char, std::allocator<char>>&) const
 {
     std::vector<ModuleData> result;
 
@@ -516,9 +552,9 @@ RmaConnStatus DevUbConnection::GetStatus() { return RmaConnStatus::READY; }
 
 std::unique_ptr<Serializable> DevUbConnection::GetExchangeDto() { return nullptr; }
 
-void DevUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto) {}
+HcclResult DevUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto) { return HCCL_SUCCESS; }
 
-void DevUbConnection::ImportRmtDto() {}
+HcclResult DevUbConnection::ImportRmtDto() { return HCCL_SUCCESS; }
 
 void DevUbConnection::ThrowAbnormalStatus(std::string funcName) {}
 
@@ -573,6 +609,33 @@ HcclResult DevUbConnection::SetSharedJettyFields(
 }
 
 void DevUbConnection::DetachJetty() { jettyDetached_ = true; }
+
+HcclResult DevUbConnection::DetachTpOwnership(TpOwnership& outOwnership)
+{
+    // 与源码同步：幂等防御——已移交过（releaseTpOnDestroy_=false）重复调用返回 NOT_FOUND，
+    // 不再产出第二个释放回调；tpHandle=0 无有效引用同样返回 NOT_FOUND（析构仍 ReleaseTp）
+    outOwnership = TpOwnership{};
+    if (!releaseTpOnDestroy_) {
+        return HCCL_E_NOT_FOUND;
+    }
+    outOwnership.devLogicId = devLogicId;
+    outOwnership.locAddr = locAddr;
+    outOwnership.rmtAddr = rmtAddr;
+    outOwnership.tpProtocol = tpProtocol;
+    outOwnership.qos = static_cast<u32>(qos_);
+    outOwnership.tpInfo = tpInfo;
+    if (tpInfo.tpHandle == 0) {
+        return HCCL_E_NOT_FOUND;
+    }
+    releaseTpOnDestroy_ = false;
+    return HCCL_SUCCESS;
+}
+
+void DevUbConnection::RestoreTpOwnershipOnDestroy()
+{
+    // 与源码同步：回调构造失败回滚，还原析构释放
+    releaseTpOnDestroy_ = true;
+}
 
 HcclResult DevUbConnection::GetJettyInfo(JettyInfo& info) const
 {
@@ -683,25 +746,9 @@ string DevUbConnection::Describe() const { return "heelo"; }
 
 void DevUbConnection::AddNop(const Stream& stream) {}
 
-HrtUbJfcMode DevUbConnection::GetUbJfcMode() const { return jfcMode; }
-
-u32 DevUbConnection::GetPiVal() const { return 4; }
-
-u32 DevUbConnection::GetCiVal() const { return 3; }
-
-u32 DevUbConnection::GetSqDepth() const { return sqDepth; }
-
-void DevUbConnection::UpdateCiVal(u32 ci) {}
-
 void DevUbConnection::SetMaxReadSize(u32 value) {}
 
 void DevUbConnection::SetMaxWriteSize(u32 value) {}
-
-std::vector<DevUbConnection*> GetStarsPollUbConns(const std::vector<RmaConnection*>& rmaConns)
-{
-    std::vector<DevUbConnection*> ubConns;
-    return ubConns;
-}
 
 HcclResult DevUbConnection::Describe(std::string& dfxMsg)
 {
@@ -709,7 +756,6 @@ HcclResult DevUbConnection::Describe(std::string& dfxMsg)
     return HCCL_SUCCESS;
 }
 
-bool IfNeedUpdatingUbCi(const std::vector<DevUbConnection*>& ubConns) { return true; }
 RmaConnection::RmaConnection(Socket* socket, const RmaConnType rmaConnType) : socket(socket), rmaConnType(rmaConnType)
 {}
 
@@ -798,7 +844,9 @@ RemoteUbRmaBuffer::RemoteUbRmaBuffer(RdmaHandle rdmaHandle) : RemoteRmaBuffer(Rm
 
 RemoteUbRmaBuffer::RemoteUbRmaBuffer(
     uintptr_t addr, u64 size, u32 tokenId, u32 tokenValue, HcclMemType memType, const std::string& memInfo)
-    : RemoteRmaBuffer(RmaType::UB)
+    : RemoteRmaBuffer(RmaType::UB),
+      tokenId(tokenId),
+      tokenValue(tokenValue)
 {
     this->addr = addr;
     this->size = size;
@@ -818,13 +866,27 @@ RemoteIpcRmaBuffer::RemoteIpcRmaBuffer(const Serializable& rmtDto, uint8_t pathM
     : RemoteRmaBuffer(RmaType::IPC),
       pathMode_(pathMode),
       isOpened(true)
-{}
+{
+    // 桩实现不做 IPC 内存打开，但字段语义需与真实构造函数保持一致，供上层出参用例校验
+    const auto& dto = dynamic_cast<const ExchangeIpcBufferDto&>(rmtDto);
+    addr = dto.addr + dto.offset;
+    size = dto.size;
+    memInfo = dto.memInfo;
+    memType = dto.memType;
+}
 
 RemoteIpcRmaBuffer::RemoteIpcRmaBuffer(const Serializable& rmtDto, const string tag, uint8_t pathMode)
     : RemoteRmaBuffer(RmaType::IPC),
       pathMode_(pathMode),
       isOpened(true)
-{}
+{
+    (void)tag;
+    const auto& dto = dynamic_cast<const ExchangeIpcBufferDto&>(rmtDto);
+    addr = dto.addr + dto.offset;
+    size = dto.size;
+    memInfo = dto.memInfo;
+    memType = dto.memType;
+}
 
 void RemoteIpcRmaBuffer::Close() const {}
 
@@ -983,7 +1045,7 @@ void UbMemTransport::CntNotifyDescPack(BinaryStream& binaryStream) {}
 HcclResult UbMemTransport::CntNotifyDescUnpack(BinaryStream& binaryStream) { return HCCL_SUCCESS; }
 
 HcclResult UbMemTransport::RmtBufferVecUnpackProc(
-    u32 locNum, BinaryStream& binaryStream, RemoteBufferVec& bufferVec, UbRmtBufType type)
+    u32 locNum, BinaryStream& binaryStream, RemoteBufferVec& bufferVec, UbRmtBufType type, bool skipExisting)
 {
     return HCCL_SUCCESS;
 }
@@ -1062,6 +1124,8 @@ HcclResult UbMemTransport::GetRemoteMems(uint32_t* memNum, CommMem** remoteMem, 
 HcclResult UbMemTransport::CheckSocketStatus(std::string socketOpreator) { return HCCL_SUCCESS; }
 
 HcclResult UbMemTransport::UpdateMemInfo(std::vector<LocalRmaBuffer*>& bufferVecTemp) { return HCCL_SUCCESS; }
+
+std::vector<char> UbMemTransport::GetMemUpdatePack() const { return {}; }
 
 HcclResult UbMemTransport::Init() { return HCCL_SUCCESS; }
 
@@ -1150,9 +1214,25 @@ HcclResult BaseMemTransport::CheckLocConn(CommonLocRes& res) { return HCCL_SUCCE
 
 HcclResult BaseMemTransport::CheckCommonLocRes(CommonLocRes& res) { return HCCL_SUCCESS; }
 HcclResult HrtRaCreateQpWithCq(
-    RdmaHandle rdmaHandle, s32 sqEvent, s32 rqEvent, void* sendChannel, void* recvChannel, QpInfo& info, bool isHdcMode)
+    RdmaHandle rdmaHandle, s32 sqEvent, s32 rqEvent, void* sendChannel, void* recvChannel, QpInfo& info, CqInfo& cq,
+    bool isHdcMode)
 {
     return HCCL_SUCCESS;
+}
+
+// RaRdevGetAttr 打桩：与 ra_host.c 桩值保持一致（maxQpWr=32768，maxCqe=65535），供 EndpointGetRdevAttr 链接
+extern "C" int RaRdevGetAttr(void* rdevHandle, struct RdevAttr* attr)
+{
+    (void)rdevHandle;
+    if (attr == nullptr) {
+        return -1;
+    }
+    attr->status = PORT_STATUS_ACTIVE;
+    attr->maxMsgSize = 0;
+    attr->maxQpWr = 32768U;
+    attr->maxCqe = 65535U;
+    attr->isInlineReduceSupported = false;
+    return 0;
 }
 
 HcclResult HrtRaDestroyQpWithCq(const QpInfo& info, bool isHdcMode) { return HCCL_SUCCESS; }
@@ -1180,7 +1260,7 @@ std::unique_ptr<Serializable> LocalIpcRmaBuffer::GetExchangeDto()
 {
     auto dto = std::make_unique<ExchangeIpcBufferDto>(
         static_cast<u64>(buf->GetAddr()), static_cast<u64>(buf->GetSize()), ipcOffset, static_cast<u32>(0),
-        buf->GetMemInfo().c_str());
+        buf->GetMemInfo().c_str(), buf->GetMemType());
     (void)memcpy_s(dto->name, RTS_IPC_MEM_NAME_LEN, name, RTS_IPC_MEM_NAME_LEN);
     return std::unique_ptr<Serializable>(dto.release());
 }
@@ -1442,24 +1522,31 @@ HcclResult DfxProfilingReporter::Init() { return HCCL_SUCCESS; }
 
 void DfxProfilingReporter::SetCurrDfxOpInfo(std::shared_ptr<DfxOpInfo> dfxOpInfo) const {}
 
-void DfxProfilingReporter::ReportOp(uint64_t beginTime, bool cachedReq, bool opbased) const {}
+HcclResult DfxProfilingReporter::ReportOp(uint64_t beginTime, bool cachedReq, bool opbased) const
+{
+    return HCCL_SUCCESS;
+}
 
-void DfxProfilingReporter::ReportCallBackAllTasks(bool cachedReq) {}
+HcclResult DfxProfilingReporter::ReportCallBackAllTasks(bool cachedReq) { return HCCL_SUCCESS; }
 
-void DfxProfilingReporter::ReportAllTasks(bool cachedReq) {}
+HcclResult DfxProfilingReporter::ReportAllTasks(bool cachedReq) { return HCCL_SUCCESS; }
 
 /* 中途打开profiling开关 */
 void DfxProfilingReporter::UpdateProfStat() {}
 
-void DfxProfilingReporter::CallReportMc2CommInfo(
+HcclResult DfxProfilingReporter::CallReportMc2CommInfo(
     const Stream& kfcStream, const Stream& stream, const std::vector<Stream*>& aicpuStreams, const std::string& id,
     RankId myRank, u32 rankSize, RankId rankInParentComm) const
-{}
+{
+    return HCCL_SUCCESS;
+}
 
-void DfxProfilingReporter::CallReportMc2CommInfo(
+HcclResult DfxProfilingReporter::CallReportMc2CommInfo(
     const u32 kfcStreamId, const std::vector<u32>& aicpuStreamsId, const std::string& id, RankId myRank, u32 rankSize,
     RankId rankInParentComm) const
-{}
+{
+    return HCCL_SUCCESS;
+}
 
 ProfilingReporterLite::ProfilingReporterLite(
     MirrorTaskManagerLite* mirrorTaskMgrLite, ProfilingHandlerLite* profilingHandlerLite, bool isIndop)
@@ -1940,7 +2027,8 @@ string IpcLocalNotify::Describe() const { return ""; }
 
 HcclResult HcclCommDestroyV2(HcclComm comm) { return HCCL_SUCCESS; }
 
-HcclResult HcommFlushV2() { return HCCL_SUCCESS; }
+// Provide a callable target for the weak HCOM V2 entry in UT builds.
+extern "C" HcclResult HcomDestroyGroupImplV2(const std::string& group) { return HCCL_SUCCESS; }
 
 HcclResult HcclGetCommNameV2(HcclComm commHandle, char* commName) { return HCCL_SUCCESS; }
 
@@ -2035,16 +2123,18 @@ uint8_t TpManager::CalcTaTimeout(TpProtocol tpProtocol, uint8_t taTimeOut, uint3
     return envValue;
 }
 
-void ReleaseUbConnectionTp(
+HcclResult ReleaseUbConnectionTp(
     const int32_t devLogicId, const IpAddress& locAddr, const IpAddress& rmtAddr, const TpProtocol tpProtocol,
     TpInfo& tpInfo, const uint32_t requestQos)
 {
+    // 与源码同步：返回释放结果供调用方审计（stub 环境无 TpManager 缓存，恒成功）
     (void)devLogicId;
     (void)locAddr;
     (void)rmtAddr;
     (void)tpProtocol;
     (void)requestQos;
     tpInfo.tpHandle = 0;
+    return HCCL_SUCCESS;
 }
 
 HrtRaUbLocalMemRegOutParam HrtRaUbLocalMemReg(RdmaHandle handle, const HrtRaUbLocMemRegParam& in)
@@ -2109,7 +2199,12 @@ HcclResult HrtRaGetEidByIp(RdmaHandle handle, const vector<IpAddress>& ipV4Addre
 
 HcclResult HrtGetUboeFlagEnable(u32 devPhyId) { return HCCL_E_NOT_FOUND; }
 
-bool HraGetRtpEnable(RdmaHandle handle) { return false; }
+HcclResult HraGetRtpEnable(RdmaHandle handle, bool& rtpEnable)
+{
+    (void)handle;
+    rtpEnable = false;
+    return HCCL_SUCCESS;
+}
 
 pair<uint32_t, uint32_t> HraGetDieAndFuncId(RdmaHandle handle)
 {
@@ -2146,7 +2241,7 @@ DfxProfilingReporterLite::~DfxProfilingReporterLite() {}
 
 HcclResult DfxProfilingReporterLite::Init() { return HCCL_SUCCESS; }
 
-void DfxProfilingReporterLite::ReportAllTasks(const std::vector<hccl::Thread*>& threads, const DfxCommContext& ctx) {}
+void DfxProfilingReporterLite::ReportAllTasks(const std::vector<ThreadHandle>& threads, const DfxCommContext& ctx) {}
 
 void DfxProfilingReporterLite::ReportStreamTask(TaskInfoCircularQueue* taskQueue, const DfxCommContext& ctx) {}
 
@@ -2178,3 +2273,20 @@ int32_t HcommNewThreadRegisterGetLatestDfxOpInfo(ThreadHandle thread, std::funct
     (void)callback;
     return 0;
 }
+
+namespace Hccl {
+// UT hook：next 用例通过该钩子驱动 Socket::Accept 的成功/超时分支（默认空 = 无连接）
+std::function<HcclResult(const std::string&, std::shared_ptr<Socket>&)> g_utSocketAcceptHook;
+
+// UT stub：Socket::Accept 默认无连接（供 SocketMgr::AcceptSocket 所在 stub 库链接；真实实现由 socket.cc 提供，
+// 在同时链接真实 socket.cc 的用例二进制中由可执行文件内的定义优先）
+HcclResult Socket::Accept(const std::string& tag, std::shared_ptr<Socket>& acceptedSocket, u32 acceptTimeOut)
+{
+    (void)acceptTimeOut;
+    acceptedSocket = nullptr;
+    if (g_utSocketAcceptHook != nullptr) {
+        return g_utSocketAcceptHook(tag, acceptedSocket);
+    }
+    return HCCL_E_AGAIN;
+}
+} // namespace Hccl

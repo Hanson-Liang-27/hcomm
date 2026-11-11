@@ -15,6 +15,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <ifaddrs.h>
+#include <net/if.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -39,7 +40,6 @@
 #define MAX_GROUP_CNT 16
 #define MAX_HCA_COUNT 64
 #define MAX_NAME_LEN 64
-#define MAX_IP_STR_LEN 48
 
 /* ───────── 业务结构 ───────── */
 typedef struct {
@@ -71,12 +71,18 @@ static bool TagIs(const TagEntry* e, const char* name) { return strcmp(e->tagNam
 
 static void BuildNpuBdfTable(char bdfs[MAX_NPU_COUNT][MAX_NAME_LEN])
 {
-    int npuCnt = hal_get_npu_count();
+    int npuCnt = hal_get_visible_device_count();
     if (npuCnt <= 0 || npuCnt > (int)MAX_NPU_COUNT) {
         TOPO_ERR("BuildNpuBdfTable: invalid npuCnt=%d", npuCnt);
         return;
     }
-    for (int phyId = 0; phyId < npuCnt; phyId++) {
+    for (int userDevId = 0; userDevId < npuCnt; userDevId++) {
+        int phyId = -1;
+        int convRet = hal_get_phyid_from_userdevid(userDevId, &phyId);
+        if (convRet != 0 || phyId < 0 || phyId >= (int)MAX_NPU_COUNT) {
+            TOPO_INFO("BuildNpuBdfTable: skip userId=%d, ret=%d, phyId=%d", userDevId, convRet, phyId);
+            continue;
+        }
         struct dcmi_pcie_info_all pcieInfo;
         if (hal_get_device_pcie_info(phyId, &pcieInfo) == 0) {
             int ret = sprintf_s(
@@ -106,21 +112,27 @@ static void TryAddNpuByBdf(const TagEntry* e, GroupCtx* ctx)
         return;
     }
 
-    /* 遍历所有 NPU 的 BDF 表，找与 busId 匹配的那个 NPU */
-    int npuCount = hal_get_npu_count();
-    unsigned int tableSize = (npuCount <= 0) ? 0 : (unsigned int)npuCount;
-    if (tableSize > MAX_NPU_COUNT) {
-        tableSize = MAX_NPU_COUNT;
+    /* 遍历本进程可见 NPU 的 BDF 表，找与 busId 匹配的那个 NPU */
+    int npuCount = hal_get_visible_device_count();
+    if (npuCount <= 0 || npuCount > (int)MAX_NPU_COUNT) {
+        TOPO_INFO("TryAddNpuByBdf: invalid npuCount=%d", npuCount);
+        return;
     }
-    for (unsigned int npuIdx = 0; npuIdx < tableSize; npuIdx++) {
-        if (ctx->npuBdfs[npuIdx][0] == '\0') {
+    for (int userDevId = 0; userDevId < npuCount; userDevId++) {
+        int phyId = -1;
+        int convRet = hal_get_phyid_from_userdevid(userDevId, &phyId);
+        if (convRet != 0 || phyId < 0 || phyId >= (int)MAX_NPU_COUNT) {
+            TOPO_INFO("TryAddNpuByBdf: skip userId=%d, ret=%d, phyId=%d", userDevId, convRet, phyId);
             continue;
         }
-        if (strcmp(busId, ctx->npuBdfs[npuIdx]) != 0) {
+        if (ctx->npuBdfs[phyId][0] == '\0') {
+            continue;
+        }
+        if (strcmp(busId, ctx->npuBdfs[phyId]) != 0) {
             continue;
         }
 
-        /* busId 匹配 → 将 NPU[npuIdx] 加入亲和组 */
+        /* busId 匹配 → 将 NPU[phyId] 加入亲和组 */
         AffinityGroup* group = &ctx->groups[ctx->curGroupIdx];
         unsigned int groupCnt = group->npuCnt;
         if (groupCnt > MAX_NPU_COUNT) {
@@ -130,13 +142,13 @@ static void TryAddNpuByBdf(const TagEntry* e, GroupCtx* ctx)
         /* 检查该 NPU 是否已在组内，避免重复占用槽位 */
         bool alreadyInGroup = false;
         for (unsigned int existIdx = 0; existIdx < groupCnt; existIdx++) {
-            if (group->npuIds[existIdx] == (int)npuIdx) {
+            if (group->npuIds[existIdx] == phyId) {
                 alreadyInGroup = true;
                 break;
             }
         }
         if (!alreadyInGroup && groupCnt < MAX_NPU_COUNT) {
-            group->npuIds[groupCnt] = (int)npuIdx;
+            group->npuIds[groupCnt] = phyId;
             group->npuCnt = groupCnt + 1;
         }
         break;
@@ -435,7 +447,7 @@ static TopoAddrResult BuildAffinityFromDriver(AffinityInfo* info)
         return ret;
     }
 
-    int npuCount = hal_get_npu_count();
+    int npuCount = hal_get_visible_device_count();
     if (npuCount <= 0 || npuCount > (int)MAX_NPU_COUNT) {
         TOPO_ERR("BuildAffinityFromDriver: invalid npuCount=%d", npuCount);
         TOPO_PERF_END(BuildAffinityFromDriver);
@@ -450,16 +462,17 @@ static TopoAddrResult BuildAffinityFromDriver(AffinityInfo* info)
 
     unsigned int totalQuery = 0;
     unsigned int failedQuery = 0;
-    for (int phyId = 0; phyId < npuCount; phyId++) {
-        /* 与 XML 路径一致：跳过当前进程不可见的 NPU */
-        int userDevId = -1;
-        if (hal_get_userdevid_by_phyid(phyId, &userDevId) != 0) {
-            TOPO_INFO("BuildAffinityFromDriver: skip invisible NPU, phyId=%d", phyId);
+    for (int userDevId = 0; userDevId < npuCount; userDevId++) {
+        int phyId = -1;
+        int convRet = hal_get_phyid_from_userdevid(userDevId, &phyId);
+        if (convRet != 0 || phyId < 0 || phyId >= (int)MAX_NPU_COUNT) {
+            TOPO_INFO("BuildAffinityFromDriver: skip userId=%d, ret=%d, phyId=%d", userDevId, convRet, phyId);
             continue;
         }
         unsigned int logicId = 0;
-        if (hal_get_logicid_from_phyid((unsigned int)phyId, &logicId) != 0) {
-            TOPO_INFO("BuildAffinityFromDriver: skip NPU without logic id, phyId=%d", phyId);
+        int logicRet = hal_get_logicid_from_userdevid(userDevId, &logicId);
+        if (logicRet != 0) {
+            TOPO_INFO("BuildAffinityFromDriver: skip NPU without logic id, userId=%d, ret=%d", userDevId, logicRet);
             continue;
         }
         for (unsigned int nicIdx = 0; nicIdx < nicCount; nicIdx++) {
@@ -499,36 +512,36 @@ static TopoAddrResult BuildAffinityFromDriver(AffinityInfo* info)
 
 /* ─── 打印 NPU → 网卡名 → IP 分配结果 ─── */
 static void LogAssignResult(
-    const AffinityInfo* info, int npuCount, const bool nicValid[MAX_HCA_COUNT], const char nicIps[][MAX_IP_STR_LEN],
-    const char assignment[][MAX_IP_STR_LEN])
+    const AffinityInfo* info, const bool nicValid[MAX_HCA_COUNT], const NpuNicIp nicIps[MAX_HCA_COUNT],
+    const NpuNicIp assignment[MAX_NPU_COUNT])
 {
-    for (int ni = 0; ni < npuCount; ni++) {
-        if (assignment[ni][0] == '\0') {
+    for (int ni = 0; ni < (int)MAX_NPU_COUNT; ni++) {
+        if (assignment[ni].addr[0] == '\0') {
             continue;
         }
         /* 反向查找该 IP 对应的 NIC 名 */
         const char* nicName = NULL;
         for (unsigned int j = 0; j < info->nicCount; j++) {
-            if (nicValid[j] && strcmp(assignment[ni], nicIps[j]) == 0) {
+            if (nicValid[j] && strcmp(assignment[ni].addr, nicIps[j].addr) == 0) {
                 nicName = info->nicNames[j];
                 break;
             }
         }
-        TOPO_INFO("NPU %d → %s (%s)", ni, assignment[ni], nicName ? nicName : "?");
+        TOPO_INFO("NPU %d → %s (%s)", ni, assignment[ni].addr, nicName ? nicName : "?");
     }
 }
 
 /* ─── 轮询分发全量 NPU 的 RoCE IP ─── */
 
 static TopoAddrResult DispatchIpsRoundRobin(
-    int phyId, const AffinityInfo* info, const bool nicValid[MAX_HCA_COUNT], const char nicIps[][MAX_IP_STR_LEN],
-    char* outIp, size_t outLen)
+    int phyId, const AffinityInfo* info, const bool nicValid[MAX_HCA_COUNT], const NpuNicIp nicIps[MAX_HCA_COUNT],
+    NpuNicIp* out)
 {
     if (phyId < 0 || phyId >= (int)MAX_NPU_COUNT) {
         TOPO_ERR("DispatchIpsRoundRobin: invalid phyId=%d", phyId);
         return TOPO_ERR_PARA;
     }
-    int npuCount = hal_get_npu_count();
+    int npuCount = hal_get_visible_device_count();
     if (npuCount <= 0 || npuCount > (int)MAX_NPU_COUNT) {
         TOPO_ERR("DispatchIpsRoundRobin: invalid npuCount=%d", npuCount);
         return TOPO_ERR_INTERNAL;
@@ -539,38 +552,46 @@ static TopoAddrResult DispatchIpsRoundRobin(
         return TOPO_ERR_INTERNAL;
     }
 
-    char assignment[MAX_NPU_COUNT][MAX_IP_STR_LEN];
+    NpuNicIp assignment[MAX_NPU_COUNT];
     (void)memset_s(assignment, sizeof(assignment), 0, sizeof(assignment));
 
     unsigned int cur = 0;
-    for (int npuId = 0; npuId < npuCount; npuId++) {
+    for (int userDevId = 0; userDevId < npuCount; userDevId++) {
+        int npuPhyId = -1;
+        int convRet = hal_get_phyid_from_userdevid(userDevId, &npuPhyId);
+        if (convRet != 0 || npuPhyId < 0 || npuPhyId >= (int)MAX_NPU_COUNT) {
+            TOPO_INFO("DispatchIpsRoundRobin: skip userId=%d, ret=%d, phyId=%d", userDevId, convRet, npuPhyId);
+            continue;
+        }
         for (unsigned int j = cur; j < cur + nicCount; j++) {
             unsigned int nicIdx = j % nicCount;
-            if (!nicValid[nicIdx] || !info->affined[npuId][nicIdx]) {
+            if (!nicValid[nicIdx] || !info->affined[npuPhyId][nicIdx]) {
                 continue;
             }
-            int ret = strcpy_s(assignment[npuId], sizeof(assignment[0]), nicIps[nicIdx]);
+            int ret = strcpy_s(assignment[npuPhyId].addr, sizeof(assignment[0].addr), nicIps[nicIdx].addr);
             if (ret != 0) {
                 TOPO_ERR(
-                    "DispatchIpsRoundRobin: strcpy_s failed, npuId=%d nicIdx=%u ret=%d nicIps=%s", npuId, nicIdx, ret,
-                    nicIps[nicIdx]);
+                    "DispatchIpsRoundRobin: strcpy_s failed, phyId=%d nicIdx=%u ret=%d nicIps=%s", npuPhyId, nicIdx,
+                    ret, nicIps[nicIdx].addr);
                 continue;
             }
+            assignment[npuPhyId].type = nicIps[nicIdx].type;
             cur = (j + 1) % nicCount;
             break;
         }
     }
 
-    LogAssignResult(info, npuCount, nicValid, nicIps, assignment);
+    LogAssignResult(info, nicValid, nicIps, assignment);
 
-    if (assignment[phyId][0] != '\0') {
-        int ret = strcpy_s(outIp, outLen, assignment[phyId]);
+    if (assignment[phyId].addr[0] != '\0') {
+        int ret = strcpy_s(out->addr, sizeof(out->addr), assignment[phyId].addr);
         if (ret != 0) {
             TOPO_ERR(
-                "DispatchIpsRoundRobin: strcpy_s failed for outIp, phyId=%d ret=%d outLen=%zu ip=%s", phyId, ret,
-                outLen, assignment[phyId]);
+                "DispatchIpsRoundRobin: strcpy_s failed for outIp, phyId=%d ret=%d buf=%zu ip=%s", phyId, ret,
+                sizeof(out->addr), assignment[phyId].addr);
             return TOPO_ERR_INTERNAL;
         }
+        out->type = assignment[phyId].type;
         return TOPO_SUCCESS;
     }
     TOPO_ERR("no IP assigned for phyId=%d", phyId);
@@ -579,8 +600,14 @@ static TopoAddrResult DispatchIpsRoundRobin(
 
 /* ─── 名称 → IP 转换 ─── */
 
-/* 直接以 eth 名查 IP */
-static TopoAddrResult EthToIp(const char* eth, char* ip, size_t ipLen)
+static bool IsLinkLocalIpv6(const struct in6_addr* addr)
+{
+    /* 链路本地前缀 fe80::/64：前 64 位为 fe80:0000:0000:0000 */
+    return addr->s6_addr32[0] == htonl(0xfe800000) && addr->s6_addr32[1] == 0UL;
+}
+
+/* 直接以 eth 名查 IP：优先 IPv4，无 IPv4 时回退到查到的第一个非链路本地 IPv6 */
+static TopoAddrResult EthToIp(const char* eth, NpuNicIp* out)
 {
     struct ifaddrs* ifaddr = NULL;
     if (getifaddrs(&ifaddr) == -1) {
@@ -588,6 +615,8 @@ static TopoAddrResult EthToIp(const char* eth, char* ip, size_t ipLen)
         return TOPO_ERR_SYSCALL;
     }
 
+    char ipv6[MAX_NET_ADDR_LEN] = {0};
+    bool hasIpv6 = false;
     for (struct ifaddrs* ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
         if (ifa->ifa_addr == NULL || ifa->ifa_name == NULL) {
             continue;
@@ -595,21 +624,55 @@ static TopoAddrResult EthToIp(const char* eth, char* ip, size_t ipLen)
         if (strcmp(ifa->ifa_name, eth) != 0) {
             continue;
         }
-        if (ifa->ifa_addr->sa_family != AF_INET) {
+        /* 网卡 down / link down 了跳过，避免选中不可用网卡而不去亲和其它网卡 */
+        if ((ifa->ifa_flags & (IFF_UP | IFF_RUNNING)) != (IFF_UP | IFF_RUNNING)) {
             continue;
         }
-        struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
-        if (inet_ntop(AF_INET, &sin->sin_addr, ip, (socklen_t)ipLen) != NULL) {
-            freeifaddrs(ifaddr);
-            return TOPO_SUCCESS;
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+            if (inet_ntop(AF_INET, &sin->sin_addr, out->addr, (socklen_t)sizeof(out->addr)) != NULL) {
+                out->type = NPU_NIC_ADDR_TYPE_IPV4;
+                freeifaddrs(ifaddr);
+                return TOPO_SUCCESS;
+            }
+            continue;
+        }
+        /* 无 IPv4 时回退：记住第一个非链路本地 IPv6，遍历完仍未找到 IPv4 再返回 */
+        if (ifa->ifa_addr->sa_family == AF_INET6 && !hasIpv6) {
+            struct sockaddr_in6* sin6 = (struct sockaddr_in6*)ifa->ifa_addr;
+            if (IsLinkLocalIpv6(&sin6->sin6_addr)) {
+                continue;
+            }
+            /* IPv4-mapped IPv6（::ffff:a.b.c.d）本质是 IPv4，取内嵌 IPv4 按 IPv4 处理 */
+            if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+                struct in_addr v4;
+                v4.s_addr = sin6->sin6_addr.s6_addr32[3];
+                if (inet_ntop(AF_INET, &v4, out->addr, (socklen_t)sizeof(out->addr)) != NULL) {
+                    out->type = NPU_NIC_ADDR_TYPE_IPV4;
+                    freeifaddrs(ifaddr);
+                    return TOPO_SUCCESS;
+                }
+                continue;
+            }
+            if (inet_ntop(AF_INET6, &sin6->sin6_addr, ipv6, (socklen_t)sizeof(ipv6)) != NULL) {
+                hasIpv6 = true;
+            }
         }
     }
     freeifaddrs(ifaddr);
+
+    if (hasIpv6) {
+        if (strcpy_s(out->addr, sizeof(out->addr), ipv6) != 0) {
+            return TOPO_ERR_INTERNAL;
+        }
+        out->type = NPU_NIC_ADDR_TYPE_IPV6;
+        return TOPO_SUCCESS;
+    }
     return TOPO_ERR_NOT_FOUND;
 }
 
 /* 以 HCA 名查 IP：/sys/class/infiniband/<hca>/device/net/<eth> */
-static TopoAddrResult HcaToIp(const char* hca, char* ip, size_t ipLen)
+static TopoAddrResult HcaToIp(const char* hca, NpuNicIp* out)
 {
     char netPath[MAX_PATH_LEN];
     int ret = sprintf_s(netPath, sizeof(netPath), HCA_NET_PATH_TEMPLATE, hca);
@@ -640,16 +703,16 @@ static TopoAddrResult HcaToIp(const char* hca, char* ip, size_t ipLen)
         return TOPO_ERR_NOT_FOUND;
     }
 
-    return EthToIp(eth, ip, ipLen);
+    return EthToIp(eth, out);
 }
 
 /* name 可能是 eth 名或 HCA 名：先尝试 eth，再尝试 HCA */
-static TopoAddrResult NameToIp(const char* name, char* ip, size_t ipLen)
+static TopoAddrResult NameToIp(const char* name, NpuNicIp* out)
 {
-    if (EthToIp(name, ip, ipLen) == TOPO_SUCCESS) {
+    if (EthToIp(name, out) == TOPO_SUCCESS) {
         return TOPO_SUCCESS;
     }
-    TopoAddrResult ret = HcaToIp(name, ip, ipLen);
+    TopoAddrResult ret = HcaToIp(name, out);
     if (ret != TOPO_SUCCESS) {
         TOPO_ERR("NameToIp: cannot resolve IP for %s (eth+HCA)", name);
     }
@@ -658,22 +721,18 @@ static TopoAddrResult NameToIp(const char* name, char* ip, size_t ipLen)
 
 /* ─── 打印 NPU-NIC 亲和关系（NIC 名 + IP） ─── */
 
-static void LogAffinityInfo(const AffinityInfo* info, const char nicIps[][MAX_IP_STR_LEN])
+static void LogAffinityInfo(const AffinityInfo* info, const NpuNicIp nicIps[MAX_HCA_COUNT])
 {
     unsigned int nicCnt = info->nicCount;
     if (nicCnt > MAX_HCA_COUNT) {
         nicCnt = MAX_HCA_COUNT;
     }
-    int npuCount = hal_get_npu_count();
-    if (npuCount <= 0 || npuCount > (int)MAX_NPU_COUNT) {
-        return;
-    }
-    for (int npuId = 0; npuId < npuCount; npuId++) {
+    for (int npuId = 0; npuId < (int)MAX_NPU_COUNT; npuId++) {
         for (unsigned int nicIdx = 0; nicIdx < nicCnt; nicIdx++) {
             if (info->affined[npuId][nicIdx]) {
                 TOPO_INFO(
                     "[affinity] NPU%d <- %s(%s)", npuId, info->nicNames[nicIdx],
-                    (nicIps[nicIdx][0] != '\0') ? nicIps[nicIdx] : "?");
+                    (nicIps[nicIdx].addr[0] != '\0') ? nicIps[nicIdx].addr : "?");
             }
         }
     }
@@ -681,22 +740,23 @@ static void LogAffinityInfo(const AffinityInfo* info, const char nicIps[][MAX_IP
 
 /* ─── 预解析全部 NIC 的 IP → 调用轮询分发 → 直接出 IP ─── */
 
-static TopoAddrResult SelectNpuRoceIp(int npuId, const AffinityInfo* info, char* ip, size_t ipLen)
+static TopoAddrResult SelectNpuRoceIp(int npuId, const AffinityInfo* info, NpuNicIp* out)
 {
     unsigned int nicCnt = info->nicCount;
     if (nicCnt > MAX_HCA_COUNT) {
         nicCnt = MAX_HCA_COUNT;
     }
 
-    char nicIps[MAX_HCA_COUNT][MAX_IP_STR_LEN] = {{0}};
+    NpuNicIp nicIps[MAX_HCA_COUNT];
+    (void)memset_s(nicIps, sizeof(nicIps), 0, sizeof(nicIps));
     bool nicValid[MAX_HCA_COUNT] = {false};
     for (unsigned int i = 0; i < nicCnt; i++) {
-        if (NameToIp(info->nicNames[i], nicIps[i], sizeof(nicIps[i])) == TOPO_SUCCESS) {
+        if (NameToIp(info->nicNames[i], &nicIps[i]) == TOPO_SUCCESS) {
             nicValid[i] = true;
         }
     }
     LogAffinityInfo(info, nicIps);
-    return DispatchIpsRoundRobin(npuId, info, nicValid, nicIps, ip, ipLen);
+    return DispatchIpsRoundRobin(npuId, info, nicValid, nicIps, out);
 }
 
 /* ─── 对外接口 ─── */
@@ -737,10 +797,10 @@ static TopoAddrResult BuildAffinity(AffinityInfo* info)
     return BuildAffinityFromDriver(info);
 }
 
-TopoAddrResult GetRoceIpFromXml(int npuId, char* ip, size_t ipLen)
+TopoAddrResult GetRoceIpFromXml(int npuId, NpuNicIp* out)
 {
-    if (ip == NULL || ipLen == 0 || npuId < 0) {
-        TOPO_ERR("GetRoceIpFromXml: invalid params (ip=%p, ipLen=%zu, npuId=%d)", ip, ipLen, npuId);
+    if (out == NULL || npuId < 0) {
+        TOPO_ERR("GetRoceIpFromXml: invalid params (out=%p, npuId=%d)", out, npuId);
         return TOPO_ERR_PARA;
     }
 
@@ -751,6 +811,7 @@ TopoAddrResult GetRoceIpFromXml(int npuId, char* ip, size_t ipLen)
         return ret;
     }
 
-    /* 从所有 NIC 中轮询选出当前 NPU 的 RoCE IP */
-    return SelectNpuRoceIp(npuId, &info, ip, ipLen);
+    /* 从所有 NIC 中轮询选出当前 NPU 的 RoCE IP 及其类型 */
+    (void)memset_s(out, sizeof(*out), 0, sizeof(*out));
+    return SelectNpuRoceIp(npuId, &info, out);
 }

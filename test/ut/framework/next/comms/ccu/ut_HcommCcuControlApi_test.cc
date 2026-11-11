@@ -1,3 +1,4 @@
+#include "ccu_device.h"
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -17,6 +18,7 @@
 #include "ccu_kernel_impl/ccu_var_add_simple_demo.h"
 #include "ccu_kernel_impl/ccu_loop_add_demo.h"
 #include "ccu_kernel_impl/ccu_func_call_demo.h"
+#include "ccu_kernel_impl/ccu_xkernel_allgather_demo.h"
 #include "ccu_kernel_impl/ccu_jump_demo.h"
 #include "ccu_kernel_impl/ccu_micro_sim.h"
 #include "ccu_kernel_impl/ccu_reduce_scatter_mesh1d_demo.h"
@@ -28,11 +30,25 @@
 #undef protected
 #undef private
 
+#include "base_comm_node_accessors.h"
+
 CCU_FUNC_KERNEL_TEST(Ut_FuncCallBasic_Expect_Success, CcuFuncCallBasicDemoKernel, true)
 CCU_FUNC_KERNEL_TEST(Ut_FuncCallReuse_Expect_Success, CcuFuncCallReuseDemoKernel, true)
 CCU_FUNC_KERNEL_TEST(Ut_FuncCallMultiArg_Expect_Success, CcuFuncCallMultiArgDemoKernel, true)
 CCU_FUNC_KERNEL_TEST(Ut_FuncCallInLoop_Expect_Fail, CcuFuncCallInLoopInvalidDemoKernel, false)
 CCU_FUNC_KERNEL_TEST(Ut_FuncCallNested_Expect_Fail, CcuFuncCallNestedInvalidDemoKernel, false)
+CCU_FUNC_KERNEL_TEST(Ut_FuncNamedDuplicate_Expect_Fail, CcuFuncNamedDuplicateInvalidDemoKernel, false)
+CCU_FUNC_KERNEL_TEST(Ut_FuncCallNamedByNttp_Expect_Fail, CcuFuncCallNamedByNttpInvalidDemoKernel, false)
+CCU_FUNC_KERNEL_TEST(Ut_FuncNamedOverLimit_Expect_Fail, CcuFuncNamedOverLimitInvalidDemoKernel, false)
+CCU_FUNC_KERNEL_TEST(Ut_FuncNamedRetryAfterOverLimit_Expect_Success, CcuFuncNamedRetryAfterOverLimitDemoKernel, true)
+CCU_FUNC_KERNEL_TEST(Ut_FuncNamedBodyThrow_Expect_Fail, CcuFuncNamedBodyThrowInvalidDemoKernel, false)
+CCU_FUNC_KERNEL_TEST(Ut_FuncCallMixed_Expect_Success, CcuFuncCallMixedDemoKernel, true)
+CCU_FUNC_KERNEL_TEST(Ut_FuncNamedThenAnonCall_Expect_Success, CcuFuncNamedThenAnonCallDemoKernel, true)
+CCU_FUNC_KERNEL_TEST(Ut_FuncCallNamedMultiArity_Expect_Success, CcuFuncCallNamedMultiArityDemoKernel, true)
+CCU_FUNC_KERNEL_TEST(Ut_FuncCallByAddrMixedArity_Expect_Success, CcuFuncCallByAddrMixedArityDemoKernel, true)
+CCU_FUNC_KERNEL_TEST(Ut_FuncCallByAddrInFuncBody_Expect_Fail, CcuFuncCallByAddrNestedInvalidDemoKernel, false)
+CCU_FUNC_KERNEL_TEST(Ut_FuncCallByAddrInLoop_Expect_Fail, CcuFuncCallByAddrInLoopInvalidDemoKernel, false)
+CCU_FUNC_KERNEL_TEST(Ut_FuncCallWithLoop_Expect_Success, CcuFuncCallWithLoopDemoKernel, true)
 CCU_FUNC_KERNEL_TEST(Ut_IfInLoop_Expect_Fail, CcuIfInLoopInvalidDemoKernel, false)
 CCU_FUNC_KERNEL_TEST(Ut_NotifyRecordInLoop_Expect_Fail, CcuNotifyRecordInLoopInvalidDemoKernel, false)
 CCU_FUNC_KERNEL_TEST(Ut_WriteVarWithNotifyInLoop_Expect_Fail, CcuWriteVarWithNotifyInLoopInvalidDemoKernel, false)
@@ -44,6 +60,7 @@ CCU_FUNC_KERNEL_V2_TEST(Ut_LoadAddImm_Expect_Success, CcuLoadAddImmDemoKernel, t
 CCU_FUNC_KERNEL_V2_TEST(Ut_AddImmStore_Expect_Success, CcuAddImmStoreDemoKernel, true)
 CCU_FUNC_KERNEL_V2_TEST(Ut_WriteVarAtomicAdd_Expect_Success, CcuWriteVarAtomicAddDemoKernel, true)
 CCU_FUNC_KERNEL_V2_TEST(Ut_WriteWithCascCntInc_Expect_Success, CcuWriteWithCascCntIncDemoKernel, true)
+CCU_FUNC_KERNEL_V2_TEST(Ut_WriteWithCascCntIncOverLimit_Expect_Success, CcuWriteWithCascCntIncOverLimitDemoKernel, true)
 
 namespace {
 void SetupCascCntTest(
@@ -58,6 +75,27 @@ void SetupCascCntTest(
     EXPECT_EQ(HcommCcuInsCreate(resDescs, hcomm::CCU_MAX_IODIE_NUM, &insHandle), CcuResult::CCU_SUCCESS);
     EXPECT_EQ(HcommCcuCascCntAlloc(insHandle, 0, &cntHandle), CcuResult::CCU_SUCCESS);
     EXPECT_NE(cntHandle, 0U);
+}
+
+// 跨实例场景: insA 只用于注册 kernel, 级联计数器句柄由 insB 在指定 die 上分配。
+// insB 不预置默认资源, 避免与带默认资源的 insA 争抢同一设备资源池。
+void SetupCrossInstanceCascCntTest(
+    HcommCcuResDescHandle resDescsA[hcomm::CCU_MAX_IODIE_NUM],
+    HcommCcuResDescHandle resDescsB[hcomm::CCU_MAX_IODIE_NUM], CcuInsHandle& insA, CcuInsHandle& insB, uint8_t cntDieId,
+    HcommCcuCascCntHandle& cntHandleB)
+{
+    constexpr uint32_t fakeDevId = MAX_MODULE_DEVICE_NUM - 2;
+    constexpr hcomm::CcuVersion fakeCcuVersion = hcomm::CcuVersion::CCU_V2;
+    (void)MockCcuDeviceEnv(fakeDevId, fakeCcuVersion);
+
+    CreateCcuResDescsPair(resDescsA, fakeCcuVersion);
+    EXPECT_EQ(HcommCcuInsCreate(resDescsA, hcomm::CCU_MAX_IODIE_NUM, &insA), CcuResult::CCU_SUCCESS);
+
+    CreateCcuResDescsPair(resDescsB, fakeCcuVersion, false);
+    EXPECT_EQ(HcommCcuInsResDescSetNum(resDescsB[cntDieId], HCOMM_CCU_RES_TYPE_CASC_CNT, 1), CcuResult::CCU_SUCCESS);
+    EXPECT_EQ(HcommCcuInsCreate(resDescsB, hcomm::CCU_MAX_IODIE_NUM, &insB), CcuResult::CCU_SUCCESS);
+    EXPECT_EQ(HcommCcuCascCntAlloc(insB, cntDieId, &cntHandleB), CcuResult::CCU_SUCCESS);
+    EXPECT_NE(cntHandleB, 0U);
 }
 } // namespace
 
@@ -122,6 +160,232 @@ TEST_F(HcommCcuControlApiTest, Ut_CascCntClear_Expect_Success)
     EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
     DestroyCcuResDescs(resDescs);
 }
+
+TEST_F(HcommCcuControlApiTest, Ut_CascCntCrossInstance_Expect_Success)
+{
+    HcommCcuResDescHandle resDescsA[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    HcommCcuResDescHandle resDescsB[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    CcuInsHandle insA{0};
+    CcuInsHandle insB{0};
+    HcommCcuCascCntHandle cntHandleB = 0;
+    SetupCrossInstanceCascCntTest(resDescsA, resDescsB, insA, insB, 0, cntHandleB);
+
+    // insA 上注册 kernel, 引用 insB 分配的级联计数器句柄, 同 die 时应按句柄归属实例解析成功
+    EXPECT_EQ(HcommCcuKernelRegisterStart(insA), CcuResult::CCU_SUCCESS);
+
+    CcuCascCntDemoArg demoArg{};
+    demoArg.cntHandle = cntHandleB;
+    demoArg.tgtValue = 1024;
+    CcuKernelArg kernelArg = static_cast<CcuKernelArg>(&demoArg);
+    const void* kernelArgs[] = {kernelArg};
+    CcuKernelHandle kernelHandle{0};
+    constexpr uint32_t kernelDieId = 0;
+    constexpr uint32_t kernelArgNum = 1;
+    CcuResult ccuRet = HcommCcuKernelRegister(
+        insA, kernelDieId, const_cast<char*>("CcuCascCntWaitDemoKernel"),
+        reinterpret_cast<void*>(CcuCascCntWaitDemoKernel), kernelArgs, kernelArgNum, &kernelHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+    EXPECT_EQ(HcommCcuKernelRegisterEnd(insA), CcuResult::CCU_SUCCESS);
+
+    EXPECT_EQ(HcommCcuInsDestroy(insA), CcuResult::CCU_SUCCESS);
+    EXPECT_EQ(HcommCcuInsDestroy(insB), CcuResult::CCU_SUCCESS);
+    DestroyCcuResDescs(resDescsA);
+    DestroyCcuResDescs(resDescsB);
+}
+
+TEST_F(HcommCcuControlApiTest, Ut_CascCntCrossDie_Expect_Fail)
+{
+    HcommCcuResDescHandle resDescsA[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    HcommCcuResDescHandle resDescsB[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    CcuInsHandle insA{0};
+    CcuInsHandle insB{0};
+    HcommCcuCascCntHandle cntHandleB = 0;
+    // 句柄在 die1 上分配, kernel 却注册到 die0, 块内索引为 die 内索引, 必须拦截
+    SetupCrossInstanceCascCntTest(resDescsA, resDescsB, insA, insB, 1, cntHandleB);
+
+    EXPECT_EQ(HcommCcuKernelRegisterStart(insA), CcuResult::CCU_SUCCESS);
+
+    CcuCascCntDemoArg demoArg{};
+    demoArg.cntHandle = cntHandleB;
+    demoArg.tgtValue = 1024;
+    CcuKernelArg kernelArg = static_cast<CcuKernelArg>(&demoArg);
+    const void* kernelArgs[] = {kernelArg};
+    CcuKernelHandle kernelHandle{0};
+    constexpr uint32_t kernelDieId = 0;
+    constexpr uint32_t kernelArgNum = 1;
+    CcuResult ccuRet = HcommCcuKernelRegister(
+        insA, kernelDieId, const_cast<char*>("CcuCascCntWaitDemoKernel"),
+        reinterpret_cast<void*>(CcuCascCntWaitDemoKernel), kernelArgs, kernelArgNum, &kernelHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_E_PARA);
+
+    // 注册失败后实例与描述符应仍可正常销毁
+    EXPECT_EQ(HcommCcuInsDestroy(insA), CcuResult::CCU_SUCCESS);
+    EXPECT_EQ(HcommCcuInsDestroy(insB), CcuResult::CCU_SUCCESS);
+    DestroyCcuResDescs(resDescsA);
+    DestroyCcuResDescs(resDescsB);
+}
+
+TEST_F(HcommCcuControlApiTest, Ut_CascCntHandleNotExist_Expect_RegisterFailWithNotFound)
+{
+    HcommCcuResDescHandle resDescs[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    CcuInsHandle insHandle{0};
+    HcommCcuCascCntHandle cntHandle = 0;
+    SetupCascCntTest(resDescs, insHandle, cntHandle);
+
+    EXPECT_EQ(HcommCcuKernelRegisterStart(insHandle), CcuResult::CCU_SUCCESS);
+
+    // 引用一个未被任何实例登记的句柄: 注册期按句柄解析失败, 应回滚并返回 NOT_FOUND
+    CcuCascCntDemoArg demoArg{};
+    demoArg.cntHandle = 0xFFFFFFFFFFFFFFFFULL;
+    demoArg.tgtValue = 1024;
+    CcuKernelArg kernelArg = static_cast<CcuKernelArg>(&demoArg);
+    const void* kernelArgs[] = {kernelArg};
+    CcuKernelHandle kernelHandle{0};
+    constexpr uint32_t kernelDieId = 0;
+    constexpr uint32_t kernelArgNum = 1;
+    CcuResult ccuRet = HcommCcuKernelRegister(
+        insHandle, kernelDieId, const_cast<char*>("CcuCascCntWaitDemoKernel"),
+        reinterpret_cast<void*>(CcuCascCntWaitDemoKernel), kernelArgs, kernelArgNum, &kernelHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_E_NOT_FOUND);
+
+    // 回滚后实例与描述符仍可正常销毁, 说明 kernel 与已转移的资源记录未残留
+    EXPECT_EQ(HcommCcuInsDestroy(insHandle), CcuResult::CCU_SUCCESS);
+    DestroyCcuResDescs(resDescs);
+}
+
+TEST_F(HcommCcuControlApiTest, Ut_FuncCallByAddr_Expect_Success)
+{
+    CcuResult ccuRet = CcuResult::CCU_E_RESERVED;
+    constexpr uint32_t fakeDevId = MAX_MODULE_DEVICE_NUM - 2;
+    constexpr hcomm::CcuVersion fakeCcuVersion = hcomm::CcuVersion::CCU_V1;
+    (void)MockCcuDeviceEnv(fakeDevId, fakeCcuVersion);
+
+    HcommCcuResDescHandle resDescs[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    CreateCcuResDescsPair(resDescs, fakeCcuVersion);
+    constexpr uint32_t descNum = 2;
+    CcuInsHandle insHandle{0};
+    ccuRet = HcommCcuInsCreate(resDescs, descNum, &insHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+
+    ccuRet = HcommCcuKernelRegisterStart(insHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+
+    int32_t dummyArg = 0;
+    CcuKernelArg kernelArg = static_cast<CcuKernelArg>(&dummyArg);
+    const void* kernelArgs[] = {kernelArg};
+    auto kernelFunc = reinterpret_cast<void*>(CcuFuncCallByAddrDemoKernel);
+
+    char* kernelFuncName = "CcuFuncCallByAddrDemoKernel";
+    CcuKernelHandle kernelHandle{0};
+    constexpr uint32_t fakeDieId = 0;
+    constexpr uint32_t kernelArgNum = 1;
+    ccuRet = HcommCcuKernelRegister(
+        insHandle, fakeDieId, kernelFuncName, kernelFunc, kernelArgs, kernelArgNum, &kernelHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+
+    // 翻译前 func 入口 pc 尚未确定
+    uint64_t pc = 0;
+    ccuRet = HcommCcuFunctionGet(kernelHandle, CCU_FUNC_BY_ADDR_NAME, &pc);
+    EXPECT_NE(ccuRet, CcuResult::CCU_SUCCESS);
+
+    ccuRet = HcommCcuKernelRegisterEnd(insHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+
+    // 翻译完成后才能按名字查到 func 入口 pc
+    ccuRet = HcommCcuFunctionGet(kernelHandle, CCU_FUNC_BY_ADDR_NAME, &pc);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+
+    ccuRet = HcommCcuFunctionGet(kernelHandle, "CcuFuncNotExist", &pc);
+    EXPECT_NE(ccuRet, CcuResult::CCU_SUCCESS);
+
+    ccuRet = HcommCcuInsDestroy(insHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+    DestroyCcuResDescs(resDescs);
+}
+
+namespace {
+// 跨 kernel 调用命名 func 的公共骨架：kernel1 只声明命名 func(不写 LoadArg、不下发)，
+// kernel2 作为调用方；翻译完成后按名字查出 func 入口 pc，再把 pc 作为 0 号 taskArg 下发 kernel2。
+void RunXkAllGatherCase(void* callKernelFunc, char* callKernelName, uint32_t expectTaskArgsNum)
+{
+    constexpr uint32_t fakeDevId = MAX_MODULE_DEVICE_NUM - 2;
+    HcommCcuResDescHandle resDescs[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    CcuInsHandle insHandle{0};
+    SetupV1CcuInstance(resDescs, insHandle, fakeDevId);
+
+    constexpr auto commEngine = CommEngine::COMM_ENGINE_CCU;
+    const auto& handlePair = MockCcuChannelConnectDefault(fakeDevId, commEngine);
+
+    XkAllGatherKernelArg demoArg{};
+    demoArg.rankId = 0;
+    demoArg.rankSize = 2;
+    demoArg.channelCount = 1;
+    demoArg.channels[0] = handlePair.second;
+
+    EXPECT_EQ(HcommCcuKernelRegisterStart(insHandle), CcuResult::CCU_SUCCESS);
+
+    const void* defineArgs[] = {static_cast<CcuKernelArg>(&demoArg)};
+    CcuKernelHandle funcKernel{0};
+    EXPECT_EQ(
+        HcommCcuKernelRegister(
+            insHandle, 0, const_cast<char*>("CcuXkAllGatherDefineKernel"),
+            reinterpret_cast<void*>(CcuXkAllGatherDefineKernel), defineArgs, 1, &funcKernel),
+        CcuResult::CCU_SUCCESS);
+
+    // 翻译前 func 入口 pc 尚未确定
+    uint64_t pc = 0;
+    EXPECT_NE(HcommCcuFunctionGet(funcKernel, XK_AG_FUNC_NAME, &pc), CcuResult::CCU_SUCCESS);
+
+    int32_t dummyArg = 0;
+    const void* callArgs[] = {static_cast<CcuKernelArg>(&dummyArg)};
+    CcuKernelHandle callKernel{0};
+    EXPECT_EQ(
+        HcommCcuKernelRegister(insHandle, 0, callKernelName, callKernelFunc, callArgs, 1, &callKernel),
+        CcuResult::CCU_SUCCESS);
+
+    EXPECT_EQ(HcommCcuKernelRegisterEnd(insHandle), CcuResult::CCU_SUCCESS);
+
+    // 翻译完成后才能按名字查到 kernel1 内命名 func 的入口 pc
+    EXPECT_EQ(HcommCcuFunctionGet(funcKernel, XK_AG_FUNC_NAME, &pc), CcuResult::CCU_SUCCESS);
+    EXPECT_NE(pc, 0U);
+
+    // kernel1 自身没有 LoadArg，运行期参数全部由调用方 kernel2 的 taskArgs 转发
+    uint32_t taskArgsNum = 0xFFFFFFFF;
+    EXPECT_EQ(HcommCcuGetTaskArgsNum(funcKernel, &taskArgsNum), CcuResult::CCU_SUCCESS);
+    EXPECT_EQ(taskArgsNum, 0U);
+    EXPECT_EQ(HcommCcuGetTaskArgsNum(callKernel, &taskArgsNum), CcuResult::CCU_SUCCESS);
+    EXPECT_EQ(taskArgsNum, expectTaskArgsNum);
+
+    auto fakeThreadHandle = MockThreadAllocWithStream(commEngine);
+    std::vector<uint64_t> taskArgs(expectTaskArgsNum, 0);
+    taskArgs[XK_AG_TASK_ARG_PC] = pc;
+    EXPECT_EQ(
+        HcommCcuKernelLaunch(
+            fakeThreadHandle, callKernel, static_cast<void*>(taskArgs.data()), static_cast<uint32_t>(taskArgs.size())),
+        CcuResult::CCU_SUCCESS);
+
+    DestroyCcuChannelInsAndDescs(handlePair, insHandle, resDescs);
+}
+} // namespace
+
+// kernel1 把简化 AllGather 整体包进命名 func(lambda 捕获 kernelArgs)，kernel2 按 pc 跨 kernel 调用
+TEST_F(HcommCcuControlApiTest, Ut_XkernelAllGather_Expect_Success)
+{
+    RunXkAllGatherCase(
+        reinterpret_cast<void*>(CcuXkAllGatherCallKernel), const_cast<char*>("CcuXkAllGatherCallKernel"),
+        XK_AG_TASK_ARG_NUM);
+}
+
+// 调用方实参填满 32 个上限，被调 func 形参更少，多余实参被忽略
+TEST_F(HcommCcuControlApiTest, Ut_XkernelAllGatherMaxArg_Expect_Success)
+{
+    RunXkAllGatherCase(
+        reinterpret_cast<void*>(CcuXkAllGatherCallMaxArgKernel), const_cast<char*>("CcuXkAllGatherCallMaxArgKernel"),
+        XK_AG_TASK_ARG_NUM);
+}
+
+// 调用方实参超过 32 个上限，应被前端直接拒绝
+CCU_FUNC_KERNEL_TEST(Ut_XkernelCallOverMaxArg_Expect_Fail, CcuXkAllGatherCallOverMaxArgKernel, false)
 
 TEST_F(HcommCcuControlApiTest, Ut_LoopObjectApi_Expect_Success)
 {
@@ -775,7 +1039,7 @@ TEST_F(HcommCcuControlApiTest, Ut_CcuIfSharedTargetVar_When_V1_Expect_XnReduced)
     ccuRet = HcommCcuKernelRegisterEnd(insHandle);
     EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
 
-    auto* kernel = hcomm::CcuKernelMgr::GetInstance(fakeDeviceLogicId).GetKernel(kernelHandle);
+    auto* kernel = hcomm::GetCcuKernelMgr(fakeDeviceLogicId).GetKernel(kernelHandle);
     ASSERT_NE(kernel, nullptr);
 
     // sharedJumpTargetVar_ 应已初始化（A5 共用路径生效）
@@ -840,7 +1104,7 @@ TEST_F(HcommCcuControlApiTest, Ut_CcuIfSharedTargetVar_When_V2_Expect_NoSharing)
     ccuRet = HcommCcuKernelRegisterEnd(insHandle);
     EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
 
-    auto* kernel = hcomm::CcuKernelMgr::GetInstance(fakeDeviceLogicId).GetKernel(kernelHandle);
+    auto* kernel = hcomm::GetCcuKernelMgr(fakeDeviceLogicId).GetKernel(kernelHandle);
     ASSERT_NE(kernel, nullptr);
 
     // sharedJumpTargetVar_ 应未初始化（A6 不共用）
@@ -969,7 +1233,7 @@ static void VerifyIfSharedVarExecDiff(int32_t fakeDeviceLogicId, uint32_t value,
     ccuRet = HcommCcuKernelRegisterEnd(insHandle);
     ASSERT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
 
-    auto* kernel = hcomm::CcuKernelMgr::GetInstance(fakeDeviceLogicId).GetKernel(kernelHandle);
+    auto* kernel = hcomm::GetCcuKernelMgr(fakeDeviceLogicId).GetKernel(kernelHandle);
     ASSERT_NE(kernel, nullptr);
 
     // 确认当前走在 V1 跳转寄存器复用路径上(与结构测试 Ut_CcuIfSharedTargetVar_When_V1_Expect_XnReduced 呼应)。
@@ -1373,7 +1637,7 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuVariableAllocConsecutive_When_AllFine_
                   << startVa << std::dec << ", i=" << i << std::endl;
     }
 
-    auto& resMgr = hcomm::CcuVarEventResMgr::GetInstance(fakeDeviceLogicId);
+    auto& resMgr = hcomm::GetCcuVarEventResMgr(fakeDeviceLogicId);
     auto it = resMgr.resMap_.find(varHandle);
     ASSERT_NE(it, resMgr.resMap_.end());
     const auto& resInfos = it->second.resInfos;
@@ -1536,7 +1800,7 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuVariableAndEventAllocAddrGet_When_AllF
     EXPECT_NE(ccuRet, CcuResult::CCU_SUCCESS);
 
     // 校验资源管理器中记录了对应连续资源块
-    auto& resMgr = hcomm::CcuVarEventResMgr::GetInstance(fakeDeviceLogicId);
+    auto& resMgr = hcomm::GetCcuVarEventResMgr(fakeDeviceLogicId);
     auto varIt = resMgr.resMap_.find(varHandle);
     ASSERT_NE(varIt, resMgr.resMap_.end());
     uint32_t varTotal = 0;
@@ -1637,14 +1901,16 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuVariableAlloc_When_MapAddrFailed_Expec
     ccuRet = HcommCcuInsCreateLegacy(MS_INS_TPYE, &insHandle);
     EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
 
-    auto* ccuIns = hcomm::CcuInstanceMgr::GetInstance(fakeDeviceLogicId).Get(insHandle);
+    CcuInsHandle ccuInsKey = 0;
+    ASSERT_EQ(hcomm::GetCcuInstanceMgr(fakeDeviceLogicId).GetCcuInsKey(insHandle, ccuInsKey), CcuResult::CCU_SUCCESS);
+    auto* ccuIns = hcomm::GetCcuInstanceMgr(fakeDeviceLogicId).Get(ccuInsKey);
     ASSERT_NE(ccuIns, nullptr);
     auto* resPack = ccuIns->GetResPack();
     ASSERT_NE(resPack, nullptr);
 
     constexpr uint8_t fakeDieId = 0;
     const std::vector<hcomm::ResInfo> poolBefore = resPack->GetCcuResRepo().blockXn[fakeDieId];
-    auto& resMgr = hcomm::CcuVarEventResMgr::GetInstance(fakeDeviceLogicId);
+    auto& resMgr = hcomm::GetCcuVarEventResMgr(fakeDeviceLogicId);
     const size_t resMapSizeBefore = resMgr.resMap_.size();
 
     // 第 1 个资源映射成功、第 2 个起失败，触发已映射资源的逐个解映射 + 整笔归还
@@ -1712,7 +1978,7 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuVarEventAlloc_When_InsCreateByResDescs
     CcuEventHandle eventHandle{0};
     ASSERT_EQ(HcommCcuEventAlloc(insHandle, fakeDieId, eventNum, &eventHandle), CcuResult::CCU_SUCCESS);
 
-    auto& resMgr = hcomm::CcuVarEventResMgr::GetInstance(fakeDeviceLogicId);
+    auto& resMgr = hcomm::GetCcuVarEventResMgr(fakeDeviceLogicId);
     ASSERT_NE(resMgr.resMap_.find(varHandle), resMgr.resMap_.end());
     ASSERT_NE(resMgr.resMap_.find(eventHandle), resMgr.resMap_.end());
 
@@ -1936,6 +2202,40 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuInsCreate_When_AllFine_Expect_ReturnCc
     CreateCcuResDescsPair(resDescs, fakeCcuVersion);
 
     constexpr uint32_t descNum = 2;
+    CcuInsHandle insHandle{0};
+    ccuRet = HcommCcuInsCreate(resDescs, descNum, &insHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+    EXPECT_NE(insHandle, 0);
+
+    ccuRet = HcommCcuInsDestroy(insHandle);
+    EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+    DestroyCcuResDescs(resDescs);
+}
+
+// 链路用例：ResDescCreate 两 die（不预置默认资源）→ 每个 desc 仅 SetNum 2 个 casc cnt 并回读校验 →
+// InsCreate 资源请求仅含 cascCntReq（校验与分配链路对其生效），设备层分配器每个 die 申请
+// 2 个 CntXnBlock 成功创建实例
+TEST_F(HcommCcuControlApiTest, Ut_HcommCcuInsCreate_When_SetCascCntTwoPerDie_Expect_ReturnCcuSUCCESS)
+{
+    CcuResult ccuRet = CcuResult::CCU_E_RESERVED;
+    constexpr uint32_t fakeDevId = MAX_MODULE_DEVICE_NUM - 2;
+    constexpr hcomm::CcuVersion fakeCcuVersion = hcomm::CcuVersion::CCU_V1;
+    (void)MockCcuDeviceEnv(fakeDevId, fakeCcuVersion);
+
+    HcommCcuResDescHandle resDescs[hcomm::CCU_MAX_IODIE_NUM] = {0, 0};
+    CreateCcuResDescsPair(resDescs, fakeCcuVersion, false);
+
+    constexpr uint32_t descNum = 2;
+    constexpr uint32_t cascCntPerDie = 2;
+    for (uint32_t i = 0; i < descNum; i++) {
+        ccuRet = HcommCcuInsResDescSetNum(resDescs[i], HCOMM_CCU_RES_TYPE_CASC_CNT, cascCntPerDie);
+        EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+        uint32_t cascCntNum = 0;
+        ccuRet = HcommCcuInsResDescQueryNum(resDescs[i], HCOMM_CCU_RES_TYPE_CASC_CNT, &cascCntNum);
+        EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
+        EXPECT_EQ(cascCntNum, cascCntPerDie);
+    }
+
     CcuInsHandle insHandle{0};
     ccuRet = HcommCcuInsCreate(resDescs, descNum, &insHandle);
     EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
@@ -2226,23 +2526,40 @@ public:
             .stubs()
             .with(mockcpp::any(), mockcpp::any(), mockcpp::any())
             .will(invoke(MockHrtGetDevicePhyIdByUserDevId));
+        // 窄访问器的预期回落路径走 quiet 变体（hrtTryGetDevicePhyIdByIndex），与上方同行为打桩
+        MOCKER(hrtTryGetDevicePhyIdByIndex)
+            .stubs()
+            .with(mockcpp::any(), mockcpp::any())
+            .will(invoke(+[](uint32_t deviceLogicId, uint32_t& devicePhyId) -> HcclResult {
+                devicePhyId = deviceLogicId;
+                return HcclResult::HCCL_SUCCESS;
+            }));
         constexpr hcomm::CcuVersion fakeCcuVersion = hcomm::CcuVersion::CCU_V1;
         MockCcuNetworkDeviceDefault(TEST_DEVICE_LOGIC_ID);
         ASSERT_EQ(MockCcuResourcesDefault(TEST_DEVICE_LOGIC_ID, fakeCcuVersion), HcclResult::HCCL_SUCCESS);
         ASSERT_EQ(InitMockCcuResourcesForDevice(OTHER_TEST_DEVICE_LOGIC_ID, fakeCcuVersion), HcclResult::HCCL_SUCCESS);
         MockCcuChannelGetRes();
         MOCKER(hrtMemcpy).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-        // PR 新增 CcuAllocCntXnBlock / CcuReleaseCntXnBlock 在 InitByResDescs 路径中被调用
-        MOCKER(hcomm::CcuAllocCntXnBlock)
+        // PR 新增 CcuAllocCntXn / CcuConfirmCntXns / CcuReleaseCntXn / CcuResetTotalCntXn
+        // 在 InitByResDescs 路径中被调用
+        MOCKER(hcomm::CcuAllocCntXn)
+            .stubs()
+            .with(mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any())
+            .will(invoke(MockControlAllocCntXn));
+        MOCKER(hcomm::CcuConfirmCntXns)
+            .stubs()
+            .with(mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any())
+            .will(invoke(MockControlConfirmCntXns));
+        MOCKER(hcomm::CcuReleaseCntXn)
             .stubs()
             .with(mockcpp::any(), mockcpp::any(), mockcpp::any())
             .will(returnValue(CcuResult::CCU_SUCCESS));
-        MOCKER(hcomm::CcuReleaseCntXnBlock)
+        MOCKER(hcomm::CcuResetTotalCntXn)
             .stubs()
             .with(mockcpp::any(), mockcpp::any(), mockcpp::any())
             .will(returnValue(CcuResult::CCU_SUCCESS));
-        ASSERT_EQ(hcomm::CcuInstanceMgr::GetInstance(TEST_DEVICE_LOGIC_ID).Init(), CcuResult::CCU_SUCCESS);
-        ASSERT_EQ(hcomm::CcuInstanceMgr::GetInstance(OTHER_TEST_DEVICE_LOGIC_ID).Init(), CcuResult::CCU_SUCCESS);
+        ASSERT_EQ(hcomm::GetCcuInstanceMgr(TEST_DEVICE_LOGIC_ID).Init(), CcuResult::CCU_SUCCESS);
+        ASSERT_EQ(hcomm::GetCcuInstanceMgr(OTHER_TEST_DEVICE_LOGIC_ID).Init(), CcuResult::CCU_SUCCESS);
     }
 
     void TearDown() override
@@ -2262,18 +2579,15 @@ public:
 protected:
     static void ResetDeviceState(int32_t deviceLogicId)
     {
-        (void)hcomm::CcuInstanceMgr::GetInstance(deviceLogicId).Deinit();
-        (void)hcomm::CcuKernelMgr::GetInstance(deviceLogicId).Deinit();
+        (void)hcomm::GetCcuInstanceMgr(deviceLogicId).Deinit();
+        (void)hcomm::GetCcuKernelMgr(deviceLogicId).Deinit();
         (void)hcomm::CcuResBatchAllocator::GetInstance(deviceLogicId).Deinit();
         (void)hcomm::CcuComponent::GetInstance(deviceLogicId).Deinit();
         (void)hcomm::CcuPfeCfgMgr::GetInstance(deviceLogicId).Deinit();
         (void)hcomm::CcuResSpecifications::GetInstance(deviceLogicId).Deinit();
     }
 
-    static hcomm::CcuInstanceMgr& InsMgr(int32_t deviceLogicId)
-    {
-        return hcomm::CcuInstanceMgr::GetInstance(deviceLogicId);
-    }
+    static hcomm::CcuInstanceMgr& InsMgr(int32_t deviceLogicId) { return hcomm::GetCcuInstanceMgr(deviceLogicId); }
 
     static void CreateResDescsDirect(int32_t deviceLogicId, HcommCcuResDescHandle resDescs[hcomm::CCU_MAX_IODIE_NUM])
     {
@@ -2304,11 +2618,15 @@ TEST_F(
     CcuInsHandle insHandle = 0;
     EXPECT_EQ(HcommCcuInsCreate(resDescs, hcomm::CCU_MAX_IODIE_NUM, &insHandle), CcuResult::CCU_SUCCESS);
     ASSERT_NE(insHandle, 0U);
-    EXPECT_EQ(InsMgr(TEST_DEVICE_LOGIC_ID).Get(insHandle), nullptr);
-    EXPECT_NE(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).Get(insHandle), nullptr);
+    CcuInsHandle ccuInsKey = 0;
+    ASSERT_EQ(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).GetCcuInsKey(insHandle, ccuInsKey), CcuResult::CCU_SUCCESS);
+    CcuInsHandle wrongDeviceInsKey = 0;
+    EXPECT_EQ(InsMgr(TEST_DEVICE_LOGIC_ID).GetCcuInsKey(insHandle, wrongDeviceInsKey), CcuResult::CCU_E_NOT_FOUND);
+    EXPECT_NE(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).Get(ccuInsKey), nullptr);
     EXPECT_EQ(HcommCcuInsQueryResDesc(insHandle, resDescs[0]), CcuResult::CCU_SUCCESS);
     EXPECT_EQ(HcommCcuInsDestroy(insHandle), CcuResult::CCU_SUCCESS);
-    EXPECT_EQ(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).Get(insHandle), nullptr);
+    CcuInsHandle destroyedInsKey = 0;
+    EXPECT_EQ(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).GetCcuInsKey(insHandle, destroyedInsKey), CcuResult::CCU_E_NOT_FOUND);
     EXPECT_EQ(g_deviceRefreshCalls, 3U);
 }
 
@@ -2322,8 +2640,12 @@ TEST_F(
     CcuInsHandle legacyHandle = 0;
     EXPECT_EQ(HcommCcuInsCreateLegacy(CcuInstanceType::CCU_SCHED, &legacyHandle), CcuResult::CCU_SUCCESS);
     ASSERT_NE(legacyHandle, 0U);
-    EXPECT_EQ(InsMgr(TEST_DEVICE_LOGIC_ID).Get(legacyHandle), nullptr);
-    EXPECT_NE(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).Get(legacyHandle), nullptr);
+    CcuInsHandle legacyInsKey = 0;
+    ASSERT_EQ(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).GetCcuInsKey(legacyHandle, legacyInsKey), CcuResult::CCU_SUCCESS);
+    CcuInsHandle wrongDeviceLegacyInsKey = 0;
+    EXPECT_EQ(
+        InsMgr(TEST_DEVICE_LOGIC_ID).GetCcuInsKey(legacyHandle, wrongDeviceLegacyInsKey), CcuResult::CCU_E_NOT_FOUND);
+    EXPECT_NE(InsMgr(OTHER_TEST_DEVICE_LOGIC_ID).Get(legacyInsKey), nullptr);
     EXPECT_EQ(g_deviceRefreshCalls, 1U);
     EXPECT_EQ(HcommCcuInsDestroy(legacyHandle), CcuResult::CCU_SUCCESS);
     EXPECT_EQ(g_deviceRefreshCalls, 2U);
@@ -2347,7 +2669,9 @@ TEST_F(
     CcuInsHandle existingHandle = 0;
     ASSERT_EQ(HcommCcuInsCreateLegacy(CcuInstanceType::CCU_SCHED, &existingHandle), CcuResult::CCU_SUCCESS);
     ASSERT_NE(existingHandle, 0U);
-    ASSERT_NE(InsMgr(TEST_DEVICE_LOGIC_ID).Get(existingHandle), nullptr);
+    CcuInsHandle existingInsKey = 0;
+    ASSERT_EQ(InsMgr(TEST_DEVICE_LOGIC_ID).GetCcuInsKey(existingHandle, existingInsKey), CcuResult::CCU_SUCCESS);
+    ASSERT_NE(InsMgr(TEST_DEVICE_LOGIC_ID).Get(existingInsKey), nullptr);
 
     uint32_t originalLoopNum = 0;
     ASSERT_EQ(
@@ -2373,7 +2697,7 @@ TEST_F(
         InsMgr(TEST_DEVICE_LOGIC_ID).GetResDescMgr().QueryResNum(resDescs[0], hcomm::ResType::LOOP, loopNum),
         CcuResult::CCU_SUCCESS);
     EXPECT_EQ(loopNum, originalLoopNum);
-    EXPECT_NE(InsMgr(TEST_DEVICE_LOGIC_ID).Get(existingHandle), nullptr);
+    EXPECT_NE(InsMgr(TEST_DEVICE_LOGIC_ID).Get(existingInsKey), nullptr);
     EXPECT_EQ(g_deviceRefreshCalls, 5U);
 }
 
@@ -2383,7 +2707,7 @@ CCU_FUNC_KERNEL_TEST(Ut_HcommCcuKernelLocalCopy_When_AllFine_Expect_ReturnCcuSUC
 // HcommCcuGetTaskArgsNum 单元测试
 // 对应业务代码：src/base_comm/primitives/api_c_adpt/ccu/ccu_launch.cc
 // 该接口取已注册 kernel 注册期间所有 LoadArg 中 argId 的最大值加1，写入 *taskArgsNum。
-// 调用链：HcommCcuGetTaskArgsNum -> CcuKernelMgr::GetInstance -> GetCcuKernelInfo -> CcuKernel::GetCcuKernelInfo
+// 调用链：HcommCcuGetTaskArgsNum -> GetCcuKernelMgr -> GetCcuKernelInfo -> CcuKernel::GetCcuKernelInfo
 // 由于 #define private public 已启用，可直接操作单例 kernelMap_ 注入 fake kernel 精确测试
 // ============================================================================================
 
@@ -2391,11 +2715,11 @@ CCU_FUNC_KERNEL_TEST(Ut_HcommCcuKernelLocalCopy_When_AllFine_Expect_ReturnCcuSUC
 TEST_F(HcommCcuControlApiTest, Ut_HcommCcuGetTaskArgsNum_When_MultiArgIds_Expect_MaxArgId)
 {
     constexpr uint32_t fakeDevId = MAX_MODULE_DEVICE_NUM - 10;
-    MOCKER(HcclGetThreadDeviceId).stubs().will(returnValue(fakeDevId));
+    MOCKER(HcclGetThreadDeviceId).stubs().will(returnValue(static_cast<int32_t>(fakeDevId)));
 
     // 通过单例注入 fake kernel，设置 loadArgUsedSet_ = {0, 3, 1}，max=3，+1=4
     constexpr CcuKernelHandle fakeHandle = 0xBEEF;
-    auto& kernelMgr = hcomm::CcuKernelMgr::GetInstance(static_cast<int32_t>(fakeDevId));
+    auto& kernelMgr = hcomm::GetCcuKernelMgr(static_cast<int32_t>(fakeDevId));
     auto fakeKernel = std::make_unique<hcomm::CcuKernel>();
     fakeKernel->loadArgUsedSet_ = {0, 3, 1};
     kernelMgr.kernelMap_[fakeHandle] = std::move(fakeKernel);
@@ -2421,7 +2745,7 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuGetTaskArgsNum_When_NullPtr_Expect_Ccu
 TEST_F(HcommCcuControlApiTest, Ut_HcommCcuGetTaskArgsNum_When_InvalidHandle_Expect_CcuENotFound)
 {
     constexpr uint32_t fakeDevId = MAX_MODULE_DEVICE_NUM - 10;
-    MOCKER(HcclGetThreadDeviceId).stubs().will(returnValue(fakeDevId));
+    MOCKER(HcclGetThreadDeviceId).stubs().will(returnValue(static_cast<int32_t>(fakeDevId)));
 
     // 不注册任何 kernel，使用不存在的 handle
     constexpr CcuKernelHandle invalidHandle = 0xDEAD;
@@ -2436,11 +2760,11 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuGetTaskArgsNum_When_InvalidHandle_Expe
 TEST_F(HcommCcuControlApiTest, Ut_HcommCcuGetTaskArgsNum_When_NoLoadArg_Expect_Zero)
 {
     constexpr uint32_t fakeDevId = MAX_MODULE_DEVICE_NUM - 10;
-    MOCKER(HcclGetThreadDeviceId).stubs().will(returnValue(fakeDevId));
+    MOCKER(HcclGetThreadDeviceId).stubs().will(returnValue(static_cast<int32_t>(fakeDevId)));
 
     // 注入 fake kernel，loadArgUsedSet_ 保持默认空集，GetCcuKernelInfo 填充 maxTaskArgsNum=0
     constexpr CcuKernelHandle fakeHandle = 0xBEEF;
-    auto& kernelMgr = hcomm::CcuKernelMgr::GetInstance(static_cast<int32_t>(fakeDevId));
+    auto& kernelMgr = hcomm::GetCcuKernelMgr(static_cast<int32_t>(fakeDevId));
     auto fakeKernel = std::make_unique<hcomm::CcuKernel>();
     // loadArgUsedSet_ 默认为空，不 insert 任何 argId
     kernelMgr.kernelMap_[fakeHandle] = std::move(fakeKernel);
@@ -2458,7 +2782,7 @@ TEST_F(HcommCcuControlApiTest, Ut_HcommCcuGetTaskArgsNum_When_NoLoadArg_Expect_Z
 TEST_F(HcommCcuControlApiTest, Ut_CcuChannelIdGet_When_Normal_Expect_Success)
 {
     HcommChannelDesc desc{};
-    hcomm::CcuUrmaChannel channel(nullptr, desc);
+    hcomm::CcuUrmaChannel channel(nullptr, desc, COMM_ENGINE_RESERVED);
     void* channelPtr = static_cast<hcomm::Channel*>(&channel);
     ChannelHandle handle = 0xAAAA;
 
@@ -2513,7 +2837,7 @@ TEST_F(HcommCcuControlApiTest, Ut_CcuChannelIdGet_When_ChannelPtrNull_Expect_Ptr
 TEST_F(HcommCcuControlApiTest, Ut_CcuChannelIdGet_When_ChannelIdInvalid_Expect_Unavail)
 {
     HcommChannelDesc desc{};
-    hcomm::CcuUrmaChannel channel(nullptr, desc);
+    hcomm::CcuUrmaChannel channel(nullptr, desc, COMM_ENGINE_RESERVED);
     void* channelPtr = static_cast<hcomm::Channel*>(&channel);
     ChannelHandle handle = 0xEEEE;
 

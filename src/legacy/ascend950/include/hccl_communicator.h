@@ -145,7 +145,6 @@ public:
     u32 GetRankInParentComm();
     u8 GetCommDepth() const;
     HcclResult Mc2AiCpuStreamAllocAndGetV2(rtStream_t* aiCpuStream);
-    HcclResult GetStreamId(u32& streamId);
     HcclResult GetRankIpPortMap(RankIpPortMapPtr& rankIpPortMap);
 
 private:

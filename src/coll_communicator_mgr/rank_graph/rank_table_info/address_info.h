@@ -24,7 +24,8 @@ namespace Hccl {
 constexpr unsigned int MIN_VALUE_PLANEID = 0;
 constexpr unsigned int MAX_VALUE_PLANEID = 1024;
 constexpr unsigned int MIN_VALUE_PORT = 1;
-constexpr unsigned int MAX_VALUE_PORT = 16;
+constexpr unsigned int MAX_VALUE_PORT
+    = 20; // A6场景单device最大端口数；A2/A3/A5实际配置不超16，此处统一放宽不做devType分档
 constexpr unsigned int MIN_VALUE_PORT_LENGTH = 1;
 constexpr unsigned int MAX_VALUE_PORT_LENGTH = 32;
 constexpr unsigned int MIN_VALUE_ADDR_LENGRH = 1;
@@ -42,23 +43,25 @@ public:
     AddrType addrType;
     std::set<std::string> ports; // 网口标记
     std::string planeId{"0"};
-    void Deserialize(const nlohmann::json& addressInfoJson, RankTableSource source = RankTableSource::RANKTABLE);
+    HcclResult Deserialize(const nlohmann::json& addressInfoJson, RankTableSource source = RankTableSource::RANKTABLE);
     explicit AddressInfo(BinaryStream& binStream);
-    void GetBinStream(BinaryStream& binStream) const;
+    HcclResult GetBinStream(BinaryStream& binStream) const;
     std::string Describe() const;
-    static void ParseAddrByType(const std::string& addrType, const std::string& address, IpAddress& ipAddress);
-    static void ParseBackupAddrs(
+    static HcclResult ParseAddrByType(
+        const std::string& addrType, const std::string& address, IpAddress& ipAddress,
+        const std::string& addrField = "backup_addr");
+    static HcclResult ParseBackupAddrs(
         const nlohmann::json& backupAddrJson, const std::string& addrType, std::vector<IpAddress>& backupAddrs);
 
 private:
     static constexpr int MAX_DISPLAY_LEN = 128;
     static const std::unordered_map<std::string, AddrType> strToAddrType;
-    void EidToAddr(std::string str);
-    void IPV4ToAddr(std::string str);
-    void IPV6ToAddr(std::string str);
-    void DeserializeBackupAddrs(const nlohmann::json& addressInfoJson, const std::string& addrTypeStr);
-    void DeserializeAddrTypeAndAddr(const nlohmann::json& addressInfoJson, RankTableSource source);
-    void DeserializePorts(const nlohmann::json& addressInfoJson, RankTableSource source);
+    HcclResult EidToAddr(std::string address);
+    HcclResult IPV4ToAddr(std::string address);
+    HcclResult IPV6ToAddr(std::string address);
+    HcclResult DeserializeBackupAddrs(const nlohmann::json& addressInfoJson, const std::string& addrTypeStr);
+    HcclResult DeserializeAddrTypeAndAddr(const nlohmann::json& addressInfoJson, RankTableSource source);
+    HcclResult DeserializePorts(const nlohmann::json& addressInfoJson, RankTableSource source);
     static bool IsStringInAddrType(std::string str) { return strToAddrType.count(str) > 0; }
 };
 

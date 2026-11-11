@@ -18,9 +18,15 @@ extern "C" {
 #endif
 void TcRsUbGetRdevCb();
 void TcRsUrmaApiInitAbnormal();
+void TcRsInitDevEidInfoCbDevListNull();
+void TcRsInitDevEidInfoCbAlreadyInit();
+void TcRsInitDevEidInfoCbSuccess();
+void TcRsInitDevEidInfoCbSuccessNonOffline();
+void TcRsUbGetDevEidInfoTotalSuccess();
+void TcRsUbGetDevEidInfoTotalMultiDev();
+void TcRsUbGetDevEidInfoTotalEidListNull();
+void TcRsDeinitDevEidInfoCb();
 void TcRsUbV2();
-void TcRsUbGetDevEidInfoNum();
-void TcRsUbGetDevEidInfoList();
 struct rs_cb* TcRsUbV2Init(int mode, unsigned int* devIndex);
 void TcRsUbV2Deinit(struct rs_cb* rsCb, int mode, unsigned int devIndex);
 void TcRsUbCtxTokenIdAlloc();
@@ -64,6 +70,31 @@ void TcRsUbSetTpAttr();
 void TcRsEpollEventJfcInHandle();
 void TcRsHandleEpollPollJfc();
 void TcRsJfcCallbackProcess();
+void TcRsUbCtxInitDeviceByEidFail();
+void TcRsUbCreateCtxFail();
+void TcRsUbGetDevAttrQueryFail();
+void TcRsUbGetIpByEidUrmaFail();
+void TcRsUbCtxDeinitDeleteFail();
+void TcRsUbSetTpAttrSmacFail();
+void TcRsUbSetTpAttrDmacFail();
+void TcRsUbDevShareJfrInitFail();
+void TcRsUbFreeRemJettyCbFail();
+void TcRsUbCtxDrvJettyImportNormalFail();
+void TcRsUbAsyncEventGetJettyContextFail();
+void TcRsUbGetJettyContextFail();
+void TcRsUrmaErrnoMacro();
+void TcRsUbFreeSegCbFail();
+void TcRsUbGetTpInfoListFail();
+void TcRsHandleEpollPollJfcFail();
+void TcRsUbGetUeInfoFail();
+void TcRsUbDevShareJfrInitCreateJfcFail();
+void TcRsUbCtxChanDestroyJfceFail();
+void TcRsUbFreeJfceCbDeleteJfceFail();
+void TcRsUbCtxJfcCreateExtFail();
+void TcRsUbDeleteJfcExtFail();
+void TcRsJfcOptFail();
+void TcRsUbAsyncEventGetJfcContextFail();
+void TcRsUbGetSaveAsyncEventFail();
 #ifdef __cplusplus
 }
 #endif

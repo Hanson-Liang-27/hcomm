@@ -8,12 +8,22 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
 #include "aicpu_ts_thread.h"
+#include "dfx/res_pub.h"
+#include "common/dev_type_utils_pub.h"
 #include "hccl_common.h"
 #include "aicpu/aicpu_hccl_sqcq.h"
 #include "device_capacity.h"
+#include "dtype_common.h"
 #include "unified_platform/pub_inc/config_plf_log_v2.h"
+#include "ub_transport_lite_impl.h"
+#include "aicpu_ts_channel_entity.h"
+#include "launch_context.h"
+#include <atomic>
+#include <string>
+
+using hcomm::UnwrapChannelHandle;
 
 namespace hccl {
 AicpuTsThread::AicpuTsThread(StreamType streamType, uint32_t notifyNum, const NotifyLoadType notifyLoadType)
@@ -26,24 +36,80 @@ AicpuTsThread::AicpuTsThread(const std::string& uniqueIdStr) : uniqueIdStr_(uniq
 
 AicpuTsThread::~AicpuTsThread() { DeInitImpl(); }
 
+#ifndef CCL_KERNEL_AICPU
+HcclResult AicpuTsThread::PreAllocThreadEntity(ThreadHandle& handle, CommEngine targetEngine)
+{
+    return PreAllocThreadEntityCommon(*this, threadHandleMap_, handle, targetEngine);
+}
+
+ThreadEntityResources* AicpuTsThread::GetThreadEntityResources(CommEngine targetEngine) const
+{
+    return GetThreadEntityResourcesCommon(threadHandleMap_, targetEngine);
+}
+#endif
+
+HcclResult AicpuTsThread::FillThreadEntityRtsq(HcommThreadEntity& entity)
+{
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
+    if (!*isGe950) {
+        return HCCL_SUCCESS;
+    }
+    // Notify-only 线程没有 Device 流，Entity 不含 RTSQ 上下文（sqContextAddr 为空），Device 端无需刷新。
+    if (IsFakeDeviceRes()) {
+        return HCCL_SUCCESS;
+    }
+    CHK_PTR_NULL(entity.sqContextAddr);
+    auto* streamLite = static_cast<Hccl::StreamLite*>(GetStreamLitePtr());
+    CHK_PTR_NULL(streamLite);
+    auto* rtsq = streamLite->GetRtsq();
+    CHK_PTR_NULL(rtsq);
+
+    const uint64_t sqBaseAddr = rtsq->GetSqBaseAddr();
+    const uint32_t sqDepth = rtsq->GetSqDepth();
+    const uint32_t sqHead = rtsq->GetHead();
+    const uint32_t sqTail = rtsq->GetTail();
+    CHK_PRT_RET(
+        sqBaseAddr == 0 || sqDepth == 0,
+        HCCL_ERROR("[%s] invalid RTSQ resource, base[%llu], depth[%u]", __func__, sqBaseAddr, sqDepth), HCCL_E_PARA);
+
+    // asc-comm 消费前需要控制面完成 RTSQ 初始值发布；Device 只刷新硬件字段，
+    // taskId/taskIdEnd/pendingSqeCnt 仍由 asc-comm 运行时维护。
+    HcommThreadSqContext& sq = *entity.sqContextAddr;
+    sq.contextInfo.rtsqContext.sqBaseAddr = sqBaseAddr;
+    sq.contextInfo.rtsqContext.sqDepth = sqDepth;
+    sq.contextInfo.rtsqContext.sqHead = sqHead;
+    sq.contextInfo.rtsqContext.sqTail = sqTail;
+    return HCCL_SUCCESS;
+}
+
+HcclResult AicpuTsThread::GetExportRtsqInfo(int32_t& streamId, uint32_t& sqId)
+{
+    CHK_PTR_NULL(stream_);
+    streamId = stream_->id();
+    sqId = stream_->sqId();
+    return HCCL_SUCCESS;
+}
+
 HcclResult AicpuTsThread::Init()
 {
     CHK_RET(GetRunSideIsDevice(isDeviceSide_));
     if (!isDeviceSide_) {
         // host侧申请资源
-        HCCL_INFO("HcclThread::%s, is hostside", __func__);
-        return HostInit();
+        CHK_RET(HostInit());
     } else {
         // device侧反序列化，恢复资源
-        HCCL_INFO("HcclThread::%s, is DeviceSide", __func__);
-        return DeviceInit();
+        CHK_RET(DeviceInit());
     }
+    HCCL_INFO("[AicpuTsThread::%s] %s, isDeviceSide[%d].", __func__, FormatThreadInfo().c_str(), isDeviceSide_);
+    return HCCL_SUCCESS;
 }
 
 HcclResult AicpuTsThread::DeInit() { return DeInitImpl(); }
 
 HcclResult AicpuTsThread::DeInitImpl()
 {
+    HCCL_INFO("[AicpuTsThread::%s] %s.", __func__, FormatThreadInfo().c_str());
     streamType_ = StreamType::STREAM_TYPE_RESERVED;
     notifyNum_ = 0;
     if (stream_) {
@@ -51,6 +117,11 @@ HcclResult AicpuTsThread::DeInitImpl()
     }
     stream_ = nullptr;
     notifys_.clear();
+    if (threadDispatcherCtx_ != nullptr) {
+        (void)DestroyDispatcherCtx(threadDispatcherCtx_, threadDispatcherCommId_.c_str());
+        threadDispatcherCtx_ = nullptr;
+        threadDispatcherCommId_ = std::string();
+    }
     uniqueIdStr_ = std::string();
     devType_ = DevType::DEV_TYPE_COUNT;
     return HCCL_SUCCESS;
@@ -74,9 +145,16 @@ std::string& AicpuTsThread::UpdateUniqueId()
     oss.write(ReinterpretAs<const char_t*>(&devId_), sizeof(devId_));
     oss.write(ReinterpretAs<const char_t*>(&notifyNum_), sizeof(notifyNum_));
 
+    int32_t streamId = 0;
+    uint32_t sqId = 0;
+    if (GetExportRtsqInfo(streamId, sqId) != HCCL_SUCCESS) {
+        HCCL_ERROR("[AicpuTsThread][UpdateUniqueId]GetExportRtsqInfo failed");
+        uniqueIdStr_ = std::string();
+        return uniqueIdStr_;
+    }
     HcclStreamParam streamParam;
-    streamParam.streamInfo.streamIds = stream_->id();
-    streamParam.streamInfo.sqIds = stream_->sqId();
+    streamParam.streamInfo.streamIds = streamId;
+    streamParam.streamInfo.sqIds = sqId;
     streamParam.streamInfo.cqIds = stream_->cqId();
     streamParam.streamInfo.logicCqids = stream_->logicCqId();
     streamParam.sqCqContextAddr = ReinterpretAs<uint64_t>(sqCqeContext_.ptr());
@@ -198,6 +276,8 @@ HcclResult AicpuTsThread::InitStreamLite(HcclStreamInfo& streamParam, uint32_t h
 
 uint32_t AicpuTsThread::GetNotifyNum() const { return notifyNum_; }
 
+size_t AicpuTsThread::GetNotifySize() const { return notifys_.size(); }
+
 LocalNotify* AicpuTsThread::GetNotify(uint32_t index) const
 {
     if (UNLIKELY(index >= notifyNum_ || index >= notifys_.size() || notifys_[index] == nullptr)) {
@@ -211,7 +291,25 @@ LocalNotify* AicpuTsThread::GetNotify(uint32_t index) const
 }
 
 // A3 Stream
-Stream* AicpuTsThread::GetStream() const { return stream_.get(); }
+Stream* AicpuTsThread::GetStream() const
+{
+    // 幂等绑定Thread私有dispatcher：本thread上的所有dispatcher操作统一使用私有dispatcher，
+    // 保证(dispatcher, stream)配对唯一；绑定变化时才调用Set，避免热路径日志刷屏
+    if (threadDispatcherCtx_ != nullptr && GetDispatcherCtx() != threadDispatcherCtx_) {
+        (void)SetDispatcherCtx(threadDispatcherCtx_);
+    }
+    return stream_.get();
+}
+
+s32 AicpuTsThread::GetStreamId() const
+{
+    // device侧 && 950：streamId 来自 StreamLite，避免走带副作用的 GetStream()
+    if (isDeviceSide_ && hcomm::EqualToOrGreaterThan950().value_or(false)) {
+        Hccl::StreamLite* streamLite = static_cast<Hccl::StreamLite*>(GetStreamLitePtr());
+        return streamLite != nullptr ? static_cast<s32>(streamLite->GetId()) : -1;
+    }
+    return stream_ ? stream_->id() : -1;
+}
 
 void AicpuTsThread::LaunchTask() const
 {
@@ -262,17 +360,100 @@ HcclResult AicpuTsThread::LocalNotifyRecord(uint32_t notifyId) const
 HcclResult
 AicpuTsThread::LocalNotifyRecord([[maybe_unused]] ThreadHandle dstThread, [[maybe_unused]] uint32_t dstNotifyIdx) const
 {
+#ifdef CCL_KERNEL_AICPU
+    if (fakeDeviceRes_) {
+        HCCL_ERROR("[%s] fakeDeviceRes thread, not support.", __func__);
+        return HCCL_E_NOT_SUPPORT;
+    }
+    Thread* dst = ReinterpretAs<Thread*>(dstThread);
+    CHK_PTR_NULL(dst);
+    uint64_t devShmAddr = 0;
+    HcclResult ret = dst->GetNotifyDevShmAddr(dstNotifyIdx, devShmAddr);
+    if (ret == HCCL_SUCCESS) {
+        CHK_RET(pImpl_->P2PWriteValue(devShmAddr, 1));
+        return HCCL_SUCCESS;
+    }
+    if (ret != HCCL_E_NOT_SUPPORT) {
+        return ret;
+    }
+    uint32_t notifyId = 0;
+    CHK_RET(dst->GetNotifyId(dstNotifyIdx, notifyId));
+    return LocalNotifyRecord(notifyId);
+#else
     HCCL_ERROR("[AicpuTsThread][%s]not support", __func__);
     return HCCL_E_NOT_SUPPORT;
+#endif
 }
 
-HcclResult AicpuTsThread::LocalNotifyWait(uint32_t notifyId, uint32_t timeout) const
+HcclResult AicpuTsThread::LocalNotifyWait(uint32_t notifyIdx, uint32_t timeout) const
 {
-    if (fakeDeviceRes_) { // host侧流导出线程无流，无法作为wait src提交SQE
+    LocalNotify* const notifyPtr = GetNotify(notifyIdx);
+    CHK_PTR_NULL(notifyPtr);
+    return LocalNotifyWaitById(notifyPtr->notifyId_, timeout);
+}
+
+HcclResult AicpuTsThread::LocalChannelNotifyWait(ChannelHandle channel, uint32_t notifyIdx, uint32_t timeout) const
+{
+    CHK_RET(hcomm::UnwrapChannelHandle(channel));
+    g_threadLaunchCtx.AddThread(ReinterpretAs<ThreadHandle>(this));
+    HCCL_DEBUG("[%s] Running on A5.", __func__);
+    auto* const transportLitePtr = ReinterpretAs<Hccl::BaseTransportLiteImpl*>(channel);
+    CHK_PTR_NULL(transportLitePtr);
+    auto* const streamLitePtr = static_cast<Hccl::StreamLite*>(GetStreamLitePtr());
+    CHK_PTR_NULL(streamLitePtr);
+
+    HcclResult ret = HCCL_SUCCESS;
+    EXCEPTION_CATCH(transportLitePtr->WaitWithTimeout(notifyIdx, *streamLitePtr, timeout), ret = HCCL_E_INTERNAL);
+    return ret;
+}
+
+HcclResult AicpuTsThread::LocalChannelNotifyRecord(ChannelHandle channel, uint32_t notifyIdx) const
+{
+    CHK_RET(hcomm::UnwrapChannelHandle(channel));
+    g_threadLaunchCtx.AddThread(ReinterpretAs<ThreadHandle>(this));
+    HCCL_DEBUG("[%s] Running on A5.", __func__);
+    auto* const transportLitePtr = ReinterpretAs<Hccl::BaseTransportLiteImpl*>(channel);
+    CHK_PTR_NULL(transportLitePtr);
+    auto* const streamLitePtr = static_cast<Hccl::StreamLite*>(GetStreamLitePtr());
+    CHK_PTR_NULL(streamLitePtr);
+    HCCL_INFO("channel streamlite ptr %p.", streamLitePtr);
+
+    HcclResult ret = HCCL_SUCCESS;
+    EXCEPTION_CATCH(transportLitePtr->Post(notifyIdx, *streamLitePtr), ret = HCCL_E_INTERNAL);
+    return ret;
+}
+
+HcclResult AicpuTsThread::LocalChannelDrain(ChannelHandle channel) const
+{
+    CHK_RET(hcomm::UnwrapChannelHandle(channel));
+    g_threadLaunchCtx.AddThread(ReinterpretAs<ThreadHandle>(this));
+    HCCL_DEBUG("[%s] Running on A5.", __func__);
+    auto* const transportLitePtr = ReinterpretAs<Hccl::BaseTransportLiteImpl*>(channel);
+    CHK_PTR_NULL(transportLitePtr);
+    auto* const streamLitePtr = static_cast<Hccl::StreamLite*>(GetStreamLitePtr());
+    CHK_PTR_NULL(streamLitePtr);
+
+    HcclResult ret = HCCL_SUCCESS;
+    EXCEPTION_CATCH(transportLitePtr->Drain(*streamLitePtr), ret = HCCL_E_INTERNAL);
+    return ret;
+}
+
+HcclResult AicpuTsThread::LocalChannelFence(ChannelHandle channel) const
+{
+    CHK_RET(hcomm::UnwrapChannelHandle(channel));
+    auto* const transportLitePtr = ReinterpretAs<Hccl::BaseTransportLiteImpl*>(channel);
+    CHK_PTR_NULL(transportLitePtr);
+    return transportLitePtr->Fence();
+}
+
+HcclResult AicpuTsThread::LocalNotifyWaitById(uint32_t notifyId, uint32_t timeout) const
+{
+    if (fakeDeviceRes_) {
         HCCL_ERROR("[%s] fakeDeviceRes thread, not support.", __func__);
         return HCCL_E_NOT_SUPPORT;
     }
     Hccl::StreamLite* streamLite = static_cast<Hccl::StreamLite*>(GetStreamLitePtr());
+    CHK_PTR_NULL(streamLite);
     Hccl::RtsqBase* rtsq = streamLite->GetRtsq();
     u32 taskId = rtsq->GetTaskId();
 
@@ -290,6 +471,14 @@ HcclResult AicpuTsThread::LocalNotifyWait(uint32_t notifyId, uint32_t timeout) c
     slot->taskPara.Notify.notifyId = notifyId;
     PLF_CONFIG_INFO(Hccl::PLF_TASK, "[%s] %s", __func__, slot->Describe().c_str());
 
+    return HCCL_SUCCESS;
+}
+
+HcclResult AicpuTsThread::GetNotifyId(uint32_t notifyIdx, uint32_t& notifyId) const
+{
+    LocalNotify* const notifyPtr = GetNotify(notifyIdx);
+    CHK_PTR_NULL(notifyPtr);
+    notifyId = notifyPtr->notifyId_;
     return HCCL_SUCCESS;
 }
 
@@ -403,24 +592,30 @@ HcclResult AicpuTsThread::HostInit()
     CHK_RET(hrtGetDevice(&deviceLogicId));
     CHK_RET(hrtGetDevicePhyIdByIndex(static_cast<uint32_t>(deviceLogicId), devId_));
     CHK_RET(hrtGetDeviceType(devType_));
-    if (rtStream_ == nullptr) {
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
+    if (stream_ == nullptr) {
         stream_.reset(new (std::nothrow) Stream(streamType_));
         CHK_SMART_PTR_NULL(stream_);
-        rtStream_ = stream_->ptr();
     }
+    // 流创建/初始化失败时 Stream 构造函数仅打日志不置失败态（内部 rtStream 为空），
+    // 须显式拦截，防止坏流线程静默创建成功导致接口返回 SUCCESS
+    CHK_PRT_RET(
+        stream_->ptr() == nullptr,
+        HCCL_ERROR("[%s] create stream failed, ptr is null, streamType[%d]", __func__, static_cast<s32>(streamType_)),
+        HCCL_E_RUNTIME);
 
     for (uint32_t idx = 0; idx < notifyNum_; idx++) {
         notifys_.emplace_back(nullptr);
         notifys_[idx].reset(new (std::nothrow) LocalNotify());
         CHK_SMART_PTR_NULL(notifys_[idx]);
         CHK_RET(notifys_[idx]->Init(notifyLoadType_));
-        if (devType_ != DevType::DEV_TYPE_950 && devType_ != DevType::DEV_TYPE_960) {
+        if (!(*isGe950)) {
             CHK_RET(notifys_[idx]->SetIpc());
         }
     }
 
-    if (streamType_ == StreamType::STREAM_TYPE_DEVICE && devType_ != DevType::DEV_TYPE_950
-        && devType_ != DevType::DEV_TYPE_960) {
+    if (streamType_ == StreamType::STREAM_TYPE_DEVICE && !(*isGe950)) {
         uint64_t size = sizeof(SqCqeContext);
         sqCqeContext_ = DeviceMem::alloc(size);
         CHK_PTR_NULL(sqCqeContext_.ptr());
@@ -434,6 +629,8 @@ HcclResult AicpuTsThread::DeviceInit()
     CHK_PRT_RET(uniqueIdStr_.empty(), HCCL_ERROR("[AicpuTsThread][Init]uniqueIdStr is empty"), HCCL_E_INTERNAL);
     std::istringstream iss(uniqueIdStr_);
     CHK_RET(hrtGetDeviceType(devType_));
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
     uint32_t hostPhyId = 0;
     iss.read(ReinterpretAs<char_t*>(&streamType_), sizeof(streamType_));
     iss.read(ReinterpretAs<char_t*>(&notifyLoadType_), sizeof(notifyLoadType_));
@@ -444,20 +641,38 @@ HcclResult AicpuTsThread::DeviceInit()
 
     HcclStreamParam streamParam;
     iss.read(ReinterpretAs<char_t*>(&streamParam), sizeof(streamParam));
-    // GE保序桩线程（host侧ONLINE导出，streamParam零值）：无流资源，仅作notify record/wait目标
-    // （dst侧仅GetNotify，record SQE由deviceOrderThread的流提交），跳过流初始化。
-    // 判据取"ONLINE+streamInfo全零"的假流签名而非仅判类型：合法ONLINE线程携带真实流参数时仍正常初始化
     const HcclStreamInfo& streamInfo = streamParam.streamInfo;
     const bool isFakeStream = streamType_ == StreamType::STREAM_TYPE_ONLINE && streamInfo.streamIds == 0
                               && streamInfo.sqIds == 0U && streamInfo.cqIds == 0U && streamInfo.logicCqids == 0U;
     if (isFakeStream) {
         fakeDeviceRes_ = true; // 后续资源注册/任务下发按此标志统一拦截
         HCCL_INFO("[AicpuTsThread][Init] streamType[%d] is host online stream, skip stream init.", streamType_);
-    } else if (devType_ == DevType::DEV_TYPE_950 || devType_ == DevType::DEV_TYPE_960) {
+    } else if (*isGe950) {
         // 91095初始化streamlite，初始化rtsq接口
         CHK_RET(InitStreamLite(streamParam.streamInfo, hostPhyId));
     } else {
         CHK_RET(InitStream(streamParam));
+    }
+
+    // dispatcher归属Thread：随thread创建/销毁，确保(dispatcher, stream)配对稳定，
+    // channel复用thread时不会出现同一stream被多个dispatcher交错写入。
+    // commId用devId+进程内自增序列保证唯一（uniqueIdStr_为二进制序列，c_str会在首个\0截断，不可直接拼接）
+    // GE保序桩线程（fakeDeviceRes_）无真实设备流，不创建thread dispatcher
+    if (!fakeDeviceRes_) {
+        static std::atomic<uint64_t> threadDispatcherSeq{0};
+        threadDispatcherCommId_
+            = "hcomm_ts_thread_" + std::to_string(devId_) + "_" + std::to_string(threadDispatcherSeq.fetch_add(1));
+        HcclResult dispatcherRet = CreateDispatcherCtx(&threadDispatcherCtx_, devId_, threadDispatcherCommId_.c_str());
+        if (dispatcherRet != HCCL_SUCCESS || threadDispatcherCtx_ == nullptr) {
+            // 创建失败不阻断thread初始化：任务下发时GetOpDispatcher()会显式报错，保证可诊断
+            HCCL_WARNING(
+                "[AicpuTsThread][Init] create thread dispatcher failed, ret[%d], commId[%s]",
+                static_cast<int>(dispatcherRet), threadDispatcherCommId_.c_str());
+            threadDispatcherCtx_ = nullptr;
+        } else {
+            HCCL_INFO(
+                "[AicpuTsThread][Init] thread dispatcher create success, commId[%s]", threadDispatcherCommId_.c_str());
+        }
     }
 
     notifys_.reserve(notifyNum_);
@@ -468,7 +683,7 @@ HcclResult AicpuTsThread::DeviceInit()
         iss.read(ReinterpretAs<char_t*>(&notifyInfo), sizeof(notifyInfo));
         notifys_[idx].reset(new (std::nothrow) LocalNotify());
         CHK_SMART_PTR_NULL(notifys_[idx]);
-        if (devType_ == DevType::DEV_TYPE_950 || devType_ == DevType::DEV_TYPE_960) {
+        if (*isGe950) {
             CHK_RET(notifys_[idx]->InitNotifyLite(notifyInfo));
             HCCL_INFO(
                 "[AicpuTsThread][Init]local notifyLite init success, resId[%u], devId[%u]", notifyInfo.resId,
@@ -512,12 +727,13 @@ HcclResult AicpuTsThread::SupplementNotify(uint32_t notifyNum)
     const u32 beginIdx = notifyNum_;
     const u32 allNotifyNum = notifyNum_ + notifyNum;
     notifys_.resize(allNotifyNum);
+    auto isGe950 = hcomm::EqualToOrGreaterThan950().value_or(false);
 
     for (uint32_t idx = beginIdx; idx < allNotifyNum; idx++) {
         notifys_[idx].reset(new (std::nothrow) LocalNotify());
         CHK_SMART_PTR_NULL(notifys_[idx]);
         CHK_RET(notifys_[idx]->Init(notifyLoadType_));
-        if (devType_ != DevType::DEV_TYPE_950 && devType_ != DevType::DEV_TYPE_960) {
+        if (!isGe950) {
             CHK_RET(notifys_[idx]->SetIpc());
         }
         notifyNum_++;
@@ -569,6 +785,7 @@ HcclResult AicpuTsThread::SupplementNotify(u32 notifyNum, const std::string& not
     std::istringstream iss(notifyDesc);
     const u32 beginIdx = notifyNum_;
     notifys_.resize(notifyNum);
+    auto isGe950 = hcomm::EqualToOrGreaterThan950().value_or(false);
     for (uint32_t idx = 0; idx < beginIdx; idx++) {
         HcclSignalInfo notifyInfo;
         iss.read(ReinterpretAs<char_t*>(&notifyInfo), sizeof(notifyInfo));
@@ -582,7 +799,7 @@ HcclResult AicpuTsThread::SupplementNotify(u32 notifyNum, const std::string& not
         iss.read(ReinterpretAs<char_t*>(&notifyInfo), sizeof(notifyInfo));
         notifys_[idx].reset(new (std::nothrow) LocalNotify());
         CHK_SMART_PTR_NULL(notifys_[idx]);
-        if (devType_ == DevType::DEV_TYPE_950 || devType_ == DevType::DEV_TYPE_960) {
+        if (isGe950) {
             CHK_RET(notifys_[idx]->InitNotifyLite(notifyInfo));
             HCCL_INFO(
                 "[AicpuTsThread][SupplementNotify]local notifyLite init success, resId[%u], devId[%u]",

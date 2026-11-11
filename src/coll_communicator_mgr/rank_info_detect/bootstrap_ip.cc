@@ -34,7 +34,10 @@ std::vector<IpAddress> GetHostSocketWhitelist()
             __func__),
         InternalException, "whiteList file name empty");
 
-    Whitelist::GetInstance().LoadConfigFile(fileName);
+    HcclResult ret = Whitelist::GetInstance().LoadConfigFile(fileName);
+    CHK_PRT_THROW(
+        ret != HCCL_SUCCESS, HCCL_ERROR("[%s] LoadConfigFile failed, ret[%d]", __func__, ret), InternalException,
+        "LoadConfigFile failed");
     Whitelist::GetInstance().GetHostWhiteList(hostSocketWhitelist);
     CHK_PRT_THROW(
         hostSocketWhitelist.empty(),
@@ -96,11 +99,14 @@ bool FindHostIpByIfName(
         if (hostIfInfo.second.GetFamily() != family) {
             continue;
         }
-        u32 matchLen = hostIfInfo.first.size();
         bool configIfNamesFlag = false;
         for (u32 i = 0; i < socketIfName.configIfNames.size(); i++) {
-            matchLen = socketIfName.searchExact ? hostIfInfo.first.size() : socketIfName.configIfNames[i].size();
-            if (hostIfInfo.first.compare(0, matchLen, socketIfName.configIfNames[i], 0, matchLen) == 0) {
+            bool isMatched
+                = socketIfName.searchExact ?
+                      hostIfInfo.first == socketIfName.configIfNames[i] :
+                      hostIfInfo.first.compare(0, socketIfName.configIfNames[i].size(), socketIfName.configIfNames[i])
+                          == 0;
+            if (isMatched) {
                 configIfNamesFlag = true;
             }
         }

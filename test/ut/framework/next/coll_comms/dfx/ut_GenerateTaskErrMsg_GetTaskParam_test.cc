@@ -9,6 +9,7 @@
  */
 
 #include "gtest/gtest.h"
+#include "dfx/device/dfx_res_pub.h"
 #include "mockcpp/mokc.h"
 #include <mockcpp/mockcpp.hpp>
 #include "hccl_comm_pub.h"
@@ -23,7 +24,7 @@
 #undef protected
 
 #include "hcomm_task_scheduler_error.h"
-#include "aicpu_indop_env.h"
+#include "common/device/aicpu_indop_env_pub.h"
 #include "adapter_hal_pub.h"
 #include "dlhal_function_v2.h"
 #include "rtsq_base.h"

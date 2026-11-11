@@ -9,40 +9,44 @@
  */
 
 #include "thread_manager.h"
+#include "hcomm/hcomm_res_expt.h"
+#include "common/cast_utils_pub.h"
+#include "cpu_thread_service.h"
 #include <algorithm>
-#include <cstring>
-#include "hcomm_thread_c_adpt.h"
-#include "res_pub.h"
-#include "hcomm_c_adpt.h"
+#include "comm_engine/thread/thread_pub.h"
+#include "dfx/res_pub.h"
+#include "comm_engine/thread/thread_c_adpt_pub.h"
 #include "independent_op.h"
-#include "comm_engine_utils.h"
+#include "common/comm_engine_utils_pub.h"
 #include "hcomm_res.h"
-#include "aicpu_launch_manager.h" // SIGNAL_DEV_STREAM_MAX_NUM 常量
+#include "thread.h"
+#include "comm_engine/aicpu_launch_manager_pub.h"
 #include "dtype_common.h"
-#include "adapter_rts.h"
-#include "prof_cycle_time.h"
-#include "hcclCommOp.h"
+#include "adapter_rts_common.h"
+#include "comm_engine/thread/dfx/thread_dfx_pub.h"
+#include "dfx/prof_utils_pub.h"
+#include "cpu_thread/cpu_thread.h"   // CpuThread 与 LegacyDpuThread（仅本 .cc 引入，不污染头文件）
+#include "aicpu_thread_launch_mgr.h" // AicpuThreadLaunchMgr（线程级 kernel 下发）
+#include <mutex>
+#include <vector>
 namespace hccl {
 
 ThreadMgr::ThreadMgr(
-    uint32_t threadNum, uint32_t notifyNumPerThread, std::string commId, const ManagerCallbacks& callbacks)
+    uint32_t threadNum, uint32_t notifyNumPerThread, std::string commId, aclrtBinHandle binHandle,
+    const ManagerCallbacks& callbacks)
     : threadNum_(threadNum),
       notifyNumPerThread_(notifyNumPerThread),
       commId_(commId),
+      cpuThreadService_(std::make_unique<CpuThreadService>(this, binHandle)),
       callbacks_(callbacks)
 {}
 
 ThreadMgr::~ThreadMgr()
 {
-    // 1. 释放专用线程（dedicatedThreadMap_ 全类型）。此前仅释放 AICPU_LAUNCH 一种，
-    // ORDER_LAUNCH_DEVICE（deviceOrderThread）被遗漏——其线程与自建流只能活到进程退出
-    // 静态析构（此时 ctx/流已被 runtime 回收，销毁必然失败并产生退出期错误风暴）
     FreeDedicatedThreads();
 
-    // 线程对象由底层接口 HcommThreadFree 统一释放：这里若直接删，底层的全局线程表会残留句柄，造成泄漏
-    // 2. 释放复用池线程（engineToThreadsMap_）
     FreeEngineToThreads();
-    // 3. 释放主流线程（mainThread_）
+
     FreeMainThreads();
 
     HCCL_INFO("[~ThreadMgr] Hcom[%s] destroy done.", commId_.c_str());
@@ -50,28 +54,29 @@ ThreadMgr::~ThreadMgr()
 
 void ThreadMgr::FreeDedicatedThreads()
 {
-    std::vector<ThreadHandle> handles;
+    // dedicatedThreadMap_ 以 HcclDedicatedThreadType 枚举为 key，容量上界即枚举值个数：
+    // 栈上固定数组收集句柄（零堆分配，规避析构路径上 vector 扩容抛 bad_alloc 的问题）
+    constexpr u32 DEDICATED_THREAD_MAX_NUM = static_cast<u32>(HCCL_DED_THREAD_TYPE_AICPU_ORDER_LAUNCH_DEVICE) + 1;
+    ThreadHandle handles[DEDICATED_THREAD_MAX_NUM] = {0};
+    u32 num = 0;
     {
         std::lock_guard<std::mutex> lock(dedicatedThreadMutex_);
-        handles.reserve(dedicatedThreadMap_.size());
         for (auto& pair : dedicatedThreadMap_) {
-            if (pair.second != 0) {
-                handles.push_back(pair.second);
+            if (pair.second != 0 && num < DEDICATED_THREAD_MAX_NUM) {
+                handles[num++] = pair.second;
             }
         }
         dedicatedThreadMap_.clear();
     }
-    if (handles.empty()) {
+    if (num == 0) {
         return;
     }
 
     // HcommThreadFree 内部保证销毁时序：先经 ThreadKernelLaunchDestroy 拆除 device 侧线程
-    // （移出守护线程轮询列表），再释放 host 侧线程与 SQ/CQ 资源，避免设备侧 UAF
-    HcommResult ret = HcommThreadFree(handles.data(), static_cast<uint32_t>(handles.size()));
+    // （移出守护线程轮询列表），再释放 host 侧线程与 SQ/CQ 资源
+    HcommResult ret = HcommThreadFree(handles, num);
     if (ret != HCCL_SUCCESS) {
-        HCCL_ERROR(
-            "[~ThreadMgr] dedicated threads free failed, Hcom[%s], num[%zu], ret[%d]", commId_.c_str(), handles.size(),
-            ret);
+        HCCL_ERROR("[~ThreadMgr] dedicated threads free failed, Hcom[%s], num[%u], ret[%d]", commId_.c_str(), num, ret);
     }
 }
 
@@ -79,28 +84,20 @@ void ThreadMgr::FreeEngineToThreads()
 {
     std::lock_guard<std::mutex> lock(engineToThreadMutex_);
     for (auto& kv : engineToThreadsMap_) {
-        auto& threadVec = kv.second;
-        if (threadVec.empty()) {
-            continue;
-        }
-
-        std::vector<ThreadHandle> handles;
-        handles.reserve(threadVec.size());
-        for (auto& meta : threadVec) {
-            if (meta.handle != 0) {
-                handles.push_back(meta.handle);
+        for (auto& meta : kv.second) {
+            if (meta.handle == 0) {
+                continue;
             }
-        }
-
-        if (!handles.empty()) {
-            HcommResult ret = HcommThreadFree(handles.data(), static_cast<uint32_t>(handles.size()));
+            ThreadHandle handle = meta.handle;
+            HcommResult ret = HcommThreadFree(&handle, 1);
             if (ret != HCCL_SUCCESS) {
                 HCCL_ERROR(
-                    "[~ThreadMgr] engineToThreads free failed, engine[%u] type[%d] ret[%d]",
-                    static_cast<uint32_t>(kv.first.first), static_cast<int32_t>(kv.first.second), ret);
+                    "[~ThreadMgr] engineToThreads free failed, engine[%u] type[%d] handle[0x%llx] ret[%d]",
+                    static_cast<uint32_t>(kv.first.first), static_cast<int32_t>(kv.first.second),
+                    static_cast<uint64_t>(handle), ret);
             }
         }
-        threadVec.clear();
+        kv.second.clear();
     }
 }
 
@@ -108,75 +105,18 @@ void ThreadMgr::FreeMainThreads()
 {
     // 释放主流线程（mainThread_：stream 到 ThreadMeta 的映射，HcclThreadAcquireWithStream 分配）
     std::lock_guard<std::mutex> lock(mainThreadMutex_);
-    std::vector<ThreadHandle> handles;
-    handles.reserve(mainThread_.size());
     for (auto& kv : mainThread_) {
-        if (kv.second.handle != 0) {
-            handles.push_back(kv.second.handle);
+        if (kv.second.handle == 0) {
+            continue;
         }
-    }
-    if (!handles.empty()) {
-        HcommResult ret = HcommThreadFree(handles.data(), static_cast<uint32_t>(handles.size()));
+        ThreadHandle handle = kv.second.handle;
+        HcommResult ret = HcommThreadFree(&handle, 1);
         if (ret != HCCL_SUCCESS) {
-            HCCL_ERROR("[~ThreadMgr] mainThread free failed, ret[%d]", ret);
+            HCCL_ERROR(
+                "[~ThreadMgr] mainThread free failed, handle[0x%llx], ret[%d]", static_cast<uint64_t>(handle), ret);
         }
     }
     mainThread_.clear();
-}
-
-uint64_t ThreadMgr::GetMaxNotifyTotal()
-{
-    uint64_t maxNotifyTotal = 0;
-    if (threadNum_ == HCCL_COMM_THREADNUM_CONFIG_NOT_SET
-        && notifyNumPerThread_ == HCCL_COMM_NOTIFY_NUM_PER_THREAD_CONFIG_NOT_SET) {
-        maxNotifyTotal = HCOMM_THREAD_NOTIFY_MAX_NUM;
-        threadNum_ = SIGNAL_DEV_STREAM_MAX_NUM;
-        notifyNumPerThread_ = HCOMM_THREAD_NOTIFY_MAX_NUM;
-    } else {
-        maxNotifyTotal = static_cast<uint64_t>(threadNum_) * static_cast<uint64_t>(notifyNumPerThread_);
-        maxNotifyTotal = maxNotifyTotal > HCOMM_THREAD_NOTIFY_MAX_NUM ? HCOMM_THREAD_NOTIFY_MAX_NUM : maxNotifyTotal;
-    }
-    return maxNotifyTotal;
-}
-
-HcclResult ThreadMgr::CheckNotifyNum(CommEngine engine, uint32_t threadNum, uint32_t notifyNumPerThread)
-{
-    uint64_t maxNotifyTotal = GetMaxNotifyTotal();
-    const uint64_t used = usedNotifyNum_;
-    uint64_t remainNotifyQuota = (maxNotifyTotal > used) ? (maxNotifyTotal - used) : 0;
-    uint64_t needNotifyTotal = static_cast<uint64_t>(threadNum) * static_cast<uint64_t>(notifyNumPerThread);
-    if (remainNotifyQuota < needNotifyTotal || notifyNumPerThread > notifyNumPerThread_
-        || maxNotifyTotal > HCOMM_THREAD_NOTIFY_MAX_NUM) {
-        HCCL_ERROR(
-            "[ThreadMgr][%s] Notify quota exhausted: remainQuota[%llu], total[%llu], used[%llu], need[%llu], "
-            "setPreNum[%u], allocPreNum[%u]",
-            __func__, remainNotifyQuota, maxNotifyTotal, used, needNotifyTotal, notifyNumPerThread_,
-            notifyNumPerThread);
-        return HCCL_E_UNAVAIL;
-    }
-
-    HCCL_INFO(
-        "[ThreadMgr][%s] Hcom[%s] HcclThreadAcquire quota: engine[%s], "
-        "remainNotifyQuota[%llu]",
-        __func__, commId_.c_str(), GetEnumToString(GetCommEngineStatusStrMap(), engine).c_str(), remainNotifyQuota);
-    return HCCL_SUCCESS;
-}
-
-HcclResult ThreadMgr::CheckThreadNum(CommEngine engine, uint32_t threadNum, uint32_t notifyNumPerThread)
-{
-    // 确保 threadNum_/notifyNumPerThread_ 已初始化（未配置时填充默认值）
-    GetMaxNotifyTotal();
-    uint32_t remainQuota = (threadNum_ > totalThreadCount_) ? (threadNum_ - totalThreadCount_) : 0;
-    if (remainQuota == 0 || threadNum > remainQuota) {
-        HCCL_ERROR(
-            "[ThreadMgr][%s] Threads quota exhausted: remainQuota[%u], need[%u].", __func__, remainQuota, threadNum);
-        return HCCL_E_UNAVAIL;
-    }
-
-    HCCL_INFO(
-        "[ThreadMgr][%s] commId[%s] HcclThreadAcquire quota: engine[%s] threadNum[%u].", __func__, commId_.c_str(),
-        GetEnumToString(GetCommEngineStatusStrMap(), engine).c_str(), remainQuota);
-    return CheckNotifyNum(engine, threadNum, notifyNumPerThread);
 }
 
 // AICPU 首次触碰 device 前预置公共域初始化（独立锁串行化 check+launch+set，comm 生命周期内仅执行一次；
@@ -233,7 +173,7 @@ HcclResult ThreadMgr::HcclThreadAcquireV2(
         it = engineToThreadsMap_.emplace(std::make_pair(engine, type), std::vector<ThreadMeta>{}).first;
     }
     auto& threadVec = it->second;
-    CHK_RET(SupplementNotify(engine, threadVec, threadNum, config));
+    CHK_RET(SupplementNotify(threadVec, threadNum, config));
 
     // 2. 扩容：threadVec.size() 扩充到 threadNum
     CHK_RET(SupplementThread(engine, threadVec, type, threadNum, config));
@@ -252,8 +192,39 @@ HcclResult ThreadMgr::HcclThreadAcquireV2(
     return HCCL_SUCCESS;
 }
 
-HcclResult ThreadMgr::SupplementNotify(
-    CommEngine engine, std::vector<ThreadMeta>& threadVec, uint32_t threadNum, const ThreadConfig* config)
+HcclResult
+ThreadMgr::SupplementCpuThreadNotify(const ThreadHandle* handles, const uint32_t* supplementNums, uint32_t threadNum)
+{
+    if (handles == nullptr || supplementNums == nullptr) {
+        HCCL_ERROR("[%s] handles/supplementNums is nullptr, comm[%s]", __func__, commId_.c_str());
+        return HCCL_E_PTR;
+    }
+    for (u32 i = 0; i < threadNum; ++i) {
+        if (supplementNums[i] == 0) {
+            continue;
+        }
+        std::shared_ptr<Thread> thread;
+        HcclResult getRet = GetThread(handles[i], thread);
+        if (getRet != HCCL_SUCCESS) {
+            HCCL_ERROR("[%s] get thread failed, comm[%s], index[%u], ret[%d]", __func__, commId_.c_str(), i, getRet);
+            return getRet;
+        }
+        std::shared_ptr<CpuThread> cpuThread = std::dynamic_pointer_cast<CpuThread>(thread);
+        if (cpuThread == nullptr) {
+            HCCL_ERROR("[%s] thread is not a CpuThread, comm[%s], index[%u]", __func__, commId_.c_str(), i);
+            return HCCL_E_INTERNAL;
+        }
+        CHK_RET(cpuThread->SupplementNotify(supplementNums[i]));
+        if (cpuThread->GetTaskPipe() != nullptr) {
+            CHK_RET(AicpuThreadLaunchMgr::CpuNotifyAddrUpdateLaunch(*cpuThread, handles[i], commId_));
+        }
+    }
+    HCCL_INFO("[%s] supplement notify done, comm[%s], threadNum[%u]", __func__, commId_.c_str(), threadNum);
+    return HCCL_SUCCESS;
+}
+
+HcclResult
+ThreadMgr::SupplementNotify(std::vector<ThreadMeta>& threadVec, uint32_t threadNum, const ThreadConfig* config)
 {
     u32 existNum = std::min(static_cast<u32>(threadVec.size()), threadNum);
     if (existNum == 0) {
@@ -276,16 +247,22 @@ HcclResult ThreadMgr::SupplementNotify(
         }
     }
 
-    CHK_RET(CheckNotifyNum(engine, 1, totalSupplement));
-    // 3. 批量补充
-    HcommResult ret = HcommThreadSupplementNotify(needSupplement.data(), existNum, supplementNums.data());
-    CHK_PRT_RET(
-        ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadSupplementNotify failed, ret[%d]", __func__, ret),
-        (HcclResult)ret);
+    if (threadVec[0].type == ThreadType::THREAD_TYPE_CPU) {
+        HcclResult ret = SupplementCpuThreadNotify(needSupplement.data(), supplementNums.data(), existNum);
+        CHK_PRT_RET(
+            ret != HCCL_SUCCESS, HCCL_ERROR("[%s] SupplementCpuThreadNotify failed, ret[%d]", __func__, ret), ret);
+    } else {
+        // 3. 批量补充
+        HcommResult ret = HcommThreadSupplementNotify(needSupplement.data(), existNum, supplementNums.data());
+        CHK_PRT_RET(
+            ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadSupplementNotify failed, ret[%d]", __func__, ret),
+            static_cast<HcclResult>(ret));
 
-    usedNotifyNum_ += totalSupplement;
+        usedNotifyNum_ += totalSupplement;
+    }
     for (u32 i = 0; i < existNum; ++i) {
-        threadVec[i].notifyNum = config[i].notifyNumPerThread;
+        // 缓存记录已分配容量：需求减小时底层不释放，保留原值，避免需求恢复时重复增配
+        threadVec[i].notifyNum = std::max(threadVec[i].notifyNum, static_cast<uint32_t>(config[i].notifyNumPerThread));
     }
 
     return HCCL_SUCCESS;
@@ -303,15 +280,14 @@ HcclResult ThreadMgr::SupplementThread(
     // 2. 扩容：threadVec.size() 扩充到 threadNum
     u32 supplementThreadNum = threadNum - static_cast<u32>(threadVec.size());
     u32 offset = static_cast<u32>(threadVec.size());
-    CHK_RET(CheckThreadNum(engine, supplementThreadNum, config[offset].notifyNumPerThread));
     std::vector<ThreadHandle> newHandles(supplementThreadNum);
     HcommResult ret = HcommThreadAllocWithCommConfig(
         engine, commId_.c_str(), supplementThreadNum, type, &config[offset], newHandles.data());
     CHK_PRT_RET(
         ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadAllocWithConfig failed, ret[%d]", __func__, ret),
-        (HcclResult)ret);
+        static_cast<HcclResult>(ret));
 
-    // 3. 查询 stream/sqId
+    // 3. 查询 stream/sqId（HOST CPU dpu 线程的流在 LegacyDpuThread::Init 内部才建，acquire 时尚未就绪，走空流分支）
     std::vector<ThreadMeta> metas;
     metas.reserve(supplementThreadNum);
     for (u32 i = 0; i < supplementThreadNum; ++i) {
@@ -320,25 +296,33 @@ HcclResult ThreadMgr::SupplementThread(
         meta.engine = engine;
         meta.type = type;
         meta.notifyNum = config[offset + i].notifyNumPerThread;
-
-        ThreadResTypeStream stream;
-        uint32_t size = sizeof(ThreadResTypeStream);
-        HcclResult infoRet = HcclThreadResGetInfo(newHandles[i], THREAD_RES_TYPE_STREAM, size, (void**)&stream);
-        if (infoRet != HCCL_SUCCESS || stream == nullptr) {
-            HCCL_ERROR("[ThreadMgr][%s] HcclThreadResGetInfo failed, ret[%d], stream[%p]", __func__, infoRet, stream);
-            // 回滚本批已分配但未入池的句柄，避免泄漏
-            (void)HcommThreadFree(newHandles.data(), supplementThreadNum);
-            return (infoRet != HCCL_SUCCESS) ? infoRet : HCCL_E_INTERNAL;
+        if (type == ThreadType::THREAD_TYPE_CPU) {
+            // 1 thread 1 kernel 的 dpu 线程不参与 TS stream/notify 机制，stream/sqId 恒为空。
+            // 按类型而非引擎判别：DPU 线程挂 (CPU,CPU) 或 (AICPU,CPU)，两者都无 TS 真流
+            meta.stream = nullptr;
+            meta.sqId = 0;
+        } else {
+            ThreadResTypeStream stream = nullptr;
+            uint32_t size = sizeof(ThreadResTypeStream);
+            HcclResult infoRet
+                = HcclThreadResGetInfo(newHandles[i], THREAD_RES_TYPE_STREAM, size, ReinterpretAs<void**>(&stream));
+            if (infoRet != HCCL_SUCCESS || stream == nullptr) {
+                HCCL_ERROR(
+                    "[ThreadMgr][%s] HcclThreadResGetInfo failed, ret[%d], stream[%p]", __func__, infoRet, stream);
+                // 回滚本批已分配但未入池的句柄，避免泄漏
+                (void)HcommThreadFree(newHandles.data(), supplementThreadNum);
+                return (infoRet != HCCL_SUCCESS) ? infoRet : HCCL_E_INTERNAL;
+            }
+            meta.stream = stream;
+            uint32_t sqId = 0;
+            if (hrtStreamGetSqid(meta.stream, &sqId) != HCCL_SUCCESS) {
+                HCCL_ERROR("[ThreadMgr][%s] hrtStreamGetSqid failed stream[%p]", __func__, meta.stream);
+                // 回滚本批已分配但未入池的句柄，避免泄漏
+                (void)HcommThreadFree(newHandles.data(), supplementThreadNum);
+                return HCCL_E_INTERNAL;
+            }
+            meta.sqId = sqId;
         }
-        meta.stream = stream;
-        uint32_t sqId = 0;
-        if (hrtStreamGetSqid(meta.stream, &sqId) != HCCL_SUCCESS) {
-            HCCL_ERROR("[ThreadMgr][%s] hrtStreamGetSqid failed stream[%p]", __func__, meta.stream);
-            // 回滚本批已分配但未入池的句柄，避免泄漏
-            (void)HcommThreadFree(newHandles.data(), supplementThreadNum);
-            return HCCL_E_INTERNAL;
-        }
-        meta.sqId = sqId;
         metas.emplace_back(std::move(meta));
     }
 
@@ -366,7 +350,7 @@ HcclResult ThreadMgr::HcclGetNotifyNumInThread(ThreadHandle thread, uint32_t* no
     HcommResult ret = HcommThreadGetNotifyNum(thread, notifyNum);
     CHK_PRT_RET(
         ret != HCCL_SUCCESS, HCCL_ERROR("[ThreadMgr][%s] HcommThreadGetNotifyNum failed, ret[%d]", __func__, ret),
-        (HcclResult)ret);
+        static_cast<HcclResult>(ret));
     HCCL_INFO("[ThreadMgr] Hcom[%s] HcclGetNotifyNumInThread done: notifyPerThread[%u]", commId_.c_str(), *notifyNum);
     return HCCL_SUCCESS;
 }
@@ -386,7 +370,7 @@ ThreadMgr::HcclThreadAcquireWithStream(CommEngine engine, rtStream_t stream, uin
             HcommResult ret = HcommThreadSupplementNotify(&handle, 1, &supplementNum);
             CHK_PRT_RET(
                 ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadSupplementNotify failed, ret[%d]", __func__, ret),
-                (HcclResult)ret);
+                static_cast<HcclResult>(ret));
             it->second.notifyNum = notifyNum;
         }
         *thread = it->second.handle;
@@ -397,7 +381,7 @@ ThreadMgr::HcclThreadAcquireWithStream(CommEngine engine, rtStream_t stream, uin
     HcommResult ret = HcommThreadAllocWithStream(engine, stream, notifyNum, thread);
     CHK_PRT_RET(
         ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadAllocWithStream failed, ret[%d]", __func__, ret),
-        (HcclResult)ret);
+        static_cast<HcclResult>(ret));
     ThreadMeta meta;
     meta.handle = *thread;
     meta.engine = engine;
@@ -435,7 +419,7 @@ HcclResult ThreadMgr::HcclThreadExportToCommEngine(
         = HcommThreadExportToCommEngine(threads, commId_.c_str(), threadNum, dstCommEngine, exportedThreads);
     CHK_PRT_RET(
         ret != HCCL_SUCCESS, HCCL_ERROR("[ThreadMgr][%s] HcommThreadExportToCommEngine failed, ret[%d]", __func__, ret),
-        (HcclResult)ret);
+        static_cast<HcclResult>(ret));
 
     if ((dstCommEngine == COMM_ENGINE_AICPU || dstCommEngine == COMM_ENGINE_AICPU_TS)
         && callbacks_.reportProfilingKernel != nullptr) {
@@ -449,7 +433,8 @@ HcclResult ThreadMgr::HcclThreadExportToCommEngine(
     return HCCL_SUCCESS;
 }
 
-HcclResult ThreadMgr::HcclThreadResGetInfo(ThreadHandle thread, ThreadResType resType, uint32_t infoLen, void** info)
+HcclResult
+ThreadMgr::HcclThreadResGetInfo(ThreadHandle thread, ThreadResType resType, uint32_t infoLen, void** info) const
 {
     CHK_PRT_RET(
         resType != ThreadResType::THREAD_RES_TYPE_STREAM,
@@ -459,7 +444,7 @@ HcclResult ThreadMgr::HcclThreadResGetInfo(ThreadHandle thread, ThreadResType re
     HcommResult ret = HcommThreadResGetInfo(thread, resType, infoLen, info);
     CHK_PRT_RET(
         ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadGetStreamInfo failed, ret[%d]", __func__, ret),
-        (HcclResult)ret);
+        static_cast<HcclResult>(ret));
     HCCL_INFO(
         "[%s] success. thread[0x%llx] resType[%d] info[%p]", __func__, thread, static_cast<int32_t>(resType), *info);
     return HCCL_SUCCESS;
@@ -472,34 +457,51 @@ ThreadMgr::HcclUnfoldThreadAcquire(HcclDedicatedThreadType useType, uint32_t not
     auto it = dedicatedThreadMap_.find(useType);
     if (it != dedicatedThreadMap_.end()) {
         *thread = it->second;
-        HCCL_INFO("[%s] reuse dedicated thread, dedThreadType[%u], thread[0x%llx]", __func__, useType, *thread);
+        HCCL_INFO(
+            "[%s] reuse dedicated thread, HcclDedicatedThreadType[%u], thread[0x%llx]", __func__, useType, *thread);
         // 补充 notify（notifyNumPerThread 为目标值，转为增量传入）
         ThreadHandle handle = *thread;
         uint32_t currentNotifyNum = 0;
         HcommResult ret = HcommThreadGetNotifyNum(handle, &currentNotifyNum);
         CHK_PRT_RET(
             ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadGetNotifyNum failed, ret[%d]", __func__, ret),
-            (HcclResult)ret);
+            static_cast<HcclResult>(ret));
         if (notifyNumPerThread > currentNotifyNum) {
             uint32_t addNotifyNum = notifyNumPerThread - currentNotifyNum;
             ret = HcommThreadSupplementNotify(&handle, 1, &addNotifyNum);
         }
         CHK_PRT_RET(
             ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadSupplementNotify failed, ret[%d]", __func__, ret),
-            (HcclResult)ret);
+            static_cast<HcclResult>(ret));
     } else {
         if (useType == HCCL_DED_THREAD_TYPE_AICPU_LAUNCH_GE) {
             CHK_RET(HcclGeUnfoldThreadAcquire(useType, notifyNumPerThread, thread));
             return HCCL_SUCCESS;
         }
+        // DFX回调必须先经HcclDedicatedThreadDfx记录（per-comm恒定），未记录按致命处理。
+        // GE分支在HcclGeUnfoldThreadAcquire内注册no-op
+        if (dfxCallback_ == nullptr) {
+            HCCL_ERROR("[%s] dfxCallback not recorded, record via HcclDedicatedThreadDfx first", __func__);
+            return HCCL_E_INTERNAL;
+        }
         CommEngine engine = CommEngine::COMM_ENGINE_CPU;
         uint32_t notifyNumPerThreadVec[1] = {notifyNumPerThread};
         HcclResult ret = static_cast<HcclResult>(HcommThreadAlloc(engine, 1, notifyNumPerThreadVec, thread));
         if (ret != HCCL_SUCCESS) {
-            HCCL_ERROR("[%s] Failed to cache dedicated thread, dedThreadType[%u], ret[%d]", __func__, useType, ret);
+            HCCL_ERROR(
+                "[%s] Failed to cache dedicated thread, HcclDedicatedThreadType[%u], ret[%d]", __func__, useType, ret);
             return ret;
         }
         dedicatedThreadMap_[useType] = *thread;
+        // 注册失败按致命处理
+        int dfxRet = HcommThreadRegisterDfx(*thread, dfxCallback_);
+        CHK_PRT_RET(
+            dfxRet != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadRegisterDfx failed, ret:[%d]", __func__, dfxRet),
+            HCCL_E_INTERNAL);
+        HCCL_RUN_INFO(
+            "[ThreadMgr][%s] created opbase unfold thread, HcclDedicatedThreadType[%u], "
+            "thread[0x%llx], notifyNumPerThread[%u], comm[%s]",
+            __func__, useType, *thread, notifyNumPerThread, commId_.c_str());
     }
     return HCCL_SUCCESS;
 }
@@ -527,7 +529,8 @@ ThreadMgr::HcclGeUnfoldThreadAcquire(HcclDedicatedThreadType useType, uint32_t n
     }
     if (stream == nullptr) {
         HCCL_WARNING(
-            "[%s] dedicated thread not found, dedThreadType[%u], attached stream not set, return threadHandle[0]",
+            "[%s] dedicated thread not found, HcclDedicatedThreadType[%u], attached stream not set, "
+            "return threadHandle[0]",
             __func__, useType);
         return HCCL_SUCCESS;
     }
@@ -542,7 +545,7 @@ ThreadMgr::HcclGeUnfoldThreadAcquire(HcclDedicatedThreadType useType, uint32_t n
             HcommResult ret = HcommThreadSupplementNotify(&handle, 1, &supplementNum);
             CHK_PRT_RET(
                 ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadSupplementNotify failed, ret[%d]", __func__, ret),
-                (HcclResult)ret);
+                static_cast<HcclResult>(ret));
             it->second.notifyNum = notifyNumPerThread;
         }
         *thread = it->second.handle;
@@ -556,7 +559,7 @@ ThreadMgr::HcclGeUnfoldThreadAcquire(HcclDedicatedThreadType useType, uint32_t n
     HcommResult ret = HcommThreadAllocWithStream(CommEngine::COMM_ENGINE_CPU_TS, stream, notifyNumPerThread, thread);
     CHK_PRT_RET(
         ret != HCCL_SUCCESS, HCCL_ERROR("[%s] HcommThreadAllocWithStream failed, ret[%d]", __func__, ret),
-        (HcclResult)ret);
+        static_cast<HcclResult>(ret));
     ThreadMeta meta;
     meta.handle = *thread;
     meta.engine = CommEngine::COMM_ENGINE_CPU_TS;
@@ -601,6 +604,12 @@ HcclResult ThreadMgr::HcclDeviceOrderThreadCreate(
     ThreadConfig config;
     HcommResult initRet = ThreadConfigInit(&config, 1);
     CHK_PRT_RET(initRet != 0, HCCL_ERROR("[%s] ThreadConfigInit failed, ret[%d]", __func__, initRet), HCCL_E_INTERNAL);
+    CHK_PRT_RET(
+        notifyNumPerThread > UINT16_MAX,
+        HCCL_ERROR(
+            "[%s] notifyNumPerThread[%u] exceeds ThreadConfig uint16 limit[%u]", __func__, notifyNumPerThread,
+            UINT16_MAX),
+        HCCL_E_PARA);
     config.notifyNumPerThread = static_cast<uint16_t>(notifyNumPerThread);
 
     // AICPU 专用线程创建前置 device 侧公共域初始化
@@ -624,8 +633,9 @@ HcclResult ThreadMgr::HcclDedicatedThreadAcquire(
 {
     CHK_PRT_RET(thread == nullptr, HCCL_ERROR("[%s] thread is null", __func__), HCCL_E_PTR);
     CHK_PRT_RET(
-        useType == HCCL_DED_THREAD_TYPE_INVALID, HCCL_ERROR("[%s] dedThreadType is invalid", __func__), HCCL_E_PARA);
-    HCCL_INFO("Entry-%s: dedThreadType[%u] notifyNumPerThread[%u]", __func__, useType, notifyNumPerThread);
+        useType == HCCL_DED_THREAD_TYPE_INVALID, HCCL_ERROR("[%s] HcclDedicatedThreadType is invalid", __func__),
+        HCCL_E_PARA);
+    HCCL_INFO("Entry-%s: HcclDedicatedThreadType[%u] notifyNumPerThread[%u]", __func__, useType, notifyNumPerThread);
 
     std::lock_guard<std::mutex> lock(dedicatedThreadMutex_);
     if (useType == HCCL_DED_THREAD_TYPE_AICPU_LAUNCH || useType == HCCL_DED_THREAD_TYPE_AICPU_LAUNCH_GE) {
@@ -633,13 +643,23 @@ HcclResult ThreadMgr::HcclDedicatedThreadAcquire(
     } else if (useType == HCCL_DED_THREAD_TYPE_AICPU_ORDER_LAUNCH_DEVICE) {
         CHK_RET(HcclDeviceOrderThreadCreate(useType, notifyNumPerThread, thread));
     } else {
-        HCCL_ERROR("[%s] unsupported dedThreadType[%u]", __func__, useType);
+        HCCL_ERROR("[%s] unsupported HcclDedicatedThreadType[%u]", __func__, useType);
         return HCCL_E_NOT_SUPPORT;
     }
 
     HCCL_INFO(
-        "[%s] success, useType[%u], thread[0x%llx], notifyNumPerThread[%u]", __func__, useType, *thread,
+        "[%s] success, HcclDedicatedThreadType[%u], thread[0x%llx], notifyNumPerThread[%u]", __func__, useType, *thread,
         notifyNumPerThread);
+    return HCCL_SUCCESS;
+}
+
+HcclResult
+ThreadMgr::HcclDedicatedThreadDfx(std::function<HcclResult(u32, u32, const Hccl::TaskParam&, u64)> dfxCallback)
+{
+    std::lock_guard<std::mutex> lock(dedicatedThreadMutex_);
+    if (dfxCallback_ == nullptr && dfxCallback != nullptr) {
+        dfxCallback_ = dfxCallback; // 仅首次记录非空回调，per-comm恒定不覆盖
+    }
     return HCCL_SUCCESS;
 }
 
@@ -695,12 +715,22 @@ HcclResult ThreadMgr::ResetDedicatedThreadLocalNotifies()
         if (pair.second == 0) {
             continue;
         }
+        std::shared_ptr<Thread> threadPtr;
+        // dedicated 线程对象在 ThreadHandleRegistryProc，不进 ThreadMgr::threadMap_；
+        // Lookup 未命中即已 Free，跳过即可，勿中断整个 reset 流程
+        if (LookupThreadByHandle(pair.second, threadPtr) != HCCL_SUCCESS || threadPtr == nullptr) {
+            HCCL_WARNING(
+                "[ThreadMgr][ResetDedicatedThreadLocalNotifies] thread not found (likely freed), skip reset, "
+                "Hcom[%s], useType[%u], thread[0x%llx]",
+                commId_.c_str(), static_cast<uint32_t>(pair.first), static_cast<uint64_t>(pair.second));
+            continue;
+        }
         HcclResult ret = static_cast<HcclResult>(HcommThreadResetNotifies(pair.second));
         CHK_PRT_RET(
             ret != HCCL_SUCCESS,
             HCCL_ERROR(
-                "[ThreadMgr][ResetDedicatedThreadLocalNotifies] reset notifies failed, Hcom[%s], useType[%u], "
-                "thread[0x%llx], ret[0x%016llx]",
+                "[ThreadMgr][ResetDedicatedThreadLocalNotifies] reset notifies failed, Hcom[%s], "
+                "HcclDedicatedThreadType[%u], thread[0x%llx], ret[0x%016llx]",
                 commId_.c_str(), static_cast<uint32_t>(pair.first), static_cast<uint64_t>(pair.second),
                 HCCL_ERROR_CODE(ret)),
             ret);
@@ -747,6 +777,122 @@ HcclResult ThreadMgr::RegisterOrderLaunchThread(ThreadHandle thread)
         "[ThreadMgr][%s] register order launch thread[0x%llx], comm[%s], total[%zu]", __func__, thread, commId_.c_str(),
         orderLaunchThreads_.size());
     return HCCL_SUCCESS;
+}
+
+HcclResult ThreadMgr::GetThread(ThreadHandle handle, std::shared_ptr<Thread>& thread) const
+{
+    thread = nullptr;
+    HcclResult ret = LookupThreadByHandle(handle, thread);
+    if (ret != HCCL_SUCCESS || thread == nullptr) {
+        // AICPU 引擎的句柄是 device 指针（StoreThreadHandles 的 AICPU 分支），而 g_ThreadMap 按 host
+        // 指针索引：补一次 D2H 反查，让 device 句柄也能取回 host 对象
+        ThreadHandle hostHandle = 0;
+        if (LookupD2HHandle(handle, hostHandle) == HCCL_SUCCESS) {
+            ret = LookupThreadByHandle(hostHandle, thread);
+        }
+    }
+    if (ret != HCCL_SUCCESS || thread == nullptr) {
+        HCCL_WARNING(
+            "[ThreadMgr][%s] thread[0x%llx] not found in thread table, comm[%s]", __func__, handle, commId_.c_str());
+        thread = nullptr;
+        return HCCL_E_NOT_FOUND;
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult ThreadMgr::GetCpuThread(std::shared_ptr<Thread>& cpuThread) const
+{
+    cpuThread = nullptr;
+    // DPU 线程按引擎落在两个池键下：(AICPU,CPU) 队列通道与 (CPU,CPU) TaskService 通道。一个通信域只走
+    // 其中一条（算子侧二选一），故至多命中其一；两条路产的都是 CpuThread 宿主薄壳，故两个键都查
+    static const std::pair<CommEngine, ThreadType> dpuKeys[]
+        = {{CommEngine::COMM_ENGINE_AICPU, ThreadType::THREAD_TYPE_CPU},
+           {CommEngine::COMM_ENGINE_CPU, ThreadType::THREAD_TYPE_CPU}};
+    ThreadHandle handle = 0;
+    {
+        std::lock_guard<std::mutex> lock(engineToThreadMutex_);
+        for (const auto& key : dpuKeys) {
+            auto it = engineToThreadsMap_.find(key);
+            if (it != engineToThreadsMap_.end() && !it->second.empty()) {
+                if (it->second.size() > 1) {
+                    // 多条目时首条未必是调用方需要的线程，留痕便于排障
+                    HCCL_WARNING(
+                        "[ThreadMgr][%s] %zu threads under key, take the first, comm[%s]", __func__, it->second.size(),
+                        commId_.c_str());
+                }
+                handle = it->second[0].handle;
+                break;
+            }
+        }
+        if (handle == 0) {
+            HCCL_WARNING("[ThreadMgr][%s] no host cpu thread registered, comm[%s]", __func__, commId_.c_str());
+            return HCCL_E_NOT_FOUND;
+        }
+    }
+    return GetThread(handle, cpuThread);
+}
+
+HcclResult ThreadMgr::GetCpuThread(std::shared_ptr<CpuThread>& cpuThread) const
+{
+    cpuThread = nullptr;
+    std::shared_ptr<Thread> thread;
+    HcclResult ret = GetCpuThread(thread);
+    if (ret != HCCL_SUCCESS) {
+        return ret;
+    }
+    cpuThread = std::dynamic_pointer_cast<CpuThread>(thread);
+    if (cpuThread == nullptr) {
+        HCCL_ERROR("[ThreadMgr][%s] thread is not a CpuThread, comm[%s]", __func__, commId_.c_str());
+        return HCCL_E_INTERNAL;
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult ThreadMgr::RollbackThread(ThreadHandle handle)
+{
+    if (handle == 0) {
+        HCCL_ERROR("[ThreadMgr][%s] handle is invalid, comm[%s]", __func__, commId_.c_str());
+        return HCCL_E_PARA;
+    }
+
+    ThreadMeta meta;
+    {
+        // 加锁次序与 HcclThreadAcquireV2 一致（threadMutex_ → engineToThreadMutex_），避免反向嵌套
+        std::lock_guard<std::mutex> lock(threadMutex_);
+        std::lock_guard<std::mutex> engineToThreadMtx(engineToThreadMutex_);
+        bool found = false;
+        for (auto& kv : engineToThreadsMap_) {
+            auto& threadVec = kv.second;
+            for (auto it = threadVec.begin(); it != threadVec.end(); ++it) {
+                if (it->handle != handle) {
+                    continue;
+                }
+                meta = *it;
+                threadVec.erase(it);
+                found = true;
+                break;
+            }
+            if (found) {
+                break;
+            }
+        }
+        if (!found) {
+            // 句柄不在复用池：非本池所有，不代为释放，避免误释放他人线程
+            HCCL_ERROR("[ThreadMgr][%s] thread[0x%llx] not in pool, comm[%s]", __func__, handle, commId_.c_str());
+            return HCCL_E_NOT_FOUND;
+        }
+
+        // 与 SupplementThread 的入池记账严格对冲：否则配额只减不还，反复失败后 acquire 被判配额耗尽
+        totalThreadCount_ = (totalThreadCount_ > 0) ? (totalThreadCount_ - 1) : 0;
+        usedNotifyNum_ = (usedNotifyNum_ > meta.notifyNum) ? (usedNotifyNum_ - meta.notifyNum) : 0;
+    }
+
+    // 释放放在锁外：缩小锁窗口，避免运行期持锁执行 device 侧销毁等慢操作阻塞 Acquire
+    HcommResult ret = HcommThreadFree(&handle, 1);
+    HCCL_INFO(
+        "[ThreadMgr][%s] rollback thread[0x%llx] done, comm[%s], ret[%d]", __func__, handle, commId_.c_str(),
+        static_cast<int32_t>(ret));
+    return (ret == HCCL_SUCCESS) ? HCCL_SUCCESS : static_cast<HcclResult>(ret);
 }
 
 } // namespace hccl

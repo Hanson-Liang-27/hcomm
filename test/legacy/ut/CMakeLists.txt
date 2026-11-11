@@ -64,12 +64,14 @@ target_include_directories(hccl_v2_utest PRIVATE
         ${HCCL_CODE_ROOT}/include/hccl
         ${HCCL_CODE_ROOT}/pkg_inc
         ${HCCL_CODE_ROOT}/pkg_inc/hccl
+        ${HCCL_CODE_ROOT}/pkg_inc/hcomm
         ${HCCL_CODE_ROOT}/pkg_inc/legacy
         ${HCCL_CODE_ROOT}/pkg_inc/legacy/hccl
 
         ${HCCL_CODE_ROOT}/test/stub/depends/include/
         ${HCCL_CODE_ROOT}/test/stub/depends/include/driver/
         ${HCCL_CODE_ROOT}/test/stub/depends/include/mmpa/
+        ${HCCL_CODE_ROOT}/test/stub/depends/include/urma/
         ${HCCL_CODE_ROOT}/test/stub/depends/pkg_inc/
         ${HCCL_CODE_ROOT}/test/stub/depends/pkg_inc/base
         ${HCCL_CODE_ROOT}/test/stub/depends/pkg_inc/profiling/
@@ -84,17 +86,22 @@ target_include_directories(hccl_v2_utest PRIVATE
         ${HCCL_CODE_ROOT}/src/base_comm/resources/hccp/inc/network/
         ${HCCL_CODE_ROOT}/src/base_comm/resources/hccp/inc/
         ${HCCL_CODE_ROOT}/src/base_comm/resources/
+        ${HCCL_CODE_ROOT}/src/base_comm/resources/flush/
         ${HCCL_CODE_ROOT}/src/base_comm/resources/endpoints/
         ${HCCL_CODE_ROOT}/src/base_comm/resources/reged_mems/
         ${HCCL_CODE_ROOT}/src/base_comm/common/
         ${HCCL_CODE_ROOT}/src/base_comm/resources/southbound_adpt/
+        ${HCCL_CODE_ROOT}/src/base_comm/resources/hccp/external_depends/aubdfx
         ${HCCL_CODE_ROOT}/src/base_comm/common/debug/
         ${HCCL_CODE_ROOT}/src/base_comm/primitives/aicpu/task_cache
         ${HCCL_CODE_ROOT}/src/base_comm/primitives/api_c_adpt/
         ${HCCL_CODE_ROOT}/src/base_comm/dfx/
         ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/
+        ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/cpu_thread/legacy_dpu_thread/
+        ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/api_c_adpt/
         ${HCCL_CODE_ROOT}/src/base_comm/dfx/aicpu/
         ${HCCL_CODE_ROOT}/src/base_comm/dfx/aicpu/common/
+        ${HCCL_CODE_ROOT}/src/coll_communicator_mgr/dfx/detect_connection_anomalies/
 
         ${HCCL_LLT_ROOT}/common/virtual_topo_stub/
         ${HCCL_LLT_ROOT}/ut/framework/topo/ranktable/
@@ -111,7 +118,7 @@ target_link_libraries(hccl_v2_utest PRIVATE
     -pthread
     # hccl_llt
     -Wl,--whole-archive
-    -Wl,--no-whole-archi
+    -Wl,--no-whole-archive
     -lgcov
     -lrt
     -ldl
@@ -157,3 +164,5 @@ add_subdirectory(unified_platform)
 
 enable_testing()
 add_test(NAME hccl_v2_utest COMMAND hccl_v2_utest)
+
+target_include_directories(hccl_v2_utest PRIVATE ${HCOMM_RES_TREE_INCLUDES})

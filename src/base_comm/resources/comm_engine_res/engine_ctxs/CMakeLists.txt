@@ -9,7 +9,6 @@
 # -----------------------------------------------------------------------------------------------------------
 
 set(src_list
-    independent_op_context_manager.cc
 )
 
 if(TARGET hcomm_base_obj)
@@ -21,8 +20,8 @@ if(TARGET hcomm_base_obj)
     )
 endif()
 
-if(TARGET ccl_kernel)
-    target_include_directories(ccl_kernel PRIVATE
+if(TARGET base_comm_aicpu)
+    target_include_directories(base_comm_aicpu PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()

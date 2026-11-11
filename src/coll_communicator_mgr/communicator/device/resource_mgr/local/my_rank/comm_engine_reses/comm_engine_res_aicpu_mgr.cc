@@ -15,7 +15,6 @@ CommEngineResAicpuMgr::CommEngineResAicpuMgr(
     hccl::HcclCommDfxLite& dfx, std::function<HcclResult(bool)> checkExecStatusCallback)
 {
     threadMgr_ = std::make_unique<ThreadAicpuMgr>(dfx, std::move(checkExecStatusCallback));
-    notifyMgr_ = std::make_unique<NotifyAicpuMgr>();
     HCCL_INFO("[CommEngineResAicpuMgr][%s] constructed", __func__);
 }
 
@@ -27,28 +26,11 @@ HcclResult CommEngineResAicpuMgr::InitThreads(ThreadMgrAicpuParam* param)
     return threadMgr_->InitThreads(param);
 }
 
-HcclResult CommEngineResAicpuMgr::NotifyFree(NotifyMgrAicpuParam* param)
-{
-    CHK_SMART_PTR_NULL(notifyMgr_);
-    return notifyMgr_->NotifyFree(param);
-}
+const std::vector<ThreadHandle>& CommEngineResAicpuMgr::GetAllThread() { return threadMgr_->GetAllThread(); }
 
-HcclResult CommEngineResAicpuMgr::NotifyAlloc(NotifyMgrAicpuParam* param)
+const std::vector<ThreadHandle>& CommEngineResAicpuMgr::GetAllCpuDeviceThread()
 {
-    CHK_SMART_PTR_NULL(notifyMgr_);
-    return notifyMgr_->NotifyAlloc(param);
-}
-
-void CommEngineResAicpuMgr::ReserveNotifyCapacity(size_t n)
-{
-    if (notifyMgr_) {
-        notifyMgr_->ReserveNotifyCapacity(n);
-    }
-}
-
-const std::vector<std::shared_ptr<hccl::Thread>>& CommEngineResAicpuMgr::GetAllThread()
-{
-    return threadMgr_->GetAllThread();
+    return threadMgr_->GetAllCpuDeviceThread();
 }
 
 std::shared_mutex& CommEngineResAicpuMgr::GetThreadMutex() { return threadMgr_->GetThreadMutex(); }

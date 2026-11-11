@@ -9,7 +9,7 @@
  */
 
 #include "dev_aicpu_ts_channel_mgr.h"
-#include "dev_aicpu_ts_roce_channel.h"
+#include "dev_aicpu_ts_roce_dev_loc_channel.h"
 #include "dev_aicpu_ts_hccs_channel.h"
 #include "log.h"
 
@@ -29,28 +29,25 @@ DevAicpuTsChannel* DevAicpuTsChannelMgr::GetOrCreateAicpuTsChannel(hcomm::HcommC
 
     std::unique_ptr<DevAicpuTsChannel> channel;
     switch (kind) {
-        case hcomm::HcommChannelKind::AICPU_TS_ROCE:
-            channel = std::make_unique<DevAicpuTsRoceChannel>();
+        case hcomm::HcommChannelKind::AICPU_TS_ROCE_DEV_LOC:
+            channel = std::make_unique<DevAicpuTsRoceDevLocChannel>();
             break;
         case hcomm::HcommChannelKind::AICPU_TS_HCCS:
             channel = std::make_unique<hccl::DevAicpuTsHccsChannel>();
             break;
         default:
-            HCCL_ERROR(
-                "[DevAicpuTsChannelMgr][GetOrCreateAicpuTsChannel] unsupported kind[%u]", static_cast<uint32_t>(kind));
+            HCCL_ERROR("[DevAicpuTsChannelMgr::%s] unsupported kind[%u]", __func__, static_cast<uint32_t>(kind));
             return nullptr;
     }
 
     if (channel == nullptr) {
-        HCCL_ERROR(
-            "[DevAicpuTsChannelMgr][GetOrCreateAicpuTsChannel] alloc failed for kind[%u]", static_cast<uint32_t>(kind));
+        HCCL_ERROR("[DevAicpuTsChannelMgr::%s] alloc failed for kind[%u]", __func__, static_cast<uint32_t>(kind));
         return nullptr;
     }
 
     DevAicpuTsChannel* ptr = channel.get();
     channelMap_.emplace(kind, std::move(channel));
-    HCCL_DEBUG(
-        "[DevAicpuTsChannelMgr][GetOrCreateAicpuTsChannel] created channel for kind[%u]", static_cast<uint32_t>(kind));
+    HCCL_DEBUG("[DevAicpuTsChannelMgr::%s] created channel for kind[%u]", __func__, static_cast<uint32_t>(kind));
     return ptr;
 }
 
@@ -59,10 +56,10 @@ bool DevAicpuTsChannelMgr::DestroyChannel(ChannelHandle handle)
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& entry : channelMap_) {
         if (entry.second && entry.second->Destroy(handle)) {
-            HCCL_DEBUG("[DevAicpuTsChannelMgr][DestroyChannel] destroyed handle[0x%llx]", handle);
+            HCCL_DEBUG("[DevAicpuTsChannelMgr::%s] destroyed handle[0x%llx]", __func__, handle);
             return true;
         }
     }
-    HCCL_WARNING("[DevAicpuTsChannelMgr][DestroyChannel] handle[0x%llx] not found", handle);
+    HCCL_WARNING("[DevAicpuTsChannelMgr::%s] handle[0x%llx] not found", __func__, handle);
     return false;
 }

@@ -13,17 +13,17 @@
 #include "hccl/hccl_res.h"
 #include "log.h"
 #include "roce_reged_mem_mgr.h"
-#include "../common/orion_adpt_utils.h"
+#include "common/orion_adpt_utils_pub.h"
 #include "endpoint_remote_reged_mem_mgr.h"
 #include "proc_reged_mem_mgr_cache.h"
+#include "base_comm_node_accessors.h"
 #include "host_socket_handle_manager.h"
 #include "adapter_rts_common.h"
-#include "dev_type_utils.h"
+#include "common/dev_type_utils_pub.h"
 #include "hccp_peer_manager.h"
-#include "server_socket_manager.h"
+#include "server_socket_mgr.h"
 #include "rdma_handle_manager.h"
 #include "mgr/endpoint_ctx_mgr.h"
-#include "hcomm_res_mgr.h"
 #include "hccp.h"
 
 using Hccl::HcclException;
@@ -56,7 +56,7 @@ HcclResult CpuRoceEndpoint::ReleaseEndpointCtx()
     // 先放掉自身引用，当use_count 只剩 map 持有的 1 份时再触发 EndpointCtxMgr 移除
     EndpointCtxKey key = endpointCtx_->key;
     endpointCtx_.reset();
-    HcommResMgr::GetInstance().GetDeviceResMgr(key.devPhyId).GetEndpointCtxMgr().Release(key);
+    GetEndpointCtxMgr(key.devPhyId).Release(key);
     return HCCL_SUCCESS;
 }
 
@@ -64,9 +64,9 @@ HcclResult CpuRoceEndpoint::AttachCache(
     const MemMgrCacheKey& key, const std::function<std::shared_ptr<LocalRegedMemMgr>()>& creator)
 {
     cacheKey_ = key;
-    cacheKeepAlive_ = ProcRegedMemMgrCache::GetHolder();
-    // 进程级 mgr 只管本端内存（跨 endpoint 复用）；远端内存由本实例的 remoteMemMgr_ 自管
-    localMemMgr_ = cacheKeepAlive_->GetOrCreate(cacheKey_, creator);
+    cacheAlias_ = GetProcRegedMemMgrCacheHolder();
+    // 进程级 mgr 只承担硬件注册与 alias 去重（跨 endpoint 复用）；本实例归属记录见 RecordLocalMemHandle
+    localMemMgr_ = cacheAlias_->GetOrCreate(cacheKey_, creator);
     if (localMemMgr_ == nullptr) {
         HCCL_ERROR("[CpuRoceEndpoint][%s] localMemMgr_ is null", __func__);
         CHK_RET(ReleaseCache());
@@ -76,14 +76,31 @@ HcclResult CpuRoceEndpoint::AttachCache(
     return HCCL_SUCCESS;
 }
 
+HcclResult CpuRoceEndpoint::RecordLocalMemHandle(void* memHandle)
+{
+    return RecordLocalMemHandleImpl<RoceRegedMemMgr, Hccl::LocalRdmaRmaBuffer>(
+        memHandle, localMemMgr_, localMemMtx_, localMemRecords_);
+}
+
+HcclResult CpuRoceEndpoint::RemoveLocalMemHandle(void* memHandle)
+{
+    return RemoveLocalMemHandleImpl<Hccl::LocalRdmaRmaBuffer>(memHandle, localMemMtx_, localMemRecords_);
+}
+
+HcclResult CpuRoceEndpoint::GetAllLocalMemHandles(void** memHandles, uint32_t* memHandleNum)
+{
+    return GetAllLocalMemHandlesImpl<Hccl::LocalRdmaRmaBuffer>(
+        localMemMtx_, localMemRecords_, memHandles, memHandleNum);
+}
+
 HcclResult CpuRoceEndpoint::ReleaseCache()
 {
-    if (cacheKeepAlive_ == nullptr) {
-        HCCL_WARNING("[CpuRoceEndpoint][%s] cacheKeepAlive_ is null, nothing to release", __func__);
+    if (cacheAlias_ == nullptr) {
+        HCCL_WARNING("[CpuRoceEndpoint][%s] cacheAlias_ is null, nothing to release", __func__);
         return HCCL_E_PTR;
     }
-    cacheKeepAlive_->Release(cacheKey_);
-    cacheKeepAlive_.reset();
+    cacheAlias_->Release(cacheKey_);
+    cacheAlias_.reset();
     return HCCL_SUCCESS;
 }
 
@@ -108,12 +125,9 @@ HcclResult CpuRoceEndpoint::Init()
     EXCEPTION_CATCH(Hccl::HccpPeerManager::GetInstance().Init(devId), return HCCL_E_INTERNAL);
     u32 devPhyId = 0;
     CHK_RET(hrtGetDevicePhyIdByIndex(devId, devPhyId));
-    // RdmaHandleManager 调用收口到 EndpointCtxMgr（per-device，经 HcommBaseResMgr 访问）
+    // RdmaHandleManager 调用收口到 EndpointCtxMgr（per-device，经 hcomm::GetEndpointCtxMgr 访问器）
     EndpointCtxKey ctxKey{devPhyId, COMM_PROTOCOL_ROCE, endpointDesc_.loc.locType, ipAddr};
-    CHK_RET(HcommResMgr::GetInstance()
-                .GetDeviceResMgr(ctxKey.devPhyId)
-                .GetEndpointCtxMgr()
-                .Acquire(ctxKey, false, endpointCtx_));
+    CHK_RET(GetEndpointCtxMgr(ctxKey.devPhyId).Acquire(ctxKey, false, endpointCtx_));
     CHK_PTR_NULL(endpointCtx_);
     ctxHandle_ = endpointCtx_->ctxHandle;
     HCCL_INFO(

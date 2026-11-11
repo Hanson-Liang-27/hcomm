@@ -9,6 +9,7 @@
  */
 
 #include "remote_rma_buffer.h"
+#include "common/cast_utils_pub.h"
 #include "null_ptr_exception.h"
 #include "internal_exception.h"
 #include "exchange_ub_buffer_dto.h"
@@ -34,6 +35,7 @@ RemoteIpcRmaBuffer::RemoteIpcRmaBuffer(const Serializable& rmtDto, uint8_t pathM
     ipcOffset = dto.offset;
     size = dto.size;
     memInfo = dto.memInfo;
+    memType = dto.memType;
     (void)memcpy_s(ipcName, RTS_IPC_MEM_NAME_LEN, dto.name, RTS_IPC_MEM_NAME_LEN);
     HCCL_INFO(
         "[RemoteIpcRmaBuffer][RemoteIpcRmaBuffer]ipcAddr[%llu] ipcOffset[%llu] ipcName[%s] memInfo[%s]  pathMode[%u]",
@@ -62,6 +64,7 @@ RemoteIpcRmaBuffer::RemoteIpcRmaBuffer(const Serializable& rmtDto, const string 
     ipcOffset = dto.offset;
     size = dto.size;
     memInfo = dto.memInfo;
+    memType = dto.memType;
     (void)memcpy_s(ipcName, RTS_IPC_MEM_NAME_LEN, dto.name, RTS_IPC_MEM_NAME_LEN);
     HCCL_INFO(
         "[RemoteIpcRmaBuffer][RemoteIpcRmaBuffer] tag[%s] ipcAddr[%llu] ipcOffset[%llu] ipcName[%s] memInfo[%s] "
@@ -108,7 +111,7 @@ bool RemoteIpcRmaBuffer::OpenIpcMemory()
     }
     if (ret != ACL_SUCCESS && ret != ACL_ERROR_RT_LINK_TYPE_NOT_SUPPORTED) {
         HCCL_ERROR("RemoteIpcRmaBuffer: aclrtIpcMemSetAttr failed attrValue = %u, ret = %d", attrValue, ret);
-        ipcPtr = NULL;
+        ipcPtr = nullptr;
         addr = 0;
         isOpened = false;
         return false;
@@ -119,7 +122,7 @@ bool RemoteIpcRmaBuffer::OpenIpcMemory()
         isOpened = false;
         return false;
     }
-    addr = reinterpret_cast<uintptr_t>(ipcPtr) + ipcOffset;
+    addr = ReinterpretAs<uintptr_t>(ipcPtr) + ipcOffset;
     isOpened = true;
     return true;
 }
@@ -132,7 +135,7 @@ bool RemoteIpcRmaBuffer::OpenIpcMemoryLegacy()
         isOpened = false;
         return false;
     }
-    addr = reinterpret_cast<uintptr_t>(ipcPtr) + ipcOffset;
+    addr = ReinterpretAs<uintptr_t>(ipcPtr) + ipcOffset;
     isOpened = true;
     return true;
 }

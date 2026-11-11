@@ -47,6 +47,9 @@
 #include "ccu_rep_funccall_v1.h"
 #include "ccu_rep_funcblock_v1.h"
 
+#include "ccu_rep_addr_funcblock_v1.h"
+#include "ccu_rep_addr_funccall_v1.h"
+
 #include "ccu_condition_v1.h"
 #include "ccu_repeat_v1.h"
 #include "ccu_loopblock_v1.h"
@@ -71,9 +74,6 @@
 #include "ccu_microcode_v1.h"
 
 #include "hccl_res.h"
-
-#include "ccu_rep_add_v1.h"
-#include "ccu_rep_assign_v1.h"
 
 #include "ccu_rep_write_var_atomic.h"
 #include "ccu_rep_write_with_cnt_inc.h"

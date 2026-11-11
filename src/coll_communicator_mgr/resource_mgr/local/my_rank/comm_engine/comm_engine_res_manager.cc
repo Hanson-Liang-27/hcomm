@@ -23,11 +23,8 @@ HcclResult CommEngineResMgr::Init(
         notifyNumPerThread);
     if (!threadMgr_) {
         EXCEPTION_CATCH(
-            threadMgr_ = std::make_unique<ThreadMgr>(threadNum, notifyNumPerThread, commId, callbacks),
+            threadMgr_ = std::make_unique<ThreadMgr>(threadNum, notifyNumPerThread, commId, binHandle, callbacks),
             return HCCL_E_PTR);
-    }
-    if (!notifyMgr_) {
-        EXCEPTION_CATCH(notifyMgr_ = std::make_unique<NotifyManager>(commId, binHandle, callbacks), return HCCL_E_PTR);
     }
     return HCCL_SUCCESS;
 }
@@ -76,19 +73,6 @@ CommEngineResMgr::HcclGetNotifyNumInThread(ThreadHandle thread, [[maybe_unused]]
     return threadMgr_->HcclGetNotifyNumInThread(thread, notifyNum);
 }
 
-HcclResult CommEngineResMgr::HcclAllocNotify(
-    CommEngine commEngine, ::NotifyType notifyType, uint32_t notifyNum, NotifyHandle** notifyHandleList)
-{
-    CHK_SMART_PTR_NULL(threadMgr_);
-    return notifyMgr_->HcclAllocNotify(commEngine, notifyType, notifyNum, notifyHandleList);
-}
-
-HcclResult CommEngineResMgr::HcommFreeNotify(uint32_t notifyNum, NotifyHandle* notifyHandleList)
-{
-    CHK_SMART_PTR_NULL(threadMgr_);
-    return notifyMgr_->HcommFreeNotify(notifyNum, notifyHandleList);
-}
-
 HcclResult CommEngineResMgr::HcclThreadExportToCommEngine(
     uint32_t threadNum, const ThreadHandle* threads, CommEngine dstCommEngine, ThreadHandle* exportedThreads)
 {
@@ -108,6 +92,13 @@ HcclResult CommEngineResMgr::HcclDedicatedThreadAcquire(
 {
     CHK_SMART_PTR_NULL(threadMgr_);
     return threadMgr_->HcclDedicatedThreadAcquire(useType, notifyNumPerThread, thread);
+}
+
+HcclResult
+CommEngineResMgr::HcclDedicatedThreadDfx(std::function<HcclResult(u32, u32, const Hccl::TaskParam&, u64)> dfxCallback)
+{
+    CHK_SMART_PTR_NULL(threadMgr_);
+    return threadMgr_->HcclDedicatedThreadDfx(dfxCallback);
 }
 
 HcclResult CommEngineResMgr::RegisterOrderLaunchThread(ThreadHandle thread)
@@ -131,15 +122,6 @@ HcclResult CommEngineResMgr::ResetCommLocalNotifies()
             "[CommEngineResMgr][ResetCommLocalNotifies] ResetThreadLocalNotifies failed, ret[0x%016llx]",
             HCCL_ERROR_CODE(ret));
         return ret;
-    }
-    if (notifyMgr_ != nullptr) {
-        ret = notifyMgr_->ResetAllocLocalNotifies();
-        if (ret != HCCL_SUCCESS) {
-            HCCL_ERROR(
-                "[CommEngineResMgr][ResetCommLocalNotifies] ResetAllocLocalNotifies failed, ret[0x%016llx]",
-                HCCL_ERROR_CODE(ret));
-            return ret;
-        }
     }
     return ret;
 }

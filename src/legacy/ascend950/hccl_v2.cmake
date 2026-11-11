@@ -43,7 +43,6 @@ target_link_libraries(hccl_v2 PRIVATE
     runtime
     acl_rt
     error_manager
-    ccl_dpu
     tsdclient
     ra
     -Wl,--as-needed
@@ -71,7 +70,6 @@ target_include_directories(hccl_v2 PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/aicpu/daemon
     ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/aicpu/inc
     ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/aicpu/one_sided_component
-    ${HCOMM_DIR}/src/legacy/ascend950/framework/communicator/hostdpu
     ${HCOMM_DIR}/src/legacy/ascend950/framework/device_mode
     ${HCOMM_DIR}/src/legacy/ascend950/framework/dfx
     ${HCOMM_DIR}/src/legacy/ascend950/framework/dfx/aicpu
@@ -90,13 +88,11 @@ target_include_directories(hccl_v2 PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend950/framework/fault_recovery
     ${HCOMM_DIR}/src/legacy/ascend950/framework/misc
     ${HCOMM_DIR}/src/legacy/ascend950/framework/misc/json_parser
-    ${HCOMM_DIR}/src/legacy/ascend950/framework/misc/mask_event
     ${HCOMM_DIR}/src/legacy/ascend950/framework/misc/whitelist
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/buffer
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/buffer/aicpu
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/connection
-    ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/connection/ub_ci_updater
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/notify
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/notify/aicpu
     ${HCOMM_DIR}/src/legacy/ascend950/framework/resource_manager/socket
@@ -197,7 +193,6 @@ target_include_directories(hccl_v2 PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/ccu_transport
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/connection
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/connection/aicpu
-    ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/connection/ub_ci_updater
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/mem
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/net_dev
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/notify
@@ -208,6 +203,9 @@ target_include_directories(hccl_v2 PRIVATE
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/task
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/transport
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/resource/transport/aicpu
+    # base_comm host-loc RoCE 模块依赖 ascend950/unified_platform/resource
+    ${HCOMM_DIR}/src/base_comm/resources/endpoint_pairs/channels/aicpu/roce_host_loc
+    ${HCOMM_DIR}/src/base_comm/resources/endpoint_pairs/channels/aicpu/roce_host_loc/device
     ${HCOMM_DIR}/src/legacy/ascend950/unified_platform/trace
     # coll_communicator_mgr dfx 头文件 (stream_lite.h -> res_pub.h)
     ${HCOMM_DIR}/src/coll_communicator_mgr/dfx
@@ -237,8 +235,11 @@ target_include_directories(hccl_v2 PRIVATE
     ${HCOMM_DIR}/src/base_comm/resources/hccp/inc/network
     ${HCOMM_DIR}/src/base_comm/resources/hccp/orion/hcomm_dev/inc/network
     # base_comm 公共头文件
+    ${HCOMM_DIR}/src/base_comm/inc
     ${HCOMM_DIR}/src/base_comm/common
     ${HCOMM_DIR}/src/base_comm/resources/comm_engine_res/threads
+    # base_comm DPU 共享类型头（dpu_types.h 等）
+    ${HCOMM_DIR}/src/base_comm/resources/comm_engine_res/threads/cpu_thread/legacy_dpu_thread
     # 外部依赖
     ${HCOMM_DIR}/external_depends/tsch
 )

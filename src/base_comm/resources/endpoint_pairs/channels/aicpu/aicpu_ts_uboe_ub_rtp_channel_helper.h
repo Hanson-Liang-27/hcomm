@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "channel.h"
-#include "aicpu_ts_channel_helper.h"
+#include "aicpu_ts_channel_entity.h"
 
 // Orion
 #include "../../../../../../src/legacy/ascend950/unified_platform/resource/socket/socket.h"
@@ -35,27 +35,21 @@ constexpr char_t FINISH_MSG[FINISH_MSG_SIZE] = "Uboe Comm Pipe ready!";
 
 class AicpuTsUboeUbRtpChannelHelper : public Channel {
 public:
-    AicpuTsUboeUbRtpChannelHelper(EndpointHandle endpointHandle, const HcommChannelDesc& channelDesc);
+    AicpuTsUboeUbRtpChannelHelper(
+        EndpointHandle endpointHandle, const HcommChannelDesc& channelDesc, CommEngine engine,
+        HcommChannelKind channelKind, const char* channelClassName);
     ~AicpuTsUboeUbRtpChannelHelper() override;
 
     HcclResult GetNotifyNum(uint32_t* notifyNum) const override;
     HcclResult GetRemoteMems(uint32_t* memNum, CommMem** remoteMem, char*** memInfos) override;
     HcclResult UpdateMemInfo(HcommMemHandle* memHandles, uint32_t memHandleNum) override;
+    std::vector<char> GetMemUpdatePack() override;
 
     HcclResult H2DResPack(std::vector<char>& buffer);
-    const HcommChannelDesc& GetChannelDesc() const override { return channelDesc_; }
     HcclResult Clean() override;
     HcclResult Resume() override;
 
-    // 数据面接口
-    HcclResult NotifyRecord(const uint32_t remoteNotifyIdx) override;
-    HcclResult NotifyWait(const uint32_t localNotifyIdx, const uint32_t timeout) override;
-    HcclResult WriteWithNotify(void* dst, const void* src, const uint64_t len, uint32_t remoteNotifyIdx) override;
-    HcclResult Write(void* dst, const void* src, uint64_t len) override;
-    HcclResult Read(void* dst, const void* src, uint64_t len) override;
-    HcclResult ChannelFence() override;
-
-    AicpuTsChannelHelper* GetAicpuTsHelper() override { return &aicpuTsHelper_; }
+    IChannelEntity* GetChannelEntity() override { return &aicpuTsEntity_; }
 
 protected:
     static constexpr u64 NORMAL_NOTIFY_VAL = 1;
@@ -64,32 +58,30 @@ protected:
     using RemoteBufferVec = std::vector<std::unique_ptr<Hccl::RemoteUbRmaBuffer>>;
     using LocalBufferVec = std::vector<Hccl::LocalUbRmaBuffer*>;
 
-    virtual HcclResult BuildConnection() = 0;
-    virtual void SendFinish() = 0;
-    virtual void RecvFinish() = 0;
+    virtual HcclResult BuildStateMachineConn() = 0;
+    virtual HcclResult SendFinish() = 0;
+    virtual HcclResult RecvFinish() = 0;
 
     HcclResult CheckSocketStatus(const std::string& socketOperator);
 
-    HcclResult ParseInputParam();
-    HcclResult BuildNotify();
+    HcclResult ParseInputParam() override;
     HcclResult BuildDrainResource();
-    HcclResult BuildSocket();
-    void BuildConn();
+    HcclResult BuildConn();
 
     bool IsSocketReady();
-    bool IsResReady();
+    HcclResult IsResReady(bool& isReady);
     bool IsConnsReady();
-    bool RecvDataProcess();
-    void SendDataSize();
-    void RecvDataSize();
-    void SendExchangeData();
-    void RecvExchangeData();
+    HcclResult RecvDataProcess(bool& needFinish);
+    HcclResult SendDataSize();
+    HcclResult RecvDataSize();
+    HcclResult SendExchangeData();
+    HcclResult RecvExchangeData();
 
     void NotifyVecPack(Hccl::BinaryStream& binaryStream);
     void BufferVecPack(Hccl::BinaryStream& binaryStream, std::vector<Hccl::LocalRmaBuffer*>& bufferVec) const;
     void DrainBufferPack(Hccl::BinaryStream& binaryStream);
     void ConnVecPack(Hccl::BinaryStream& binaryStream);
-    void RmtBufferVecUnpackProc(
+    HcclResult RmtBufferVecUnpackProc(
         u32 locNum, Hccl::BinaryStream& binaryStream, RemoteBufferVec& bufferVec, UboeRmtBufType type);
     void RmtDrainBufferUnpackProc(Hccl::BinaryStream& binaryStream);
     HcclResult ConnVecUnpackProc(Hccl::BinaryStream& binaryStream, bool& result);
@@ -103,39 +95,12 @@ protected:
     std::vector<char> GetDrainUniqueIds() const;
     std::vector<char> GetConnUniqueIds();
 
-    // --------------------- 入参 ---------------------
-    EndpointHandle endpointHandle_;
-    HcommChannelDesc channelDesc_;
-
-    // --------------------- 转换参数 ---------------------
-    EndpointDesc localEp_{};
-    EndpointDesc remoteEp_{};
-    uint32_t notifyNum_{0};
-
     // --------------------- 具体成员 ---------------------
-    Hccl::Socket* socket_{nullptr};
-    // 保存 socketConfig 的拷贝并记录裸指针，供析构时 DestroySocket 回收引用计数。须在 GetSocket 之前调用，
-    // 避免 GetSocket 成功后 holder 构造异常（bad_alloc）导致 socketConfig_ 未设置、析构无法回收引用计数。
-    void SaveSocketConfig(const Hccl::SocketConfig& socketConfig)
-    {
-        socketConfigHolder_ = std::make_unique<Hccl::SocketConfig>(socketConfig);
-        socketConfig_ = socketConfigHolder_.get();
-    }
-
-    std::unique_ptr<Hccl::SocketConfig> socketConfigHolder_{nullptr};
-    const Hccl::SocketConfig* socketConfig_{nullptr};
-    RdmaHandle rdmaHandle_{nullptr};
-    std::unique_ptr<Hccl::UbMemTransport> memTransport_{nullptr};
-    Hccl::BaseMemTransport::CommonLocRes commonRes_{};
     std::vector<std::unique_ptr<Hccl::DevUbConnection>> connections_{};
-    std::vector<std::unique_ptr<Hccl::UbLocalNotify>> localNotifies_{};
-    std::unique_ptr<Hccl::Socket> serverSocket_;
 
     std::unique_ptr<Hccl::UbLocalNotify> drainNotify_;        // 本端drain notify
     std::unique_ptr<Hccl::LocalUbRmaBuffer> drainBuffer_;     // 本端常量1 buffer
     std::unique_ptr<Hccl::RemoteUbRmaBuffer> rmtDrainBuffer_; // 对端常量1 buffer
-
-    ChannelStatus channelStatus{ChannelStatus::INIT};
 
     u32 type_{1}; // 默认为UB
     u32 bufferNum_{0};
@@ -149,21 +114,11 @@ protected:
     std::vector<char> recvFinishMsg_{};
     std::vector<char> sendData_{};
     std::vector<char> sendFinishMsg_{};
-    bool isRecvFirst_{false};
 
-    Hccl::IpAddress locAddr_;
-    Hccl::IpAddress rmtAddr_;
-
-    std::mutex remoteMemsMutex_;
-    bool cacheValid_ = false;
-    std::vector<CommMem> remoteUserMems_;
-    std::vector<std::string> memInfoCopies_;
-    std::vector<char*> memInfoPointers_;
     DevBaseAttr devBaseAttr_{};
-    uint32_t devicePhyId_{};
 
 private:
-    AicpuTsChannelHelper aicpuTsHelper_;
+    AicpuTsChannelEntity aicpuTsEntity_;
 };
 
 } // namespace hcomm

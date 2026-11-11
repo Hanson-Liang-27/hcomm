@@ -12,6 +12,7 @@
 #define __AICPU_HCCL_PROCESS_H__
 
 #include <memory>
+#include "aicpu_init_param.h"
 #include <vector>
 #include <string>
 #include "common.h"
@@ -19,7 +20,7 @@
 #include "common/aicpu_hccl_def.h"
 #include "hdc_pub.h"
 #include "stream_pub.h"
-#include "aicpu_launch_manager.h"
+#include "comm_engine/aicpu_launch_manager_pub.h"
 
 class AicpuHcclProcess {
 public:
@@ -48,7 +49,8 @@ public:
     WaitAsyncFlag(hccl::Transport::Buffer* localFlagBufforCheck, const uint32_t flagValue, uint64_t timeOut);
     static HcclResult AicpuIndOpChannelInit(HcclIndOpChannelRemoteResV3* commParam);
     static HcclResult AicpuIndOpThreadInit(ThreadMgrAicpuParam* param);
-    static HcclResult AicpuIndOpNotifyInit(NotifyMgrAicpuParam* param);
+    // 仅可经 c_adpt 的 RunAicpuCommInit 调用：其入口已前置 hrtSet* 三连（workModeAicpu/device/devType），
+    // InitAicpuIndOp 内谓词依赖该全局态取数；独立直调将读到过期设备类型导致分支错误
     static HcclResult AicpuIndOpCommInit(CommAicpuParam* commAicpuParam);
 
     // IndOp dfx

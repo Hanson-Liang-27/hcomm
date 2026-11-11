@@ -8,12 +8,14 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
 #include "adapter_error_manager_pub.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 #include "hcomm_adapter_hccp.h"
 
 #include <algorithm>
+#include <mutex>
+#include <unistd.h>
 
 #include "securec.h"
 #include "log.h"
@@ -111,6 +113,62 @@ HcclResult RaGetDevEidInfos(const RaInfo& raInfo, std::vector<DevEidInfo>& devEi
     return HcclResult::HCCL_SUCCESS;
 }
 
+// 同步请求失败按返回码分流上报: ENOMEM上报EI0011(内存不足), ENOSPC/ENOSR上报EI0007(资源耗尽)
+static void ReportResourceExhausted(
+    int32_t ret, const std::string& resourceType, const std::string& opName, const std::string& memSizeDesc)
+{
+    if (IS_DEV_MEM_EXHAUSTED(ret)) {
+        RPT_ENV_ERR(true, "EI0011", std::vector<std::string>({"memory_size"}), std::vector<std::string>({memSizeDesc}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] %s failed due to insufficient memory, ret[%d]",
+            LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
+            HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), opName.c_str(), ret);
+        return;
+    }
+    if (IS_RESOURCE_EXHAUSTED(ret)) {
+        RPT_ENV_ERR(
+            true, "EI0007", std::vector<std::string>({"resource_type", "resource_info"}),
+            std::vector<std::string>({resourceType, opName}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] %s failed: %s resources are exhausted, ret[%d]",
+            LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
+            HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), opName.c_str(), resourceType.c_str(), ret);
+    }
+}
+
+// 资源类型异步请求失败按返回码分流上报: ENOMEM上报EI0011(内存不足), ENOSPC/ENOSR上报EI0007(资源耗尽)
+static void ReportAsyncResourceExhausted(const struct AsyncReqResult& reqResult)
+{
+    std::string resourceType;
+    std::string opName;
+    std::string memSizeDesc;
+    switch (reqResult.interfaceOpcode) {
+        case HCCP_OP_CTX_QP_CREATE:
+            resourceType = "jetty";
+            opName = "CreateJettyAsync";
+            memSizeDesc = "16384~2097152";
+            break;
+        case HCCP_OP_CTX_QP_IMPORT:
+            resourceType = "jetty";
+            opName = "ImportJettyAsync";
+            memSizeDesc = "N/A";
+            break;
+        case HCCP_OP_LMEM_REG:
+            resourceType = "segment";
+            opName = "RegisterSegAsync";
+            memSizeDesc = "N/A";
+            break;
+        case HCCP_OP_GET_TP_INFO_LIST:
+            resourceType = "tp";
+            opName = "GetTpListAsync";
+            memSizeDesc = "N/A";
+            break;
+        default:
+            return;
+    }
+    ReportResourceExhausted(reqResult.reqResult, resourceType, opName, memSizeDesc);
+}
+
 RequestResult HccpGetAsyncReqResult(RequestHandle& reqHandle)
 {
     if (reqHandle == 0) {
@@ -127,10 +185,11 @@ RequestResult HccpGetAsyncReqResult(RequestHandle& reqHandle)
 
     // 返回码非0代表调用查询接口失败，当前仅入参错误时触发
     if (ret != 0) {
+        // interfaceOpcode数值为结构体初始化的0，预留
         HCCL_ERROR(
             "[%s] failed to get asynchronous request result[%d], "
-            "reqhandle[%llx].",
-            __func__, ret, reqHandle);
+            "reqhandle[%llx] interfaceOpCode[%u].",
+            __func__, ret, reqHandle, reqResult.interfaceOpcode);
         return RequestResult::GET_REQ_RESULT_FAILED;
     }
 
@@ -142,21 +201,11 @@ RequestResult HccpGetAsyncReqResult(RequestHandle& reqHandle)
     }
 
     if (reqResult.reqResult != 0) {
-        const bool isJettyExhausted
-            = reqResult.interfaceOpcode == HCCP_OP_CTX_QP_CREATE && IS_JETTY_RESOURCE_EXHAUSTED(reqResult.reqResult);
-        RPT_ENV_ERR(
-            isJettyExhausted, "EI0007", std::vector<std::string>({"resource_type", "resource_info"}),
-            std::vector<std::string>({"jetty", "CreateJettyAsync"}));
-        if (isJettyExhausted) {
-            HCCL_ERROR(
-                "[%s][%s] errNo[0x%016llx] CreateJettyAsync failed: jetty resources are exhausted, ret[%d]",
-                LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
-                HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), reqResult.reqResult);
-        }
+        ReportAsyncResourceExhausted(reqResult);
         HCCL_ERROR(
             "[%s] failed, the asynchronous request "
-            "error[%d], reqhandle[%llx].",
-            __func__, reqResult.reqResult, tmpReqHandle);
+            "error[%d], reqhandle[%llx] interfaceOpCode[%u].",
+            __func__, reqResult.reqResult, tmpReqHandle, reqResult.interfaceOpcode);
         return RequestResult::ASYNC_REQUEST_FAILED;
     }
 
@@ -174,7 +223,7 @@ const std::map<HrtJettyMode, JettyMode> HRT_JETTY_MODE_MAP
        {HrtJettyMode::CCU_CCUM_CACHE, JettyMode::JETTY_MODE_CCU},
        {HrtJettyMode::CCU_TA_CACHE, JettyMode::JETTY_MODE_CCU_TA_CACHE}};
 
-constexpr uint8_t RNR_RETRY = 7;
+constexpr uint8_t RNR_RETRY = 7; // 950不支持RNR重传
 constexpr uint32_t RQ_DEPTH = 64;
 
 HcclResult
@@ -248,15 +297,7 @@ HccpUbCreateJetty(const CtxHandle ctxhandle, const HrtRaUbCreateJettyParam& in, 
             "sqDepth[%u] sq.buffVa[%llx] sq.buffSize[%u].",
             __func__, ctxhandle, attr.ub.jettyId, in.jettyMode.Describe().c_str(), attr.sqDepth,
             attr.ub.extMode.sq.buffVa, attr.ub.extMode.sq.buffSize);
-        RPT_ENV_ERR(
-            IS_JETTY_RESOURCE_EXHAUSTED(ret), "EI0007", std::vector<std::string>({"resource_type", "resource_info"}),
-            std::vector<std::string>({"jetty", "CreateJetty"}));
-        if (IS_JETTY_RESOURCE_EXHAUSTED(ret)) {
-            HCCL_ERROR(
-                "[%s][%s] errNo[0x%016llx] CreateJetty failed: jetty resources are exhausted, ret[%d]",
-                LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
-                HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), ret);
-        }
+        ReportResourceExhausted(ret, "jetty", "CreateJetty", "16384~2097152");
         return HcclResult::HCCL_E_NETWORK;
     }
 
@@ -407,6 +448,7 @@ static HcclResult ImportJetty(
             "protocol[%s].",
             __func__, ctxHandle, cfg.tpHandle, cfg.peerTpHandle, cfg.tag, cfg.txPsn, cfg.rxPsn,
             protocol.Describe().c_str());
+        ReportResourceExhausted(ret, "jetty", "ImportJetty", "N/A");
         return HcclResult::HCCL_E_NETWORK;
     }
 
@@ -650,6 +692,189 @@ HcclResult HccpGetCtpEnable(void* ctxHandle, bool& ctpEnable)
     }
     HCCL_INFO("[%s] ctxHandle[%p], ctpEnable[%d].", __func__, ctxHandle, ctpEnable);
     return HCCL_SUCCESS;
+}
+
+namespace {
+    // 快照通知状态：二维【卡粒度×die粒度】，每个 (设备, die) 的 start/end 无论成败各只通知一次；
+    // start 成功时按 (设备, die) 记录各自 ctxHandle，end 时用该 die 自己的 ctx 下发
+    using SnapshotDieKey = std::pair<u32, u32>; // (devPhyId, dieId)
+    struct SnapshotStartedEntry {
+        SnapshotDieKey key; // (devPhyId, dieId)
+        void* ctxHandle;    // start 成功时的 ctx，end 按各自 die 下发
+        uint64_t generation{0}; // 记账时的设备 reset 代际，下发前比对，代际已变则放弃（句柄可能已销毁）
+    };
+    std::mutex gSnapshotMutex;
+    std::vector<SnapshotDieKey> gSnapshotStartNotifiedKeys; // 已发起 start 通知的 (设备, die)（无论成败）
+    std::vector<SnapshotDieKey> gSnapshotEndNotifiedKeys;   // 已发起 end 通知的 (设备, die)（无论成败）
+    std::vector<SnapshotStartedEntry> gSnapshotStartedKeys; // start 成功、待结束的 (设备, die, ctxHandle)
+    std::unordered_map<u32, uint64_t> gSnapshotGeneration;  // devPhyId → reset 代际（reset 时递增）
+
+    bool IsKeyNotified(const std::vector<SnapshotDieKey>& notifiedKeys, u32 devPhyId, u32 dieId)
+    {
+        return std::find(notifiedKeys.begin(), notifiedKeys.end(), SnapshotDieKey(devPhyId, dieId))
+               != notifiedKeys.end();
+    }
+
+    bool IsKeyInStarted(const std::vector<SnapshotStartedEntry>& startedKeys, u32 devPhyId, u32 dieId)
+    {
+        return std::find_if(
+                   startedKeys.begin(), startedKeys.end(),
+                   [devPhyId, dieId](const SnapshotStartedEntry& entry) {
+                       return entry.key == SnapshotDieKey(devPhyId, dieId);
+                   })
+               != startedKeys.end();
+    }
+
+    void RemoveKeyFromStarted(u32 devPhyId, u32 dieId)
+    {
+        gSnapshotStartedKeys.erase(
+            std::remove_if(
+                gSnapshotStartedKeys.begin(), gSnapshotStartedKeys.end(),
+                [devPhyId, dieId](const SnapshotStartedEntry& entry) {
+                    return entry.key == SnapshotDieKey(devPhyId, dieId);
+                }),
+            gSnapshotStartedKeys.end());
+    }
+
+    void RemoveKeyFromEndNotified(u32 devPhyId, u32 dieId)
+    {
+        gSnapshotEndNotifiedKeys.erase(
+            std::remove_if(
+                gSnapshotEndNotifiedKeys.begin(), gSnapshotEndNotifiedKeys.end(),
+                [devPhyId, dieId](const SnapshotDieKey& key) {
+                    return key == SnapshotDieKey(devPhyId, dieId);
+                }),
+            gSnapshotEndNotifiedKeys.end());
+    }
+
+    // 能力判定（RaHasCapability）与事件下发（RaCtxNotifyEvent）均不持锁执行，避免阻塞故障上报链路；
+    // 锁内仅做状态判定与账本更新（去重 key 登记、通知中账本回滚）
+    HcclResult NotifySingleDieSnapshot(void* ctxHandle, u32 devPhyId, u32 dieId, bool start, uint64_t generation)
+    {
+        {
+            // 下发前短锁比对代际：reset 已递增则放弃下发（账本已清、句柄可能已销毁，无需回滚）
+            std::lock_guard<std::mutex> lock(gSnapshotMutex);
+            auto genIt = gSnapshotGeneration.find(devPhyId);
+            if (genIt != gSnapshotGeneration.end() && genIt->second != generation) {
+                return HCCL_SUCCESS;
+            }
+        }
+        struct RaInfo raInfo = {};
+        raInfo.mode = NETWORK_OFFLINE;
+        raInfo.phyId = devPhyId;
+        if (!RaHasCapability(&raInfo, RA_CAP_NET_DFX_INFO_EVENT)) {
+            if (!start) {
+                // end 未真正下发：短锁回滚 end 去重登记并保留待结束账本，后续故障可重试（不永久漏掉）
+                std::lock_guard<std::mutex> lock(gSnapshotMutex);
+                RemoveKeyFromEndNotified(devPhyId, dieId);
+            }
+            return HCCL_SUCCESS;
+        }
+
+        struct CtxNotifyEvent event = {};
+        event.eventType = NET_DFX_SNAPSHOT_EVENT_TYPE;
+        event.eventInfo.netDfxInfo.pid = static_cast<uint32_t>(getpid());
+        event.eventInfo.netDfxInfo.status = start ? 1U : 0U;
+        int32_t retCode = RaCtxNotifyEvent(ctxHandle, &event);
+        if (retCode != 0) {
+            if (!start) {
+                // end 未真正下发：短锁回滚 end 去重登记并保留待结束账本，后续故障可重试（不永久漏掉）
+                std::lock_guard<std::mutex> lock(gSnapshotMutex);
+                RemoveKeyFromEndNotified(devPhyId, dieId);
+            }
+            return HCCL_E_INTERNAL;
+        }
+
+        {
+            // 事件发送成功后短锁更新采集状态（start 记录含各自 ctxHandle，供 end 时按 die 下发）
+            std::lock_guard<std::mutex> lock(gSnapshotMutex);
+            if (start) {
+                if (!IsKeyInStarted(gSnapshotStartedKeys, devPhyId, dieId)) {
+                    gSnapshotStartedKeys.push_back(SnapshotStartedEntry{
+                        SnapshotDieKey(devPhyId, dieId), ctxHandle, gSnapshotGeneration[devPhyId]});
+                }
+            } else {
+                RemoveKeyFromStarted(devPhyId, dieId);
+            }
+        }
+        HCCL_INFO(
+            "[%s] dfx snapshot notify success, devPhyId[%u], dieId[%u], start[%d]", __func__, raInfo.phyId, dieId,
+            start);
+        return HCCL_SUCCESS;
+    }
+} // namespace
+
+HcclResult HccpNotifyDfxSnapshot(void* ctxHandle, u32 devPhyId, u32 dieId, bool start)
+{
+    std::vector<SnapshotStartedEntry> notifyEntries;
+    {
+        // 短锁：仅状态判定与账本更新（notifyEntries 拷贝、去重 key 登记）；事件下发移到锁外执行
+        std::lock_guard<std::mutex> lock(gSnapshotMutex);
+        if (start) {
+            if (IsKeyNotified(gSnapshotStartNotifiedKeys, devPhyId, dieId)) {
+                return HCCL_SUCCESS;
+            }
+            CHK_PTR_NULL(ctxHandle);
+            // 记录当前 reset 代际：下发前比对，reset 后放弃在途下发（与 start 成功记账写入的代际一致）
+            notifyEntries.push_back(
+                SnapshotStartedEntry{SnapshotDieKey(devPhyId, dieId), ctxHandle, gSnapshotGeneration[devPhyId]});
+            // 发起前登记 start 去重 key（成败均只通知一次）
+            gSnapshotStartNotifiedKeys.push_back(SnapshotDieKey(devPhyId, dieId));
+        } else {
+            if (gSnapshotStartedKeys.empty()) {
+                return HCCL_SUCCESS;
+            }
+            // 结束通知：把所有已成功 start 且未发起 end 的 die 全部通知结束（各用其 start 时的 ctxHandle 下发）；
+            // 拷贝时同步登记 end 去重 key，并发 end 场景后者拷贝为空，避免锁外重复下发
+            for (const auto& entry : gSnapshotStartedKeys) {
+                if (!IsKeyNotified(gSnapshotEndNotifiedKeys, entry.key.first, entry.key.second)) {
+                    notifyEntries.push_back(entry);
+                    gSnapshotEndNotifiedKeys.push_back(entry.key);
+                }
+            }
+            if (notifyEntries.empty()) {
+                return HCCL_SUCCESS;
+            }
+        }
+    }
+
+    bool allSuccess = true;
+    for (const auto& entry : notifyEntries) {
+        if (NotifySingleDieSnapshot(entry.ctxHandle, entry.key.first, entry.key.second, start, entry.generation)
+            != HCCL_SUCCESS) {
+            allSuccess = false;
+        }
+    }
+    return allSuccess ? HCCL_SUCCESS : HCCL_E_INTERNAL;
+}
+
+void HccpResetDfxSnapshot(u32 devPhyId)
+{
+    std::lock_guard<std::mutex> lock(gSnapshotMutex);
+    // 递增该设备 reset 代际：在途下发（已拷贝 notifyEntries、锁外执行中）比对代际后放弃，彻底关闭悬垂窗口
+    ++gSnapshotGeneration[devPhyId];
+    // 按设备清理：仅移除该 devPhyId 的 (设备, die) 条目，避免误清其他在线设备的采集状态
+    gSnapshotStartNotifiedKeys.erase(
+        std::remove_if(
+            gSnapshotStartNotifiedKeys.begin(), gSnapshotStartNotifiedKeys.end(),
+            [devPhyId](const SnapshotDieKey& key) {
+                return key.first == devPhyId;
+            }),
+        gSnapshotStartNotifiedKeys.end());
+    gSnapshotEndNotifiedKeys.erase(
+        std::remove_if(
+            gSnapshotEndNotifiedKeys.begin(), gSnapshotEndNotifiedKeys.end(),
+            [devPhyId](const SnapshotDieKey& key) {
+                return key.first == devPhyId;
+            }),
+        gSnapshotEndNotifiedKeys.end());
+    gSnapshotStartedKeys.erase(
+        std::remove_if(
+            gSnapshotStartedKeys.begin(), gSnapshotStartedKeys.end(),
+            [devPhyId](const SnapshotStartedEntry& entry) {
+                return entry.key.first == devPhyId;
+            }),
+        gSnapshotStartedKeys.end());
 }
 
 HcclResult HrtRaDumpJettyContext(JettyHandle jettyHandle, u32 jettyId)

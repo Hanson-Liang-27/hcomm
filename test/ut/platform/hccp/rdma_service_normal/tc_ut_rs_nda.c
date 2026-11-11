@@ -26,6 +26,8 @@
 #define rs_nda_ut_msg(fmt, args...) fprintf(stderr, "\t>>>>> " fmt, ##args)
 
 extern __thread struct rs_cb* gRsCb;
+extern struct ibv_context_extend* RsIbvOpenExtend(struct ibv_context* context);
+extern int RsIbvQueryDeviceExtend(struct ibv_context_extend* context, struct ibv_device_attr_extend* extDevAttr);
 extern int RsQueryRdevCb(unsigned int phyId, unsigned int rdevIndex, struct RsRdevCb** rdevCb);
 extern int RsNdaQpCreateEx(struct RsQpCb* qpCb, struct ibv_qp_init_attr_extend* qpInitAttrEx, struct NdaQpInfo* info);
 extern int RsGetNdaPcieDbCb(struct RsNdaCb* ndaCb, uint64_t hva, struct NdaPcieDbCb** ndaDbCb);
@@ -43,6 +45,44 @@ int RsQueryRdevCbNdaStub(unsigned int phyId, unsigned int rdevIndex, struct RsRd
 
     *rdevCb = &ndaRdevCb;
     return 0;
+}
+
+static struct ibv_context_extend gNdaIbCtxEx;
+static uint32_t gNdaExtDevCap;
+static int gNdaDirectFlag;
+
+int RsQueryRdevCbNdaExtStub(unsigned int phyId, unsigned int rdevIndex, struct RsRdevCb** rdevCb)
+{
+    static struct RsRdevCb ndaRdevCb = {0};
+    ndaRdevCb.rsCb = gRsCb;
+    ndaRdevCb.ibCtxEx = &gNdaIbCtxEx;
+    ndaRdevCb.extDevCap = gNdaExtDevCap;
+    ndaRdevCb.directFlag = gNdaDirectFlag;
+    *rdevCb = &ndaRdevCb;
+    return 0;
+}
+
+static struct ibv_context_extend gStubIbCtxEx;
+static struct ibv_device_attr_extend gStubExtDevAttr;
+static int gStubQueryRet;
+
+struct ibv_context_extend* RsIbvOpenExtendStub(struct ibv_context* context)
+{
+    (void)context;
+    return &gStubIbCtxEx;
+}
+
+struct ibv_context_extend* RsIbvOpenExtendNullStub(struct ibv_context* context)
+{
+    (void)context;
+    return NULL;
+}
+
+int RsIbvQueryDeviceExtendStub(struct ibv_context_extend* context, struct ibv_device_attr_extend* extDevAttr)
+{
+    (void)context;
+    *extDevAttr = gStubExtDevAttr;
+    return gStubQueryRet;
 }
 
 int DlDrvMemGetAttributeStub(DVdeviceptr vptr, struct DVattribute* attr)
@@ -64,12 +104,26 @@ int DlHalHostRegisterStub(void* srcPtr, UINT64 size, UINT32 flag, UINT32 devId, 
 
 int DlHalHostUnRegisterExStub(void* srcPtr, UINT32 devId)
 {
-    uint64_t alignHva = AlignDown((uint64_t)1, RA_RS_4K_PAGE_SIZE);
+    uint64_t alignHva = RaRsAlignDown((uint64_t)1, RA_RS_4K_PAGE_SIZE);
 
     if ((uint64_t)(uintptr_t)srcPtr == alignHva) {
         return 0;
     }
     return -1;
+}
+
+static int64_t gNdaMainboardId = 0;
+static int gNdaMainboardRet = 0;
+
+int DlHalGetDeviceInfoMainboardStub(uint32_t devId, int32_t moduleType, int32_t infoType, int64_t* value)
+{
+    (void)devId;
+    (void)moduleType;
+    (void)infoType;
+    if (value != NULL) {
+        *value = gNdaMainboardId;
+    }
+    return gNdaMainboardRet;
 }
 
 void TcRsNdaGetDirectFlag()
@@ -87,6 +141,143 @@ void TcRsNdaGetDirectFlag()
     ret = RsNdaGetDirectFlag(phyId, rdevIndex, &directFlag);
     EXPECT_INT_EQ(ret, 0);
     mocker_clean();
+}
+
+void TcRsNdaGetDirectFlagExt()
+{
+    unsigned int rdevIndex = 0;
+    unsigned int phyId = 0;
+    int directFlag = 0;
+    int ret = 0;
+
+    // extDevCap 含 NDA 位 -> 返回 directFlag
+    mocker_clean();
+    gNdaExtDevCap = IBV_EXTEND_DEV_NDA;
+    gNdaDirectFlag = DIRECT_FLAG_UB;
+    mocker_invoke(RsQueryRdevCb, RsQueryRdevCbNdaExtStub, 1);
+    ret = RsNdaGetDirectFlag(phyId, rdevIndex, &directFlag);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ(directFlag, DIRECT_FLAG_UB);
+    mocker_clean();
+
+    // extDevCap 不含 NDA 位 -> 返回 NOTSUPP
+    mocker_clean();
+    gNdaExtDevCap = 0;
+    gNdaDirectFlag = DIRECT_FLAG_UB;
+    mocker_invoke(RsQueryRdevCb, RsQueryRdevCbNdaExtStub, 1);
+    ret = RsNdaGetDirectFlag(phyId, rdevIndex, &directFlag);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ(directFlag, DIRECT_FLAG_NOTSUPP);
+    mocker_clean();
+}
+
+void TcRsInitNdaCb()
+{
+    struct RsRdevCb rdevCb = {0};
+    int ret = 0;
+
+    gNdaMainboardId = 0x0300;
+    gNdaMainboardRet = 0;
+
+    // 查询成功 -> extDevCap == extDevAttr.ext_cap
+    gRsCb = calloc(1, sizeof(struct rs_cb));
+    rdevCb.rsCb = gRsCb;
+    gStubExtDevAttr.ext_cap = IBV_EXTEND_DEV_NDA | IBV_EXTEND_DEV_NDR;
+    gStubQueryRet = 0;
+    mocker_clean();
+    mocker_invoke((stub_fn_t)DlHalGetDeviceInfo, DlHalGetDeviceInfoMainboardStub, 1);
+    mocker_invoke(RsIbvOpenExtend, RsIbvOpenExtendStub, 1);
+    mocker_invoke(RsIbvQueryDeviceExtend, RsIbvQueryDeviceExtendStub, 1);
+    ret = RsInitNdaCb(&rdevCb);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ((int)rdevCb.extDevCap, (int)gStubExtDevAttr.ext_cap);
+    mocker_clean();
+    free(gRsCb);
+
+    // 查询失败 -> extDevCap == 0
+    memset(&rdevCb, 0, sizeof(rdevCb));
+    gRsCb = calloc(1, sizeof(struct rs_cb));
+    rdevCb.rsCb = gRsCb;
+    gStubQueryRet = -1;
+    mocker_clean();
+    mocker_invoke((stub_fn_t)DlHalGetDeviceInfo, DlHalGetDeviceInfoMainboardStub, 1);
+    mocker_invoke(RsIbvOpenExtend, RsIbvOpenExtendStub, 1);
+    mocker_invoke(RsIbvQueryDeviceExtend, RsIbvQueryDeviceExtendStub, 1);
+    ret = RsInitNdaCb(&rdevCb);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ((int)rdevCb.extDevCap, 0);
+    mocker_clean();
+    free(gRsCb);
+
+    // ibCtxEx == NULL -> 返回 0 且 extDevCap == 0
+    memset(&rdevCb, 0, sizeof(rdevCb));
+    gRsCb = calloc(1, sizeof(struct rs_cb));
+    rdevCb.rsCb = gRsCb;
+    mocker_clean();
+    mocker_invoke((stub_fn_t)DlHalGetDeviceInfo, DlHalGetDeviceInfoMainboardStub, 1);
+    mocker_invoke(RsIbvOpenExtend, RsIbvOpenExtendNullStub, 1);
+    ret = RsInitNdaCb(&rdevCb);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ((int)rdevCb.extDevCap, 0);
+    mocker_clean();
+    free(gRsCb);
+
+    gRsCb = NULL;
+}
+
+void TcRsInitNdaCbDirectFlag()
+{
+    /* mainboard_id 命中白名单 -> DIRECT_FLAG_UB，需与 rs_nda.c 白名单逐项保持一致 */
+    static const uint64_t ubMainboardIds[] = {
+        0x03, 0x05, 0x07,                                           /* 天成 POD */
+        0x21, 0x23, 0x25, 0x27, 0x29, 0x2B, 0x2D, 0x2F, 0x31, 0x33, /* A+K Server */
+        0x44, 0x46, 0x48, 0x4A, 0x4C,                               /* A+X Server */
+    };
+    /* 不在白名单 -> DIRECT_FLAG_PCIE（PCIE 标卡/预留/装备/EVB 等机型） */
+    static const uint64_t pcieMainboardIds[] = {
+        0x00, 0x61, 0x81, 0xC1, 0xE1, 0x04,
+    };
+    struct RsRdevCb rdevCb = {0};
+    unsigned int i = 0;
+    int ret = 0;
+
+    gRsCb = calloc(1, sizeof(struct rs_cb));
+
+    mocker_clean();
+    gNdaMainboardRet = 0;
+    mocker_invoke((stub_fn_t)DlHalGetDeviceInfo, DlHalGetDeviceInfoMainboardStub, 64);
+    /* ibCtxEx 返回 NULL，跳过 extDevCap 查询，仅验证 directFlag 判定 */
+    mocker_invoke(RsIbvOpenExtend, RsIbvOpenExtendNullStub, 64);
+
+    for (i = 0; i < sizeof(ubMainboardIds) / sizeof(ubMainboardIds[0]); i++) {
+        gNdaMainboardId = (int64_t)ubMainboardIds[i];
+        memset(&rdevCb, 0, sizeof(rdevCb));
+        rdevCb.rsCb = gRsCb;
+        ret = RsInitNdaCb(&rdevCb);
+        EXPECT_INT_EQ(ret, 0);
+        EXPECT_INT_EQ(rdevCb.directFlag, DIRECT_FLAG_UB);
+    }
+
+    for (i = 0; i < sizeof(pcieMainboardIds) / sizeof(pcieMainboardIds[0]); i++) {
+        gNdaMainboardId = (int64_t)pcieMainboardIds[i];
+        memset(&rdevCb, 0, sizeof(rdevCb));
+        rdevCb.rsCb = gRsCb;
+        ret = RsInitNdaCb(&rdevCb);
+        EXPECT_INT_EQ(ret, 0);
+        EXPECT_INT_EQ(rdevCb.directFlag, DIRECT_FLAG_PCIE);
+    }
+
+    /* mainboard_id 查询失败 -> 告警降级，返回 0 且 directFlag 默认 DIRECT_FLAG_PCIE */
+    gNdaMainboardRet = -1;
+    memset(&rdevCb, 0, sizeof(rdevCb));
+    rdevCb.rsCb = gRsCb;
+    ret = RsInitNdaCb(&rdevCb);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ(rdevCb.directFlag, DIRECT_FLAG_PCIE);
+    mocker_clean();
+
+    free(gRsCb);
+    gRsCb = NULL;
 }
 
 void TcRsNdaQpCreateFailed()
@@ -453,4 +644,21 @@ void TcRsNdaCqCreate()
 
     ret = RsDeinit(&cfg);
     EXPECT_INT_EQ(ret, 0);
+}
+
+void TcRsNdaAlignDownWithMixedTypeAlign()
+{
+    int alignInt = (int)RA_RS_4K_PAGE_SIZE;
+    unsigned int alignUint = (unsigned int)RA_RS_4K_PAGE_SIZE;
+    uint64_t addr = 0x100001234ULL;
+
+    uint64_t r1 = RaRsAlignDown(addr, alignInt);
+    uint64_t r2 = RaRsAlignDown(addr, alignUint);
+    EXPECT_LONG_EQ((long)r1, (long)r2);
+    EXPECT_LONG_EQ((long)r1, (long)0x100001000ULL);
+
+    uint64_t up1 = RaRsAlignUp(addr, alignInt);
+    uint64_t up2 = RaRsAlignUp(addr, alignUint);
+    EXPECT_LONG_EQ((long)up1, (long)up2);
+    EXPECT_LONG_EQ((long)up1, (long)0x100002000ULL);
 }

@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
 #include "orion_adapter_hccp.h"
 #include <chrono>
 #include <unistd.h>
@@ -25,7 +25,7 @@
 #include "hccp_common.h"
 #include "exception_util.h"
 #include "adapter_error_manager_pub.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 #include "config_plf_log_v2.h"
 
 using namespace std;
@@ -102,6 +102,17 @@ inline union HccpIpAddr IpAddressToHccpIpAddr(IpAddress& addr)
         hccpIpAddr.addr6 = addr.GetBinaryAddress().addr6;
     }
     return hccpIpAddr;
+}
+
+inline IpAddress HccpIpAddrToIpAddress(const union HccpIpAddr& hccpIpAddr, s32 family)
+{
+    BinaryAddr addr = {};
+    if (family == AF_INET) {
+        addr.addr = hccpIpAddr.addr;
+    } else {
+        addr.addr6 = hccpIpAddr.addr6;
+    }
+    return IpAddress(addr, family);
 }
 
 inline IpAddress IfAddrInfoToIpAddress(struct InterfaceInfo info)
@@ -665,7 +676,8 @@ RaSocketFdHandleParam HrtRaBlockGetOneSocket(u32 role, RaSocketGetParam& param, 
     HCCL_INFO("Socket Get tag=[%s], remoteIp[%s], ret[%d]", socketInfo.tag, param.remoteIp.Describe().c_str(), sret);
     RaBlockGetSockets(role, &socketInfo, 1, timeout);
 
-    return RaSocketFdHandleParam(socketInfo.fdHandle, socketInfo.status);
+    IpAddress remoteIp_ = HccpIpAddrToIpAddress(socketInfo.remoteIp, param.remoteIp.GetFamily());
+    return RaSocketFdHandleParam(socketInfo.fdHandle, socketInfo.status, remoteIp_);
 }
 
 void HrtRaSocketBlockSend(const FdHandle fdHandle, const void* data, u32 sendSize)
@@ -1254,11 +1266,20 @@ void HrtRaRdmaDeInit(RdmaHandle rdmaHandle, HrtNetworkMode netMode)
     }
 }
 
-void HrtRaGetNotifyBaseAddr(RdmaHandle rdmaHandle, u64* va, u64* size)
+HcclResult HrtRaGetNotifyBaseAddr(RdmaHandle rdmaHandle, u64* va, u64* size)
 {
-    CHECK_NULLPTR(rdmaHandle, "[HrtRaGetNotifyBaseAddr] rdmaHandle is nullptr!");
-    CHECK_NULLPTR(va, "[HrtRaGetNotifyBaseAddr] va is nullptr!");
-    CHECK_NULLPTR(size, "[HrtRaGetNotifyBaseAddr] size is nullptr!");
+    if (rdmaHandle == nullptr) {
+        HCCL_ERROR("[HrtRaGetNotifyBaseAddr] rdmaHandle is nullptr!");
+        return HCCL_E_PTR;
+    }
+    if (va == nullptr) {
+        HCCL_ERROR("[HrtRaGetNotifyBaseAddr] va is nullptr!");
+        return HCCL_E_PTR;
+    }
+    if (size == nullptr) {
+        HCCL_ERROR("[HrtRaGetNotifyBaseAddr] size is nullptr!");
+        return HCCL_E_PTR;
+    }
 
     HCCL_INFO("[HrtRaGetNotifyBaseAddr] Input params: rdmaHandle=%p, va=%llu, size=%llu", rdmaHandle, *va, *size);
     auto startTime = std::chrono::steady_clock::now();
@@ -1281,15 +1302,14 @@ void HrtRaGetNotifyBaseAddr(RdmaHandle rdmaHandle, u64* va, u64* size)
             }
             SaluSleep(ONE_MILLISECOND_OF_USLEEP);
         } else {
-            MACRO_THROW(
-                NetworkApiException,
-                StringFormat(
-                    "[Get][RaNotifyBaseAddr]errNo[0x%016llx] ra get notify base addr fail, call RaGetNotifyBaseAddr "
-                    "failed,"
-                    "return[%d], params: va[0x%llx], size[%llu], rdmaHandle=%p",
-                    HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), ret, notifyVa, notifySize, rdmaHandle));
+            HCCL_ERROR(
+                "[Get][RaNotifyBaseAddr]errNo[0x%016llx] ra get notify base addr fail, call RaGetNotifyBaseAddr "
+                "failed, return[%d], params: va[0x%llx], size[%llu], rdmaHandle=%p",
+                HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), ret, notifyVa, notifySize, rdmaHandle);
+            return HCCL_E_NETWORK;
         }
     }
+    return HCCL_SUCCESS;
 }
 
 QpHandle HrtRaQpCreate(RdmaHandle rdmaHandle, int flag, int qpMode)
@@ -1587,6 +1607,29 @@ void HrtRaUbCtxDestroy(RdmaHandle handle)
     }
 }
 
+// 同步请求失败按返回码分流上报: ENOMEM上报EI0011(内存不足), ENOSPC/ENOSR上报EI0007(资源耗尽)
+static void ReportResourceExhausted(
+    s32 ret, const std::string& resourceType, const std::string& opName, const std::string& memSizeDesc)
+{
+    if (IS_DEV_MEM_EXHAUSTED(ret)) {
+        RPT_ENV_ERR(true, "EI0011", std::vector<std::string>({"memory_size"}), std::vector<std::string>({memSizeDesc}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] %s failed due to insufficient memory, ret[%d]",
+            LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
+            HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), opName.c_str(), ret);
+        return;
+    }
+    if (IS_RESOURCE_EXHAUSTED(ret)) {
+        RPT_ENV_ERR(
+            true, "EI0007", std::vector<std::string>({"resource_type", "resource_info"}),
+            std::vector<std::string>({resourceType, opName}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] %s failed: %s resources are exhausted, ret[%d]",
+            LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
+            HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), opName.c_str(), resourceType.c_str(), ret);
+    }
+}
+
 std::pair<TokenIdHandle, uint32_t> RaUbAllocTokenIdHandle(RdmaHandle handle)
 {
     CHECK_NULLPTR(handle, "[RaUbAllocTokenIdHandle] handle is nullptr!");
@@ -1595,7 +1638,8 @@ std::pair<TokenIdHandle, uint32_t> RaUbAllocTokenIdHandle(RdmaHandle handle)
     void* tokenIdHandle = nullptr;
     s32 ret = RaCtxTokenIdAlloc(handle, &out, &tokenIdHandle);
     if (ret != 0) {
-        string msg = StringFormat("%s failed, set=%d, rdmaHandle=%p", __func__, ret, handle);
+        ReportResourceExhausted(ret, "token id", "AllocTokenId", "N/A");
+        string msg = StringFormat("%s failed, ret[%d], rdmaHandle=%p", __func__, ret, handle);
         MACRO_THROW(NetworkApiException, msg);
     }
     HCCL_INFO("[RaUbAllocTokenIdHandle] tokenIdHandle[%p], rdmaHandle[%p]", tokenIdHandle, handle);
@@ -1648,7 +1692,8 @@ HrtRaUbLocalMemRegOutParam HrtRaUbLocalMemReg(RdmaHandle handle, const HrtRaUbLo
     void* lmemHandle = nullptr;
     s32 ret = RaCtxLmemRegister(handle, &info, &lmemHandle);
     if (ret != 0) {
-        string msg = StringFormat("localMemReg failed, addr=0x%llx, size=0x%llx", in.addr, in.size);
+        ReportResourceExhausted(ret, "segment", "RegisterSeg", "N/A");
+        string msg = StringFormat("localMemReg failed, addr=0x%llx, size=0x%llx, ret[%d]", in.addr, in.size, ret);
         MACRO_THROW(NetworkApiException, msg);
     }
 
@@ -1757,12 +1802,24 @@ JfcHandle HrtRaUbCreateJfc(RdmaHandle handle, CqCreateInfo& cqInfo, HrtUbJfcMode
 
     s32 ret = RaCtxCqCreate(handle, &info, &jfcHandle);
     if (ret != 0) {
-        string msg = StringFormat("ubCreateCq failed, rdmaHandle=%p,", handle);
+        ReportResourceExhausted(ret, "jfc", "CreateJfc", "4096~2097152");
+        string msg = StringFormat("ubCreateCq failed, rdmaHandle=%p, ret[%d]", handle, ret);
         MACRO_THROW(NetworkApiException, msg);
     }
 
-    cqInfo.va = info.out.va;
-    HCCL_INFO("HrtRaUbCreateJfc va[%llu] mode[%u] jfcHandle[%p]", cqInfo.va, info.in.ub.mode, jfcHandle);
+    if (mode == HrtUbJfcMode::USER_CTL) {
+        cqInfo.va = info.out.bufAddr;
+        cqInfo.id = info.out.id;
+        cqInfo.cqeSize = info.out.cqeSize;
+        cqInfo.swdbAddr = info.out.swdbAddr;
+    } else {
+        cqInfo.va = info.out.va;
+    }
+
+    cqInfo.cqDepth = info.in.depth;
+    HCCL_INFO(
+        "[HrtRaUbCreateJfc] jfcId[%u], cqVA[%llx], cqeSize[%u], cqDepth[%u], dbAddr[%llx], mode[%u], jfcHandle[%p]",
+        cqInfo.id, cqInfo.va, cqInfo.cqeSize, cqInfo.cqDepth, cqInfo.swdbAddr, info.in.ub.mode, jfcHandle);
     return ReinterpretAs<JfcHandle>(jfcHandle);
 }
 
@@ -1794,7 +1851,8 @@ JfcHandle HrtRaUbCreateJfcUserCtl(RdmaHandle handle, CqCreateInfo& cqInfo)
 
     s32 ret = RaCtxCqCreate(handle, &info, &jfcHandle);
     if (ret != 0) {
-        string msg = StringFormat("ubCreateCq failed, rdmaHandle=%p,", handle);
+        ReportResourceExhausted(ret, "jfc", "CreateJfc", "4096~2097152");
+        string msg = StringFormat("ubCreateCq failed, rdmaHandle=%p, ret[%d]", handle, ret);
         THROW<NetworkApiException>(msg);
     }
 
@@ -1822,7 +1880,7 @@ const std::map<HrtJettyMode, JettyMode> HRT_JETTY_MODE_MAP
        {HrtJettyMode::CACHE_LOCK_DWQE, JettyMode::JETTY_MODE_CACHE_LOCK_DWQE},
        {HrtJettyMode::CCU_CCUM_CACHE, JettyMode::JETTY_MODE_CCU}};
 
-constexpr u8 RNR_RETRY = 7;
+constexpr u8 RNR_RETRY = 7; // 950不支持RNR重传
 constexpr u32 RQ_DEPTH = 256;
 
 static struct QpCreateAttr GetQpCreateAttr(const HrtRaUbCreateJettyParam& in)
@@ -1891,16 +1949,8 @@ HrtRaUbJettyCreatedOutParam HrtRaUbCreateJetty(RdmaHandle handle, const HrtRaUbC
     void* qpHandle = nullptr;
     s32 ret = RaCtxQpCreate(handle, &attr, &info, &qpHandle);
     if (ret != 0) {
-        RPT_ENV_ERR(
-            IS_JETTY_RESOURCE_EXHAUSTED(ret), "EI0007", std::vector<std::string>({"resource_type", "resource_info"}),
-            std::vector<std::string>({"jetty", "CreateJetty"}));
-        if (IS_JETTY_RESOURCE_EXHAUSTED(ret)) {
-            HCCL_ERROR(
-                "[%s][%s] errNo[0x%016llx] CreateJetty failed: jetty resources are exhausted, ret[%d]",
-                LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
-                HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), ret);
-        }
-        string msg = StringFormat("ubCreateJetty failed, rdmaHandle=%p,", handle);
+        ReportResourceExhausted(ret, "jetty", "CreateJetty", "16384~2097152");
+        string msg = StringFormat("ubCreateJetty failed, rdmaHandle=%p, ret[%d]", handle, ret);
         MACRO_THROW(NetworkApiException, msg);
     }
     PLF_CONFIG_INFO(PLF_RES, "Create Qp para: qpn[%u]", info.ub.id);
@@ -1982,7 +2032,8 @@ static HrtRaUbJettyImportedOutParam ImportJetty(
     void* remQpHandle = nullptr;
     s32 ret = RaCtxQpImport(handle, &info, &remQpHandle);
     if (ret != 0) {
-        string msg = StringFormat("UbImportJetty failed, rdmaHandle=%p,", handle);
+        ReportResourceExhausted(ret, "jetty", "ImportJetty", "N/A");
+        string msg = StringFormat("UbImportJetty failed, rdmaHandle=%p, ret[%d]", handle, ret);
         MACRO_THROW(NetworkApiException, msg);
     }
 
@@ -2174,28 +2225,31 @@ std::pair<uint32_t, uint32_t> HraGetDieAndFuncId(RdmaHandle handle)
     return std::make_pair(out.ub.dieId, out.ub.funcId);
 }
 
-bool HraGetRtpEnable(RdmaHandle handle)
+HcclResult HraGetRtpEnable(RdmaHandle handle, bool& rtpEnable)
 {
     struct DevBaseAttr out {};
     auto ret = RaGetDevBaseAttr(handle, &out);
     if (ret != 0) {
-        THROW<NetworkApiException>(StringFormat("[%s] call RaGetDevBaseAttr failed, error code =%d.", __func__, ret));
+        HCCL_ERROR("[%s] call RaGetDevBaseAttr failed, error code =%d.", __func__, ret);
+        return HCCL_E_NETWORK;
     }
 
     HCCL_RUN_INFO(
         "[%s] rmTpCap[%u] rcTpCap[%u] umTpCap[%u] tpFeat[%u]", __func__, out.ub.rmTpCap.value, out.ub.rcTpCap.value,
         out.ub.umTpCap.value, out.ub.tpFeat.value);
 
+    rtpEnable = false;
     for (int i = 0; i < MAX_PRIORITY_CNT; i++) {
         const CtxSlInfo& priorityInfo = out.ub.priorityInfo[i];
         HCCL_RUN_INFO(
             "[%s] priorityInfo[%d]: SL[%u] tpType[%u] rtp[%u]", __func__, i, priorityInfo.SL, priorityInfo.tpType.value,
             priorityInfo.tpType.bs.rtp);
         if (priorityInfo.tpType.bs.rtp == 1) {
-            return true;
+            rtpEnable = true;
+            return HCCL_SUCCESS;
         }
     }
-    return false;
+    return HCCL_SUCCESS;
 }
 
 void HrtRaUbPostNops(JettyHandle jettyHandle, JettyHandle remoteJettyHandle, const u32 numNop)
@@ -2215,16 +2269,6 @@ void HrtRaUbPostNops(JettyHandle jettyHandle, JettyHandle remoteJettyHandle, con
     s32 ret = RaBatchSendWr(ReinterpretAs<void*>(jettyHandle), sendWrList, sendWrRespList, numNop, &compNum);
     if (ret != 0) {
         string msg = StringFormat("UbJettySendWr failed, jettyHandle=0x%llx,", jettyHandle);
-        MACRO_THROW(NetworkApiException, msg);
-    }
-}
-
-void RaUbUpdateCi(JettyHandle jettyHandle, u32 ci)
-{
-    HCCL_INFO("RaUbUpdateCi: jettyHandle=0x%llx, ci=%u", jettyHandle, ci);
-    s32 ret = RaCtxUpdateCi(ReinterpretAs<void*>(jettyHandle), ci);
-    if (ret != 0) {
-        string msg = StringFormat("UbUpdateCi failed, ret=%d, jettyHandle=0x%llx, ci=%u", ret, jettyHandle, ci);
         MACRO_THROW(NetworkApiException, msg);
     }
 }
@@ -2291,6 +2335,39 @@ std::vector<HrtDevEidInfo> HrtRaGetDevEidInfoList(const HRaInfo& raInfo)
     return hrtDevEidInfo;
 }
 
+// 资源类型异步请求失败按返回码分流上报: ENOMEM上报EI0011(内存不足), ENOSPC/ENOSR上报EI0007(资源耗尽)
+static void ReportAsyncResourceExhausted(const struct AsyncReqResult& reqResult)
+{
+    std::string resourceType;
+    std::string opName;
+    std::string memSizeDesc;
+    switch (reqResult.interfaceOpcode) {
+        case HCCP_OP_CTX_QP_CREATE:
+            resourceType = "jetty";
+            opName = "CreateJettyAsync";
+            memSizeDesc = "16384~2097152";
+            break;
+        case HCCP_OP_CTX_QP_IMPORT:
+            resourceType = "jetty";
+            opName = "ImportJettyAsync";
+            memSizeDesc = "N/A";
+            break;
+        case HCCP_OP_LMEM_REG:
+            resourceType = "segment";
+            opName = "RegisterSegAsync";
+            memSizeDesc = "N/A";
+            break;
+        case HCCP_OP_GET_TP_INFO_LIST:
+            resourceType = "tp";
+            opName = "GetTpListAsync";
+            memSizeDesc = "N/A";
+            break;
+        default:
+            return;
+    }
+    ReportResourceExhausted(reqResult.reqResult, resourceType, opName, memSizeDesc);
+}
+
 ReqHandleResult HrtRaGetAsyncReqResult(RequestHandle& reqHandle)
 {
     if (reqHandle == 0) {
@@ -2307,11 +2384,12 @@ ReqHandleResult HrtRaGetAsyncReqResult(RequestHandle& reqHandle)
 
     // 返回码非0代表调用查询接口失败，当前仅入参错误时触发
     if (ret != 0) {
+        // interfaceOpcode数值为结构体初始化的0，预留
         MACRO_THROW(
             NetworkApiException, StringFormat(
                                      "[%s] failed, call interface error[%d], "
-                                     "reqhandle[%llu].",
-                                     __func__, ret, reqHandle));
+                                     "reqhandle[%llu] interfaceOpCode[%u]",
+                                     __func__, ret, reqHandle, reqResult.interfaceOpcode));
     }
 
     RequestHandle tmpReqHandle = reqHandle;
@@ -2323,22 +2401,12 @@ ReqHandleResult HrtRaGetAsyncReqResult(RequestHandle& reqHandle)
     }
 
     if (reqResult.reqResult != 0) {
-        const bool isJettyExhausted
-            = reqResult.interfaceOpcode == HCCP_OP_CTX_QP_CREATE && IS_JETTY_RESOURCE_EXHAUSTED(reqResult.reqResult);
-        RPT_ENV_ERR(
-            isJettyExhausted, "EI0007", std::vector<std::string>({"resource_type", "resource_info"}),
-            std::vector<std::string>({"jetty", "CreateJettyAsync"}));
-        if (isJettyExhausted) {
-            HCCL_ERROR(
-                "[%s][%s] errNo[0x%016llx] CreateJettyAsync failed: jetty resources are exhausted, ret[%d]",
-                LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_RESOURCE.c_str(),
-                HCCL_ERROR_CODE(HcclResult::HCCL_E_NETWORK), reqResult.reqResult);
-        }
+        ReportAsyncResourceExhausted(reqResult);
         MACRO_THROW(
             NetworkApiException, StringFormat(
                                      "[%s] failed, the asynchronous request "
-                                     "error[%d], reqhandle[%llu].",
-                                     __func__, reqResult.reqResult, tmpReqHandle));
+                                     "error[%d], reqhandle[%llu] interfaceOpCode[%u].",
+                                     __func__, reqResult.reqResult, tmpReqHandle, reqResult.interfaceOpcode));
     }
 
     return ReqHandleResult::COMPLETED;
@@ -2460,7 +2528,7 @@ RaSocketFdHandleParam RaGetOneSocket(u32 role, RaSocketGetParam& param)
     if ((connectedNum == 0 && sockRet == 0) || sockRet == SOCK_EAGAIN) {
         // 更新为 connecting 状态，表示连接未完成
         socketInfo.status = SOCKET_CONNECTING;
-        return RaSocketFdHandleParam(socketInfo.fdHandle, socketInfo.status);
+        return RaSocketFdHandleParam(socketInfo.fdHandle, socketInfo.status, param.remoteIp);
     }
 
     if (sockRet != 0) {
@@ -2479,7 +2547,8 @@ RaSocketFdHandleParam RaGetOneSocket(u32 role, RaSocketGetParam& param)
                 "than expected[%u], role[%u], num[%u], connectednum[%u]",
                 __func__, connectedNum, SOCKET_NUM_ONE, sockRet, role, SOCKET_NUM_ONE, connectedNum));
     }
-    return RaSocketFdHandleParam(socketInfo.fdHandle, socketInfo.status);
+    IpAddress remoteIp_ = HccpIpAddrToIpAddress(socketInfo.remoteIp, param.remoteIp.GetFamily());
+    return RaSocketFdHandleParam(socketInfo.fdHandle, socketInfo.status, remoteIp_);
 }
 
 RequestHandle HrtRaSocketSendAsync(const FdHandle fdHandle, const void* data, u32 size, unsigned long long& sentSize)
@@ -2709,6 +2778,7 @@ void RaUbGetTpInfo(const RdmaHandle rdmaHandle, const RaUbGetTpInfoParam& param,
     num = TP_HANDLE_REQUEST_NUM; // 指定需要从管控面申请tp handle的数量, hccp 会返回实际个数
     s32 ret = RaCtxGetTpInfoList(rdmaHandle, &cfg, info, &num);
     if (ret != 0) {
+        ReportResourceExhausted(ret, "tp", "GetTpList", "N/A");
         MACRO_THROW(
             NetworkApiException,
             StringFormat(
@@ -2852,20 +2922,28 @@ void HrtRaGetSecRandom(u32* value, u32& devPhyId)
     HCCL_INFO("[HrtRaGetSecRandom] Input params: value=%u, devPhyId=%u", *value, devPhyId);
 }
 HcclResult HrtRaCreateQpWithCq(
-    RdmaHandle rdmaHandle, s32 sqEvent, s32 rqEvent, void* sendChannel, void* recvChannel, QpInfo& info, bool isHdcMode)
+    RdmaHandle rdmaHandle, s32 sqEvent, s32 rqEvent, void* sendChannel, void* recvChannel, QpInfo& info, CqInfo& cq,
+    bool isHdcMode)
 {
     CHK_PTR_NULL(rdmaHandle);
     CHK_PTR_NULL(sendChannel);
     CHK_PTR_NULL(recvChannel);
-    HCCL_INFO(
-        "[HrtRaCreateQpWithCq] Input params: rdmaHandle=%p, sqEvent=%d, rqEvent=%d, sendChannel=%p, recvChannel=%p",
-        rdmaHandle, sqEvent, rqEvent, sendChannel, recvChannel);
     struct ibv_comp_channel* sChannel = ReinterpretAs<struct ibv_comp_channel*>(sendChannel);
     struct ibv_comp_channel* rChannel = ReinterpretAs<struct ibv_comp_channel*>(recvChannel);
 
-    QpConfig config(MAX_WR_NUM, MAX_SEND_SGE_NUM, MAX_RECV_SGE_NUM, sqEvent, rqEvent);
-    CqInfo cq(
-        nullptr, nullptr, nullptr, MAX_CQ_DEPTH, config.sqEvent, config.rqEvent, info.srqContext, sChannel, rChannel);
+    QpConfig config(
+        (info.attr.maxWr != 0) ? info.attr.maxWr : MAX_WR_NUM, MAX_SEND_SGE_NUM, MAX_RECV_SGE_NUM, sqEvent, rqEvent);
+    if (cq.depth == 0) {
+        cq.depth = MAX_CQ_DEPTH;
+    }
+    HCCL_INFO(
+        "[HrtRaCreateQpWithCq] Effective depth: sqDepth=%u (input %u), cqDepth=%u (input %u), hdcMode=%d", config.maxWr,
+        info.attr.maxWr, cq.depth, (cq.depth == MAX_CQ_DEPTH) ? 0U : cq.depth, static_cast<int>(isHdcMode));
+    cq.sqEvent = config.sqEvent;
+    cq.rqEvent = config.rqEvent;
+    cq.srqContext = info.srqContext;
+    cq.sendChannel = sChannel;
+    cq.recvChannel = rChannel;
     // hdc模式下hccp没有对外提供创建CQ的接口
     if (!isHdcMode) {
         CHK_RET(HrtRaCreateCq(rdmaHandle, cq));
@@ -2875,6 +2953,7 @@ HcclResult HrtRaCreateQpWithCq(
     info.context = cq.context;
     info.sendCq = cq.sq;
     info.recvCq = cq.rq;
+
     info.recvChannel = rChannel;
     info.sendChannel = sChannel;
 
@@ -3416,8 +3495,8 @@ HrtRaSetTpAttrAsync(RdmaHandle handle, uint64_t tpHandle, uint32_t attrBitmap, T
     void* raReqHandle = nullptr;
     s32 ret = RaSetTpAttrAsync(handle, tpHandle, attrBitmap, &attr, &raReqHandle);
     if (ret != 0) {
-        string msg = StringFormat("call RaSetTpAttrAsync failed, error code =%d.", ret);
-        THROW<NetworkApiException>(msg);
+        HCCL_ERROR("[%s] call RaSetTpAttrAsync failed, error code =%d.", __func__, ret);
+        return HCCL_E_NETWORK;
     }
 
     // 修复ubg场景问题:底层排队和执行时间随集群规模增长而超过10s, 修改为和建链超时时间一致

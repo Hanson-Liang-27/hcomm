@@ -11,7 +11,7 @@
 #include <cstring>
 #include "hcomm_c_adpt.h"
 #include "hcomm_c_adpt_common.h"
-#include "hcomm_res_mgr.h"
+#include "base_comm_node_accessors.h"
 #include "log.h"
 #include "endpoint.h"
 #include "param_check_pub.h"
@@ -24,10 +24,10 @@
 using namespace hcomm;
 
 namespace {
-EndpointMgr& GetEndpointMgrWithInit()
+EndpointHandleMgr& GetEndpointHandleMgrWithInit()
 {
     (void)HcommResMgrInit();
-    return HcommResMgr::GetInstance().GetEndpointMgr();
+    return GetEndpointHandleMgr();
 }
 } // namespace
 
@@ -41,32 +41,45 @@ HcommMemReg(EndpointHandle endpointHandle, const char* memTag, const CommMem* me
             HCCL_ERROR("[%s] memTag too long, len[%zu], max[%u].", __func__, memTagLen, HCOMM_RES_TAG_MAX_LEN),
             HCCL_E_PARA);
     }
-    auto endpoint = GetEndpointMgrWithInit().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgrWithInit().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
     auto mgr = endpoint->GetLocalRegMemMgr();
     CHK_PTR_NULL(mgr);
     CHK_RET(RefreshEndpointContext(endpoint->GetEndpointDesc()));
-    return static_cast<HcclResult>(mgr->RegisterMemory(mem, memTag, static_cast<void**>(memHandle)));
+    CHK_RET(static_cast<HcclResult>(mgr->RegisterMemory(mem, memTag, static_cast<void**>(memHandle))));
+    // 注册成功后记入本 endpoint 归属，供 GetAllLocalMemHandles 按实例枚举；记账失败回滚注册，避免泄漏与串数据
+    HcclResult recordRet = endpoint->RecordLocalMemHandle(*memHandle);
+    if (recordRet != HCCL_SUCCESS) {
+        HCCL_ERROR(
+            "[%s] RecordLocalMemHandle failed, ret[%d], rollback register", __func__, static_cast<int>(recordRet));
+        (void)mgr->UnregisterMemory(*memHandle);
+        return static_cast<HcommResult>(recordRet);
+    }
+    return HCCL_SUCCESS;
 }
 
 HcommResult HcommMemUnreg(EndpointHandle endpointHandle, HcommMemHandle memHandle)
 {
-    auto endpoint = GetEndpointMgrWithInit().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgrWithInit().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
     auto mgr = endpoint->GetLocalRegMemMgr();
     CHK_PTR_NULL(mgr);
     CHK_RET(RefreshEndpointContext(endpoint->GetEndpointDesc()));
-    return static_cast<HcclResult>(mgr->UnregisterMemory(memHandle));
+    // 先摘本实例归属账：handle 非本实例注册时在此拒绝（硬件未动），避免跨实例注销导致两份账本静默发散；
+    // 摘账命中则 mgr 必有记录（注册路径同源保证），随后注销不会因记录缺失失败
+    CHK_RET(endpoint->RemoveLocalMemHandle(memHandle));
+    CHK_RET(static_cast<HcclResult>(mgr->UnregisterMemory(memHandle)));
+    return HCCL_SUCCESS;
 }
 
 HcommResult
 HcommMemExport(EndpointHandle endpointHandle, HcommMemHandle memHandle, void** memDesc, uint32_t* memDescLen)
 {
-    auto endpoint = GetEndpointMgrWithInit().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgrWithInit().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
@@ -78,7 +91,7 @@ HcommMemExport(EndpointHandle endpointHandle, HcommMemHandle memHandle, void** m
 
 HcommResult HcommMemImport(EndpointHandle endpointHandle, const void* memDesc, uint32_t descLen, CommMem* outMem)
 {
-    auto endpoint = GetEndpointMgrWithInit().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgrWithInit().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
@@ -90,7 +103,7 @@ HcommResult HcommMemImport(EndpointHandle endpointHandle, const void* memDesc, u
 
 HcommResult HcommMemUnimport(EndpointHandle endpointHandle, const void* memDesc, uint32_t descLen)
 {
-    auto endpoint = GetEndpointMgrWithInit().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgrWithInit().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
@@ -105,7 +118,7 @@ HcommResult HcommMemGrant(EndpointHandle endpointHandle, const HcommMemGrantInfo
     CHK_PTR_NULL(remoteGrantInfo);
     HCCL_INFO("[%s] START. endpointHandle[0x%llx].", __func__, endpointHandle);
 
-    auto endpoint = HcommResMgr::GetInstance().GetEndpointMgr().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgr().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[0x%llx]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
@@ -132,13 +145,11 @@ HcommResult HcommMemGetAllMemHandles(EndpointHandle endpointHandle, void** memHa
     CHK_PTR_NULL(memHandles);
     CHK_PTR_NULL(memHandleNum);
 
-    auto endpoint = HcommResMgr::GetInstance().GetEndpointMgr().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgr().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[0x%llx]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
-    auto mgr = endpoint->GetLocalRegMemMgr();
-    CHK_PTR_NULL(mgr);
-    CHK_RET(mgr->GetAllMemHandles(memHandles, memHandleNum));
+    CHK_RET(endpoint->GetAllLocalMemHandles(memHandles, memHandleNum));
     return HCCL_SUCCESS;
 }
 

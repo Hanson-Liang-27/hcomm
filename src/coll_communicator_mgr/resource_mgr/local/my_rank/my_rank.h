@@ -12,6 +12,7 @@
 #define MY_RANK_H
 
 #include <cstdint>
+#include "comm_mem_c_adpt.h"
 #include <memory>
 #include <mutex>
 #include <string>
@@ -36,15 +37,18 @@
 #include "comm_mems/comm_mems.h"
 #include "engine_ctxs.h"
 #include "../../../dfx/ns_recovery/ns_recovery.h"
+#include "../../../dfx/detect_connection_anomalies/detect_connection_anomalies.h"
 #include "hdc_pub.h"
 #include "rank_graph.h"
+#include "rank_graph_v2.h"
 #include "orion_adapter_hccp.h"
 #include "coll_comm_config_consistency.h"
 #include "exchange_info_mgr.h"
 
 #include "ccu_types.h"
-#include "ccu_drv_handle.h"
-#include "ccu_device_res.h"
+#include "hcomm/ccu/hcomm_res_ccu_entity_defs.h"
+#include "comm_engine/ccu/ccu_drv_handle_pub.h"
+#include "comm_engine/ccu/ccu_device_res_pub.h"
 #include "dev_type.h"
 
 namespace hccl {
@@ -53,6 +57,8 @@ constexpr uint32_t DEFAULT_MODE = 0;
 constexpr uint32_t AICPU_TS_MODE = 2;
 constexpr uint32_t CCU_MS_MODE = 5;
 constexpr uint32_t CCU_SCHED_MODE = 6;
+constexpr uint32_t CCU_MS_ONLY_MODE = 8;
+constexpr uint32_t CCU_SCHED_ONLY_MODE = 9;
 // opExpansionMode 到 CcuInstanceType 的映射，仅作数据类型转换，不做逻辑处理。
 // 供 MyRank 内部及外部适配层（如 coll_comm_ccu_c_adpt.cc）共用。
 inline CcuInstanceType OpExpansionModeToCcuInstanceType(uint32_t opExpansionMode)
@@ -84,10 +90,11 @@ public:
 
     HcclResult UnregMemByTag(const std::string& tag);
     uint32_t GetOpExpansionMode() const { return opExpansionMode_; }
+    uint32_t GetOpExpansionModeRaw() const { return opExpansionModeRaw_; }
     CcuInsHandle GetCcuInstance() const { return ccuInsHandle_; }
-    void SetCcuInstance(CcuInsHandle ccuInsHandle) { ccuInsHandle_ = ccuInsHandle; }
+    void SetCcuInstance(CcuInsHandle ccuInsHandle);
     CcuInsHandle GetAssignedCcuInstance() const { return assignedCcuInsHandle_; }
-    void SetAssignedCcuInstance(CcuInsHandle ccuInsHandle) { assignedCcuInsHandle_ = ccuInsHandle; }
+    void SetAssignedCcuInstance(CcuInsHandle ccuInsHandle);
 
     CollCommConfigConsistency& GetCollCommConfigConsistency();
 
@@ -132,20 +139,18 @@ public:
         std::vector<HcommChannelDesc>& hcommDescs, CommEngine engine);
 
     /**
-     * @brief 在已建好的 socket 上执行通信域一致性校验交换（CheckFrameV2 + 用户信息）。
-     *        与非共享路径 MyRank::CreateChannels 内部调用 exchangeInfoMgr_ 的逻辑一致，
-     *        供共享 jetty 路径在 createFunc 中调用，确保两端无论 shared/非shared 配置是否对称，
-     *        都会在 socket 上完成定长 CheckFrameV2（120B）的对称收发，避免一端死等。
+     * @brief 在已创建的 channel 上执行通信域一致性校验交换：内部通过 ChannelGetDesc 取 socket，
+     *        收发 [CheckFrameV2][hcclDataLen][hcclData] 定长整包，比对 CheckFrameV2 并存储对端交换信息。
+     *        非共享路径由 MyRank::CreateChannels 调用，共享 jetty 路径由 ExchangeConsistencyForSharedJetty 调用，
+     *        确保两端无论 shared/非shared 配置是否对称，都在 socket 上完成定长整包对称收发，避免一端死等。
      * @param[in] channelDescs HCCL 层 channel desc 数组
-     * @param[in] hcommDescs 已通过 BatchCreateSockets 填充 socket 字段的 HcommChannelDesc 数组
+     * @param[in] channelHandles 已创建的 channel 句柄数组，内部通过 ChannelGetDesc 获取 socket
      * @param[in] channelNum 数量
-     * @param[in] newChannels 新建 channel 的 (idx, reuseIdx) 列表；空表示全部按新建处理
-     * @param[in] engine 通信引擎
-     * @note DEV_TYPE_950 和 DEV_TYPE_960 实际执行交换，其它设备类型直接返回 SUCCESS，与非共享路径保持一致。
+     * @note 950 及后续代际（EqualToOrGreaterThan950 谓词）且 rankConsistentState 为 0(first)/1(on) 时执行，否则直接返回
+     * SUCCESS。
      */
     HcclResult BatchExchangeAndCheckConsistency(
-        const HcclChannelDesc* channelDescs, const std::vector<HcommChannelDesc>& hcommDescs, uint32_t channelNum,
-        const std::vector<std::pair<u32, u32>>& newChannels, CommEngine engine);
+        const HcclChannelDesc* channelDescs, const ChannelHandle* channelHandles, uint32_t channelNum);
     void GetAbnormalChannelTlsStatus(
         const HcclChannelDesc* channelDescs, const int32_t* statusList, uint32_t channelNum,
         std::vector<Hccl::TlsStatus>& tlsStatusList) const;
@@ -160,26 +165,28 @@ private:
     // 查 local/remote addr 的 ipIndex 并注入 EndpointPair，供 SocketConfig 拼 hccpTag 使用
     void FillEndpointPairIpIndex(
         hcomm::EndpointPair* endpointPair, uint32_t remoteRank, const EndpointDesc& localEp,
-        const EndpointDesc& remoteEp);
+        const EndpointDesc& remoteEp) const;
     HcclResult BatchServerInitForChannels(
         const HcclChannelDesc* channelDescs, uint32_t channelNum, const std::string& socketTag,
         ReuseSocketIdxMap& reuseSocketIdxMap);
     HcclResult BatchGetSocketsForChannels(
         const HcclChannelDesc* channelDescs, uint32_t channelNum, const std::string& socketTag,
         std::vector<HcommChannelDesc>& hcommDescs, ReuseSocketIdxMap& reuseSocketIdxMap, CommEngine engine);
+    // channelHandles 出参为 host Channel*；deviceChannelHandles 出参为该引擎用户可见句柄，二者一一对应
     HcclResult BatchCreateChannels(
         CommEngine engine, const HcclChannelDesc* channelDescs, uint32_t channelNum,
-        std::vector<HcommChannelDesc>& hcommDescs, ChannelHandle* channelHandles,
+        std::vector<HcommChannelDesc>& hcommDescs, ChannelHandle* channelHandles, ChannelHandle* deviceChannelHandles,
         std::vector<std::vector<MemHandle>>& allHandles);
-    HcclResult
-    BatchConnectChannels(const HcclChannelDesc* channelDescs, ChannelHandle* channelHandles, uint32_t channelNum) const;
+    HcclResult WaitForChannelsReady(
+        const HcclChannelDesc* channelDescs, ChannelHandle* channelHandles, uint32_t channelNum, CommEngine engine);
     void LogChannelCreationInfo(
         CommEngine engine, const std::string& commTag, const HcclChannelDesc* channelDescs, uint32_t channelNum,
         const ChannelHandle* hostChannelHandleList) const;
     HcclResult FinalizeChannelsByEngine(
-        CommEngine engine, const std::string& commTag, uint32_t channelNum, std::vector<HcommChannelDesc>& hcommDescs,
-        ChannelHandle* hostChannelHandleList, ChannelHandle* channelHandles);
+        CommEngine engine, const std::string& commTag, uint32_t channelNum, ChannelHandle* hostChannelHandleList,
+        const ChannelHandle* deviceChannelHandleList, ChannelHandle* channelHandles);
     HcclResult CheckChannelParam(CommEngine engine, const HcclChannelDesc* channelDesc, uint32_t channelNum) const;
+    HcclResult NeedCheckConsistency(bool& needCheck) const;
     HcclResult QueryListenPort(
         uint32_t localRank, uint32_t remoteRank, const EndpointDesc& localEndpointDesc,
         const EndpointDesc& remoteEndpointDesc, uint32_t& listenPort, HcommChannelDesc& hcommDesc, CommEngine engine);
@@ -191,12 +198,38 @@ private:
     void ReconcileCcuMsCommReservation(HcclResult initRet);
     void ReleaseCcuMsCommReservation();
     HcclResult ConfigSqDepthByExpansionMode(CommEngine engine, HcommChannelDesc& hcommDesc) const;
+
+    // ccu only模式（ccu_ms_only/ccu_sched_only）不感知回退语义，配置后禁止模式切换
+    bool IsOnlyModeConfigured() const
+    {
+        return opExpansionModeRaw_ == CCU_MS_ONLY_MODE || opExpansionModeRaw_ == CCU_SCHED_ONLY_MODE;
+    }
+
     HcclResult DestroyNewChannels(
         CommEngine engine, const HcclChannelDesc* channelDescs, const std::vector<std::pair<u32, u32>>& newChannels);
     HcclResult
     QueryOneChannel(CommEngine engine, const HcclChannelDesc& channelDesc, u32 reuseIdx, ChannelHandle& handle);
     HcclResult
     DestroyOneChannel(ChannelHandle userHandle, u32 index, HcclResult& firstErr, u32& invalidHandleCnt, u32& failedCnt);
+
+    void StartDcaDetect(
+        const HcclChannelDesc* channelDescs, const int32_t* statusList, uint32_t channelNum, CommEngine engine);
+    void StartDcaDetectByFailedRanks(
+        const HcclChannelDesc* channelDescs, uint32_t channelNum,
+        const std::unordered_map<uint32_t, uint32_t>& failedRanks, CommEngine engine);
+    void CollectFailedRanks(
+        const HcclChannelDesc* channelDescs, const int32_t* statusList, uint32_t channelNum,
+        std::unordered_map<uint32_t, uint32_t>& failedRanks);
+    HcclResult CollectDcaPeerInfo(
+        const HcclChannelDesc* channelDescs, const std::unordered_map<uint32_t, uint32_t>& failedRanks,
+        std::vector<hcomm::DcaPeerInfo>& peers, CommEngine engine);
+    // 收集 RankGraph 全部 netLayer/topoInst 下的 EndpointDesc
+    HcclResult CollectEndpointDescs(std::vector<EndpointDesc>& descs) const;
+    // 遍历 RankGraph 全部 endpoint，按 IP 去重收集本端建链地址与端口
+    HcclResult CollectDcaLocalInfo(std::vector<hcomm::LocalIpInfo>& localIps, CommEngine engine);
+    // 按 (rank, IP) 查询监听端口，失败/无效时 fallback 默认端口
+    uint32_t GetDcaPort(uint32_t rank, const Hccl::IpAddress& ip, EndpointLocType locType, CommEngine engine);
+
     aclrtBinHandle binHandle_{nullptr};
     uint32_t rankId_{};
     int32_t devLogicId_{};
@@ -204,6 +237,8 @@ private:
 
     // 当前通信域初始化没有处理CommConfig，暂时只使用展开模式
     uint32_t opExpansionMode_{0};
+    // ccu only模式存储原始展开方式
+    uint32_t opExpansionModeRaw_{0};
 
     std::unique_ptr<RankPairMgr> rankPairMgr_{nullptr};
     std::unique_ptr<hccl::EndpointMgr> endpointMgr_{nullptr};
@@ -235,6 +270,8 @@ private:
     // 查 device 侧监听端口：host 侧或 CPU 引擎走原有查询，device 侧查 (rank, IP) 两级端口表
     HcclResult GetListenPortByAddr(
         uint32_t rank, const Hccl::IpAddress& addr, EndpointLocType locType, CommEngine engine, uint32_t* port);
+    // 内部获取机器唯一标识（netLayer0 netInstId）
+    HcclResult GetNetInstId(uint32_t remoteRank, std::string& netInstId);
 
     Hccl::RankIpPortMapPtr rankIpPortMap_;
 

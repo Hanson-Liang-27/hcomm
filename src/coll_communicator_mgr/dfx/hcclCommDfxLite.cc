@@ -9,14 +9,30 @@
  */
 
 #include "hcclCommDfxLite.h"
+#include "dfx_compact_report_pub.h"
 #include "hccl_common.h"
-#include "dfx_profiling_handler_lite.h"
-#include "res_pub.h"
-#include "dfx_circular_queue.h"
-#include "prof_sal_lite.h"
+#include "dfx/device/dfx_profiling_handler_lite_pub.h"
+#include "dfx/device/dfx_res_pub.h"
+#include "comm_engine/thread/device/dfx/dfx_circular_queue_pub.h"
 #include "unified_platform/pub_inc/config_plf_log_v2.h"
+#include "coll_comm_aicpu_mgr.h"
 
 namespace hccl {
+namespace {
+    // MC2 相关：当前代码流程 MC2 和 hcomm 的流程混合导致该功能只跟 MC2 有关；
+    // 如果 MC2 迁移了，这个地方可以删除。
+    struct CompactReportOpRegistrar {
+        CompactReportOpRegistrar()
+        {
+            Hccl::SetMarkCompactReportOp([](void* dfxLite, const void* opInfo) {
+                static_cast<HcclCommDfxLite*>(dfxLite)->MarkCompactReportOp(
+                    static_cast<const Hccl::DfxDfxOpInfo*>(opInfo));
+            });
+        }
+    };
+    CompactReportOpRegistrar g_compactReportOpRegistrar;
+} // namespace
+
 // HcclCommDfxLite构造函数实现
 HcclCommDfxLite::HcclCommDfxLite() {}
 
@@ -74,7 +90,7 @@ HcclResult HcclCommDfxLite::SetCurrDfxOpInfo(const Hccl::DfxDfxOpInfo* newDfxOpI
     return HCCL_SUCCESS;
 }
 
-void HcclCommDfxLite::ReportAllTasks(const std::vector<hccl::Thread*>& threads)
+void HcclCommDfxLite::ReportAllTasks(const std::vector<ThreadHandle>& threads)
 {
     profilingImpl_->ReportAllTasks(threads, GetDfxCommContext());
 }
@@ -140,7 +156,16 @@ Hccl::DfxCommContext HcclCommDfxLite::GetDfxCommContext() const
 
 void HcclCommDfxLite::SetTaskExpDevMem(void* taskExpDevMem) { taskExpDevMem_ = taskExpDevMem; }
 
-void* HcclCommDfxLite::GetTaskExpDevMem() const { return taskExpDevMem_; }
+void* HcclCommDfxLite::GetTaskExpDevMem() const
+{
+    if (taskExpDevMem_ != nullptr) {
+        return taskExpDevMem_;
+    }
+    // VA 的唯一数据源是登记处（HcclDpuTaskexpShmemRestore 登记），而 InitAicpuIndOp 在其之前取过一次快照、
+    // 此后本类再无更新点；收编把登记推迟到首次 HcclTaskRegister 之后，快照必然为空。故未命中时按 commId
+    // 现查，消除两侧的顺序依赖，否则设备侧读不到 VA、HandleDpuTaskexception 静默返回、主机侧握手超时。
+    return CollCommAicpuMgr::GetInstance().GetTaskExpDevMemRegistry().Find(commTag_);
+}
 
 void HcclCommDfxLite::MarkTaskExpStopped() { taskExpStopped_ = true; }
 

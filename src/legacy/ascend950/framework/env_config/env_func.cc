@@ -21,8 +21,9 @@
 #include "string_util.h"
 #include "base_config_legacy.h"
 #include "orion_adapter_rts.h"
+#include "common/dev_type_utils_pub.h"
 #include "adapter_error_manager_pub.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 
 namespace Hccl {
 
@@ -877,11 +878,11 @@ void CastDfsConfigParseClusterHeartBeatEnable(bool& clusterHeartBeatEnable, cons
 void CastDfsConfigParseRankConsistentState(int32_t& rankConsistentState, const std::string configValue)
 {
     if (configValue == "off") {
-        rankConsistentState = -1;
+        rankConsistentState = RANK_CONSISTENT_STATE_OFF;
     } else if (configValue == "first") {
-        rankConsistentState = 0;
+        rankConsistentState = RANK_CONSISTENT_STATE_FIRST;
     } else if (configValue == "on") {
-        rankConsistentState = 1;
+        rankConsistentState = RANK_CONSISTENT_STATE_ON;
     } else {
         THROW<InvalidParamsException>(StringFormat(
             "env[HCCL_DFS_CONFIG] please set inconsistent_check to '-1' or '0' or '1'.", configValue.c_str()));
@@ -913,15 +914,52 @@ void CastDfsConfigParseTaskMonitorInterval(uint32_t& taskMonitorInterval, const 
     HCCL_INFO("env[HCCL_DFS_CONFIG] task_monitor_interval was configed to [%u ms]", val);
 }
 
+void CastDfsConfigParseConnFaultTime(int32_t& connFaultTime, const std::string configValue)
+{
+    if (configValue.empty()) {
+        HCCL_WARNING(
+            "env[HCCL_DFS_CONFIG] connection_fault_detection_time is empty, use default [%d]s",
+            HCCL_MIN_CONNECT_FAULT_DETECTION_TIME);
+        return;
+    }
+
+    // 严格整串解析（ParseDecimalU32 非抛）：拒 0x10/20abc/12.5/空白/符号
+    u32 parsed = 0;
+    const bool parseSuccess = ParseDecimalU32(configValue, parsed);
+    CHK_PRT_THROW(
+        !parseSuccess,
+        HCCL_ERROR("env[HCCL_DFS_CONFIG] connection_fault_detection_time value[%s] is invalid.", configValue.c_str()),
+        InvalidParamsException,
+        StringFormat(
+            "env[HCCL_DFS_CONFIG] connection_fault_detection_time value[%s] is invalid.", configValue.c_str()));
+
+    // 0 = 关闭；合法范围 [20, 7200]
+    CHK_PRT_THROW(
+        parsed != 0
+            && (parsed < static_cast<u32>(HCCL_MIN_CONNECT_FAULT_DETECTION_TIME)
+                || parsed > static_cast<u32>(HCCL_MAX_CONNECT_FAULT_DETECTION_TIME)),
+        HCCL_ERROR(
+            "env[HCCL_DFS_CONFIG] connection_fault_detection_time value[%u] is invalid, expect: [0] or [%d, %d].",
+            parsed, HCCL_MIN_CONNECT_FAULT_DETECTION_TIME, HCCL_MAX_CONNECT_FAULT_DETECTION_TIME),
+        InvalidParamsException,
+        StringFormat(
+            "env[HCCL_DFS_CONFIG] connection_fault_detection_time value[%u] is invalid, expect: [0] or [%d, %d].",
+            parsed, HCCL_MIN_CONNECT_FAULT_DETECTION_TIME, HCCL_MAX_CONNECT_FAULT_DETECTION_TIME));
+
+    connFaultTime = static_cast<int32_t>(parsed);
+}
+
 DfsConfig CastDfsConfig(const std::string& dfsConfigEnv)
 {
-    constexpr std::size_t DFS_CONFIG_ITEM_NUM = 4;
+    constexpr std::size_t DFS_CONFIG_ITEM_NUM = 5;
     const std::array<std::string, DFS_CONFIG_ITEM_NUM> dfsItemName
-        = {"task_exception", "cluster_heartbeat", "inconsistent_check", "task_monitor_interval"};
+        = {"task_exception", "cluster_heartbeat", "inconsistent_check", "task_monitor_interval",
+           "connection_fault_detection_time"};
     bool taskExceptionEnable = true;
     bool clusterHeartBeatEnable = true;
-    int32_t rankConsistentState = 0;
+    int32_t rankConsistentState = RANK_CONSISTENT_STATE_FIRST;
     uint32_t taskMonitorInterval = 0;
+    int32_t connectionFaultDetectionTime = HCCL_MIN_CONNECT_FAULT_DETECTION_TIME;
     std::string dfsConfigEnvCopy = dfsConfigEnv;
     dfsConfigEnvCopy.erase(std::remove(dfsConfigEnvCopy.begin(), dfsConfigEnvCopy.end(), ' '), dfsConfigEnvCopy.end());
     auto items = SplitDfsConfig(dfsConfigEnvCopy, ',');
@@ -931,8 +969,9 @@ DfsConfig CastDfsConfig(const std::string& dfsConfigEnv)
         if (itemPair.size() != ITEM_SIZE
             || std::find(dfsItemName.begin(), dfsItemName.end(), itemPair[0]) == dfsItemName.end()) {
             THROW<InvalidParamsException>(StringFormat(
-                "env[HCCL_DFS_CONFIG] value[%s] is invalid, please check, example [task_exception:on]",
-                dfsConfigEnv.c_str()));
+                "env[HCCL_DFS_CONFIG] value[%s] is invalid, please check, example [task_exception:on, "
+                "connection_fault_detection_time:%d]",
+                dfsConfigEnv.c_str(), HCCL_MIN_CONNECT_FAULT_DETECTION_TIME));
         }
         if (itemPair[0] == dfsItemName[0]) {
             CastDfsConfigParseTaskExceptionEnable(taskExceptionEnable, itemPair[1]);
@@ -942,17 +981,22 @@ DfsConfig CastDfsConfig(const std::string& dfsConfigEnv)
             CastDfsConfigParseRankConsistentState(rankConsistentState, itemPair[1]);
         } else if (itemPair[0] == dfsItemName[3]) {
             CastDfsConfigParseTaskMonitorInterval(taskMonitorInterval, itemPair[1]);
+        } else if (itemPair[0] == dfsItemName[4]) {
+            CastDfsConfigParseConnFaultTime(connectionFaultDetectionTime, itemPair[1]);
         }
     }
-    return DfsConfig{taskExceptionEnable, clusterHeartBeatEnable, rankConsistentState, taskMonitorInterval};
+    return DfsConfig{
+        taskExceptionEnable, clusterHeartBeatEnable, rankConsistentState, taskMonitorInterval,
+        connectionFaultDetectionTime};
 }
 
 /*----------------------------- validate functions -------------------------*/
 void CheckExecTimeOut(const u32& timeOut)
 {
     DevType devType = HrtGetDeviceType();
-    if (devType == DevType::DEV_TYPE_910A2 || devType == DevType::DEV_TYPE_910A3 || devType == DevType::DEV_TYPE_950
-        || devType == DevType::DEV_TYPE_960) {
+    // 代际判断归一化：950/960 判断收敛为 hcomm 谓词（真值源为全局 hrtGetDeviceType，获取失败按非 A5 处理）
+    if (devType == DevType::DEV_TYPE_910A2 || devType == DevType::DEV_TYPE_910A3
+        || hcomm::EqualToOrGreaterThan950().value_or(false)) {
         // 910A2和910A3算子超时时间范围0s-2147483647s,其中0代表永不超时
         CheckRange<u32>(timeOut, 0, HCCL_EXEC_TIME_OUT_S_910A3);
     } else {
@@ -961,13 +1005,12 @@ void CheckExecTimeOut(const u32& timeOut)
     }
 }
 
-void CheckFilePath(const string& filePath)
+HcclResult CheckFilePath(const string& filePath)
 {
     if (filePath.length() >= (PATH_MAX) || filePath.length() == 0) {
-        THROW<InvalidParamsException>(StringFormat(
-            "env[HCCL_WHITELIST_FILE] or env[HCCL_RDMA_QP_PORT_CONFIG_PATH] is invalid, len is %u, should be (0,4096)",
-            filePath.length()));
+        return HCCL_E_PARA;
     }
+    return HCCL_SUCCESS;
 }
 
 void CheckRdmaTimeout(const u32& timeout)
@@ -991,8 +1034,9 @@ void SetRealPath(string& filePath)
 void ProcExecTimeOut(u32& timeOut)
 {
     DevType devType = HrtGetDeviceType();
-    if (devType == DevType::DEV_TYPE_910A2 || devType == DevType::DEV_TYPE_910A3 || devType == DevType::DEV_TYPE_950
-        || devType == DevType::DEV_TYPE_960) {
+    // 代际判断归一化：950/960 判断收敛为 hcomm 谓词（真值源为全局 hrtGetDeviceType，获取失败按非 A5 处理）
+    if (devType == DevType::DEV_TYPE_910A2 || devType == DevType::DEV_TYPE_910A3
+        || hcomm::EqualToOrGreaterThan950().value_or(false)) {
         return;
     }
     // 910A芯片限制超时时长为68的倍数

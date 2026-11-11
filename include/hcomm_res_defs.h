@@ -21,7 +21,8 @@
 extern "C" {
 #endif // __cplusplus
 
-static const uint32_t COMM_ADDR_EID_LEN = 16U;
+// 用宏而非 static const：该值被用作数组维，C 下需要整型常量表达式（static const 非编译期常量）。
+#define COMM_ADDR_EID_LEN 16U
 
 typedef int32_t HcommResult;
 
@@ -57,6 +58,7 @@ typedef uint64_t ThreadHandle;
 typedef enum {
     THREAD_TYPE_INVALID = -1,
     THREAD_TYPE_TS = 0,
+    THREAD_TYPE_CPU = 1, ///< HOST CPU 线程（HostDpu kernel，1 thread 1 kernel）
 } ThreadType;
 
 static const uint32_t HCOMM_THREAD_CONFIG_MAGIC_WORD = 0x0f0f0f2f;
@@ -220,6 +222,11 @@ typedef struct {
 } CommMem;
 
 /**
+ * @brief 内存注册标签（memTag）长度上限，HcommMemReg 入参校验使用
+ */
+static const uint32_t HCOMM_RES_TAG_MAX_LEN = 255U;
+
+/**
  * @brief 套接字角色
  */
 typedef enum {
@@ -262,7 +269,8 @@ static inline HcommResult EndpointDescInit(EndpointDesc* endpoint, uint32_t num)
  */
 typedef enum {
     HCOMM_ENDPOINT_FEATURE_INVALID = -1,
-    HCOMM_ENDPOINT_FEATURE_NDA = 0, // NPU Direct RDMA Async 特性
+    HCOMM_ENDPOINT_FEATURE_NDA = 0,           // NPU Direct RDMA Async 特性
+    HCOMM_ENDPOINT_FEATURE_INLINE_REDUCE = 1, // Host 网卡 Inline-Reduce 特性
 } HcommEndpointFeatureType;
 
 // 支持获取的底层资源类型

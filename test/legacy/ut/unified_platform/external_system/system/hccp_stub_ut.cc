@@ -175,7 +175,15 @@ int RaGetNotifyBaseAddr(void* rdev_handle, unsigned long long* va, unsigned long
  */
 int RaInit(struct RaInitConfig* config) { return 0; }
 
-int RaTlvInit(struct TlvInitInfo* init_info, unsigned int* buffer_size, void** tlv_handle) { return 0; }
+int RaTlvInit(struct TlvInitInfo* init_info, unsigned int* buffer_size, void** tlv_handle)
+{
+    static char fakeTlvHandle;
+    if (tlv_handle != nullptr) {
+        *tlv_handle = &fakeTlvHandle;
+    }
+    return 0;
+}
+
 int RaTlvRequest(void* tlv_handle, unsigned int module_type, struct TlvMsg* send_msg, struct TlvMsg* recv_msg)
 {
     return 0;
@@ -423,8 +431,6 @@ int RaGetDevEidInfoNum(struct RaInfo info, unsigned int* num) { return 0; }
 int RaGetDevEidInfoList(struct RaInfo info, struct HccpDevEidInfo info_list[], unsigned int* num) { return 0; }
 
 int RaGetDevBaseAttr(void* ctx_handle, struct DevBaseAttr* attr) { return 0; }
-
-int RaCtxUpdateCi(void* qp_handle, uint16_t ci) { return 0; }
 
 int RaGetAsyncReqResult(void* req_handle, struct AsyncReqResult* req_result) { return 0; }
 

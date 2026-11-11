@@ -9,6 +9,7 @@
  */
 
 #include "ccu_kernel.h"
+#include "ccu_device.h"
 
 #include <algorithm>
 #include <map>
@@ -30,6 +31,7 @@
 #include "ccu_rep_funccall_v1.h"
 #include "../../endpoint_pairs/channels/ccu/ccu_urma_channel.h"
 #include "../ccu_instance/ccu_var_event_res_mgr.h"
+#include "base_comm_node_accessors.h"
 
 #include "ccu_log.h"
 
@@ -104,7 +106,7 @@ static HcclResult GetDieIdByChannel(const ChannelHandle channel, uint32_t& dieId
 CcuResult GetChannelIdByHandle(ChannelHandle channel, uint32_t& channelId)
 {
     void* channelPtr{nullptr};
-    // HcommResult 与 HcclResult 数值对齐（见 hcomm_result_defs.h 与 hcomm_res_defs.h 注释），
+    // HcommResult 与 HcclResult 数值对齐（见 result_defs_pub.h 与 hcomm_res_defs.h 注释），
     // 经 static_cast<HcclResult> 再由 HCCL_TO_CCU_RET 转为 CcuResult
     HcommResult hret = HcommChannelGet(channel, &channelPtr);
     if (static_cast<HcclResult>(hret) != HCCL_SUCCESS) {
@@ -575,7 +577,7 @@ CcuResult CcuKernel::VariableCreateByAcquire(CcuVariableHandle acqHandle, uint32
 {
     uint8_t dieId = 0;
     uint32_t xnId = 0;
-    CCU_CHK_RET(CcuVarEventResMgr::GetInstance(HcclGetThreadDeviceId()).GetVariableXnId(acqHandle, index, dieId, xnId));
+    CCU_CHK_RET(GetCcuVarEventResMgr(HcclGetThreadDeviceId()).GetVariableXnId(acqHandle, index, dieId, xnId));
 
     CcuRep::Variable var(this);
     var.Reset(static_cast<uint16_t>(xnId), static_cast<uint16_t>(dieId));
@@ -589,7 +591,7 @@ CcuResult CcuKernel::EventCreateByAcquire(CcuEventHandle acqHandle, uint32_t ind
 {
     uint8_t dieId = 0;
     uint32_t ckeId = 0;
-    CCU_CHK_RET(CcuVarEventResMgr::GetInstance(HcclGetThreadDeviceId()).GetEventCkeId(acqHandle, index, dieId, ckeId));
+    CCU_CHK_RET(GetCcuVarEventResMgr(HcclGetThreadDeviceId()).GetEventCkeId(acqHandle, index, dieId, ckeId));
 
     CcuRep::CompletedEvent event(this);
     event.Reset(static_cast<uint16_t>(ckeId), static_cast<uint16_t>(dieId));
@@ -859,6 +861,7 @@ CcuResult CcuKernel::NotifyWait(const ChannelHandle channel, uint32_t localNotif
 CcuResult CcuKernel::CascCntWait(HcommCcuCascCntHandle cntHandle, uint64_t tgtValue)
 {
     PLF_CONFIG_INFO(PLF_DATA_OP, "[CascCntWait] cntHandle=%llu, tgtValue=%llu", cntHandle, tgtValue);
+    AddCascCntHandle(cntHandle);
     auto rep = std::make_shared<CcuRep::CcuRepCascCntWait>(insGenerator, cntHandle, tgtValue);
     Append(rep);
     return CcuResult::CCU_SUCCESS;
@@ -869,6 +872,7 @@ CcuResult CcuKernel::CascCntClear(HcommCcuCascCntHandle cntHandle, CcuEventHandl
         PLF_DATA_OP, "[CascCntClear] cntHandle=%llu, eventHandle=%llu, mask=%u", cntHandle, eventHandle, mask);
     CcuRep::CompletedEvent* event{nullptr};
     CCU_CHK_RET(GetEventByHandle(eventHandle, &event));
+    AddCascCntHandle(cntHandle);
     auto rep = std::make_shared<CcuRep::CcuRepCascCntClear>(insGenerator, cntHandle, *event, mask);
     Append(rep);
     SetDependencyInfo(event->Id(), mask, rep);
@@ -986,6 +990,10 @@ CcuResult CcuKernel::LoadAddImm(
     PLF_CONFIG_INFO(
         PLF_DATA_OP, "[LoadAddImm] varHandle=%llu, offsetHandle=%llu, immAddValue=%u, dstHandle=%llu", varHandle,
         offsetHandle, immAddValue, dstHandle);
+    if (srcNum == 0) {
+        HCCL_ERROR("[%s] srcNum must be greater than 0", __func__);
+        return CcuResult::CCU_E_PARA;
+    }
     CcuRep::Variable* baseVar(nullptr);
     CCU_CHK_RET(GetVariableByHandle(varHandle, &baseVar));
     CcuRep::Variable* offsetVar(nullptr);
@@ -1005,6 +1013,10 @@ CcuResult CcuKernel::AddImmStore(
     PLF_CONFIG_INFO(
         PLF_DATA_OP, "[AddImmStore] varHandle=%llu, offsetHandle=%llu, immAddValue=%u, srcHandle=%llu", varHandle,
         offsetHandle, immAddValue, srcHandle);
+    if (dstNum == 0) {
+        HCCL_ERROR("[%s] dstNum must be greater than 0", __func__);
+        return CcuResult::CCU_E_PARA;
+    }
     CcuRep::Variable* baseVar(nullptr);
     CCU_CHK_RET(GetVariableByHandle(varHandle, &baseVar));
     CcuRep::Variable* offsetVar(nullptr);
@@ -1359,8 +1371,9 @@ CcuResult CcuKernel::WriteWithCascCntInc(
     CCU_CHK_RET(GetVariableByHandle(lenHandle, &len));
     CcuRep::RemoteAddr* inCntAddr{nullptr};
     CCU_CHK_RET(GetRemoteAddrByHandle(inCntAddrHandle, &inCntAddr));
+    CcuRep::Variable origLen = CreateVariable();
     auto rep = std::make_shared<CcuRep::CcuRepWriteWithCntInc>(
-        insGenerator, *channelId, *remoteAddr, *local, *len, *inCntAddr);
+        insGenerator, *channelId, *remoteAddr, *local, *len, *inCntAddr, origLen);
     Append(rep);
     return CcuResult::CCU_SUCCESS;
 }
@@ -2329,10 +2342,6 @@ CcuResult CcuKernel::LoopCreate(CcuLoop* loop)
         HCCL_ERROR("[CcuKernel::LoopCreate] cannot create loop inside a loop body");
         return LatchBodyError(CcuResult::CCU_E_INTERNAL);
     }
-    if (inFuncBody_) {
-        HCCL_ERROR("[CcuKernel::LoopCreate] cannot create loop inside a func body");
-        return LatchBodyError(CcuResult::CCU_E_INTERNAL);
-    }
 
     CcuLoop handle = ++loopHandleCounter_;
     std::string label = "loop_" + std::to_string(handle);
@@ -2369,7 +2378,8 @@ CcuResult CcuKernel::LoopBodyEnter(CcuLoop loop)
         return CcuResult::CCU_E_INTERNAL;
     }
 
-    Append(desc.repLoopBlock);
+    FlushClosablePendingIfs();
+    AppendLoopBlockForTranslation(desc.repLoopBlock);
     desc.prevActiveBlock = CurrentBlock();
     SetCurrentBlock(desc.repLoopBlock);
     ++loopBodyDepth_;
@@ -2437,6 +2447,12 @@ CcuResult CcuKernel::FuncBlockBegin(const void* funcPtr, uint64_t* outHandle)
         return CcuResult::CCU_SUCCESS;
     }
 
+    *outHandle = OpenFuncBlock(funcPtr);
+    return CcuResult::CCU_SUCCESS;
+}
+
+uint64_t CcuKernel::OpenFuncBlock(const void* funcPtr)
+{
     const uint64_t handle = ++funcHandleCounter_;
     std::string label = "func_" + std::to_string(handle);
 
@@ -2450,7 +2466,84 @@ CcuResult CcuKernel::FuncBlockBegin(const void* funcPtr, uint64_t* outHandle)
     SetCurrentBlock(desc.repFuncBlock);
     inFuncBody_ = true;
     bodyError_ = CcuResult::CCU_SUCCESS;
+    return handle;
+}
+
+// 命名 func 在声明处即绑定到当前 kernel：name 是它在本 kernel 内的唯一身份，重名直接判错。
+// 不进 funcInstanceMap_ —— 那张表按 ccu::Func 对象地址索引，只服务 ccu::CallFunc<Obj> 的匿名 func；
+// 命名 func 多为 kernel 内的栈对象，兄弟作用域可能复用同一地址，按地址索引会互相误命中。
+CcuResult CcuKernel::FuncBlockBeginNamed(const char* name, uint64_t* outHandle)
+{
+    PLF_CONFIG_INFO(PLF_DATA_OP, "[FuncBlockBeginNamed] name=%s", name == nullptr ? "(null)" : name);
+    CCU_CHK_PTR_NULL(name);
+    CCU_CHK_PTR_NULL(outHandle);
+    if (CurrentBlock()->Type() == CcuRep::CcuRepType::LOOP_BLOCK || inFuncBody_) {
+        HCCL_ERROR("[CcuKernel::FuncBlockBeginNamed] named ccu::Func only allowed at kernel top level");
+        return LatchBodyError(CcuResult::CCU_E_INTERNAL);
+    }
+    if (name[0] == '\0') {
+        HCCL_ERROR("[CcuKernel::FuncBlockBeginNamed] func name must not be empty");
+        return CcuResult::CCU_E_PARA;
+    }
+    if (funcNameMap_.find(name) != funcNameMap_.end()) {
+        HCCL_ERROR("[CcuKernel::FuncBlockBeginNamed] duplicate func name %s in current kernel", name);
+        return CcuResult::CCU_E_PARA;
+    }
+
+    // 命名 func 走新 callfunc 链路的独立 rep，不复用匿名 func 的 CcuRepFuncBlock
+    const uint64_t handle = ++funcHandleCounter_;
+    std::string label = "func_" + std::to_string(handle);
+
+    FuncDescriptor desc;
+    desc.funcPtr = nullptr; // 命名 func 以 name 为身份，不占 funcInstanceMap_
+    desc.label = label;
+    desc.name = name;
+    desc.repAddrFuncBlock = std::make_shared<CcuRep::CcuRepAddressableFuncBlock>(insGenerator, label);
+    desc.prevActiveBlock = CurrentBlock();
+
+    funcMap_[handle] = desc;
+    funcNameMap_[name] = handle;
+    SetCurrentBlock(desc.repAddrFuncBlock);
+    inFuncBody_ = true;
+    bodyError_ = CcuResult::CCU_SUCCESS;
     *outHandle = handle;
+    return CcuResult::CCU_SUCCESS;
+}
+
+CcuResult CcuKernel::RegisterAddrUser(uint32_t numIn)
+{
+    if (numIn > CCU_FUNC_XKERNEL_ARG_MAX) {
+        HCCL_ERROR(
+            "[CcuKernel::RegisterAddrUser] arg num %u exceeds cross-kernel max %u", numIn, CCU_FUNC_XKERNEL_ARG_MAX);
+        return CcuResult::CCU_E_PARA;
+    }
+    return CcuResult::CCU_SUCCESS;
+}
+
+// caller 只写低位的前 numIn 个、callee 只读自己形参个数那么多，两侧个数不等时多余的实参无人读取。
+CcuResult CcuKernel::BindFuncAddr(const CcuFuncAddr* addr)
+{
+    if (addrFuncBlocks_.empty() && addrFuncCalls_.empty()) {
+        return CcuResult::CCU_SUCCESS;
+    }
+    if (addr == nullptr || addr->argVars.size() < CCU_FUNC_XKERNEL_ARG_MAX) {
+        HCCL_ERROR("[CcuKernel::BindFuncAddr] func addr regs are unavailable on die %u", GetDieId());
+        return CcuResult::CCU_E_INTERNAL;
+    }
+
+    for (auto& funcBlock : addrFuncBlocks_) {
+        const uint32_t numIn = static_cast<uint32_t>(funcBlock->GetInArgVars().size());
+        funcBlock->SetTransferInVars(
+            std::vector<CcuRep::Variable>(addr->argVars.begin(), addr->argVars.begin() + numIn));
+        funcBlock->SetSharedRetVar(addr->retVar);
+    }
+    for (auto& funcCall : addrFuncCalls_) {
+        const uint32_t numIn = funcCall->GetInArgCount();
+        funcCall->SetTransferInVars(
+            std::vector<CcuRep::Variable>(addr->argVars.begin(), addr->argVars.begin() + numIn));
+        funcCall->SetSharedRetVar(addr->retVar);
+        funcCall->SetJumpScratchVar(addr->jumpScratch);
+    }
     return CcuResult::CCU_SUCCESS;
 }
 
@@ -2471,13 +2564,36 @@ CcuResult CcuKernel::FuncBlockEnd(uint64_t handle)
         const CcuResult err = bodyError_;
         HCCL_ERROR("[CcuKernel::FuncBlockEnd] illegal operation inside func body, err=%d", err);
         bodyError_ = CcuResult::CCU_SUCCESS;
+        HCCL_INFO(
+            "[CcuKernel::FuncBlockEnd] func[%s] registration rolled back, handle invalidated, same name reusable",
+            desc.name.c_str());
+        funcNameMap_.erase(desc.name);
         funcMap_.erase(it);
         return err;
     }
 
+    // 命名 / 可寻址 func 走新 callfunc 链路：登记 Addr 共享传参入口并挂到 mainBlock
+    if (!desc.name.empty()) {
+        const CcuResult ret = RegisterAddrUser(static_cast<uint32_t>(desc.repAddrFuncBlock->GetInArgVars().size()));
+        if (ret != CcuResult::CCU_SUCCESS) {
+            HCCL_INFO(
+                "[CcuKernel::FuncBlockEnd] func[%s] registration rolled back, handle invalidated, same name reusable",
+                desc.name.c_str());
+            funcNameMap_.erase(desc.name);
+            funcMap_.erase(it);
+            return ret;
+        }
+        addrFuncBlocks_.push_back(desc.repAddrFuncBlock);
+        Append(desc.repAddrFuncBlock);
+        desc.bodyDefined = true;
+        return CcuResult::CCU_SUCCESS;
+    }
+
     Append(desc.repFuncBlock);
     desc.bodyDefined = true;
-    funcInstanceMap_[desc.funcPtr] = handle;
+    if (desc.funcPtr != nullptr) {
+        funcInstanceMap_[desc.funcPtr] = handle;
+    }
     return CcuResult::CCU_SUCCESS;
 }
 
@@ -2492,7 +2608,11 @@ CcuResult CcuKernel::FuncDefineInArg(uint64_t handle, CcuVariableHandle formal)
 
     CcuRep::Variable* formalVar = nullptr;
     CCU_CHK_RET(GetVariableByHandle(formal, &formalVar));
-    it->second.repFuncBlock->DefineInArg(*formalVar);
+    if (!it->second.name.empty()) { // 命名 func 走新 callfunc 链路的可寻址 block
+        it->second.repAddrFuncBlock->DefineInArg(*formalVar);
+    } else {
+        it->second.repFuncBlock->DefineInArg(*formalVar);
+    }
     return CcuResult::CCU_SUCCESS;
 }
 
@@ -2514,6 +2634,12 @@ CcuResult CcuKernel::FuncCall(uint64_t handle, const CcuVariableHandle* inArgs, 
         return CcuResult::CCU_E_PARA;
     }
 
+    // 命名 func 只能按 pc 调用（走 ccu::CallFunc(pc, args) → FuncCallByAddr），不支持按 handle 直调
+    if (!it->second.name.empty()) {
+        HCCL_ERROR("[CcuKernel::FuncCall] named func must be called by pc, use ccu::CallFunc(pc, args)");
+        return CcuResult::CCU_E_NOT_SUPPORT;
+    }
+
     auto repFuncCall = std::make_shared<CcuRep::CcuRepFuncCall>(insGenerator, it->second.label);
     for (uint32_t i = 0; i < numIn; i++) {
         CcuRep::Variable* actual = nullptr;
@@ -2521,6 +2647,77 @@ CcuResult CcuKernel::FuncCall(uint64_t handle, const CcuVariableHandle* inArgs, 
         repFuncCall->SetInArg(*actual);
     }
     Append(repFuncCall);
+    return CcuResult::CCU_SUCCESS;
+}
+
+// 调用点不知道目标是谁，实参统一写入中转寄存器池，由被调命名 func 的序言拷到自己的形参。
+CcuResult CcuKernel::FuncCallByAddr(CcuVariableHandle funcPc, const CcuVariableHandle* inArgs, uint32_t numIn)
+{
+    PLF_CONFIG_INFO(PLF_DATA_OP, "[FuncCallByAddr] funcPc=%llu, numIn=%u", funcPc, numIn);
+    if (CurrentBlock()->Type() == CcuRep::CcuRepType::LOOP_BLOCK || inFuncBody_) {
+        HCCL_ERROR("[CcuKernel::FuncCallByAddr] ccu::CallFunc(pc, args) only allowed at top level");
+        return LatchBodyError(CcuResult::CCU_E_INTERNAL);
+    }
+    if (numIn > 0 && inArgs == nullptr) {
+        HCCL_ERROR("[CcuKernel::FuncCallByAddr] null input args");
+        return CcuResult::CCU_E_PTR;
+    }
+
+    CCU_CHK_RET(RegisterAddrUser(numIn));
+
+    CcuRep::Variable* pcVar = nullptr;
+    CCU_CHK_RET(GetVariableByHandle(funcPc, &pcVar));
+
+    auto repFuncCall = std::make_shared<CcuRep::CcuRepAddrFuncCall>(insGenerator, *pcVar);
+    for (uint32_t i = 0; i < numIn; i++) {
+        CcuRep::Variable* actual = nullptr;
+        CCU_CHK_RET(GetVariableByHandle(inArgs[i], &actual));
+        CCU_CHK_RET(repFuncCall->SetInArg(*actual));
+    }
+    addrFuncCalls_.push_back(repFuncCall);
+    Append(repFuncCall);
+    return CcuResult::CCU_SUCCESS;
+}
+
+// 可寻址 func 的容器 kernel 通常不被 Launch，mission 序言不会执行，func 入口得自己把保留资源和常量
+// 寄存器初始化一遍，这些指令数随常量个数变化，必须在常量确定后回填给 FuncBlock。
+void CcuKernel::UpdateAddressableFuncPreludeCount()
+{
+    const uint16_t preludeCount
+        = CcuRep::FUNC_PRELUDE_FIXED_INSTR_NUM + static_cast<uint16_t>(constValue2VarMap.size());
+    for (auto& funcBlock : addrFuncBlocks_) {
+        funcBlock->SetPreludeInstrCount(preludeCount);
+    }
+}
+
+CcuResult CcuKernel::GetFuncPc(const char* name, uint64_t* pc) const
+{
+    CCU_CHK_PTR_NULL(name);
+    CCU_CHK_PTR_NULL(pc);
+
+    auto nameIt = funcNameMap_.find(name);
+    if (nameIt == funcNameMap_.end()) {
+        HCCL_ERROR("[CcuKernel::GetFuncPc] func %s not found in kernel %s", name, name_.c_str());
+        return CcuResult::CCU_E_NOT_FOUND;
+    }
+    auto funcIt = funcMap_.find(nameIt->second);
+    if (funcIt == funcMap_.end() || !funcIt->second.bodyDefined || funcIt->second.repAddrFuncBlock == nullptr) {
+        HCCL_ERROR("[CcuKernel::GetFuncPc] func %s is not defined", name);
+        return CcuResult::CCU_E_NOT_FOUND;
+    }
+    if (!funcIt->second.repAddrFuncBlock->Translated()) {
+        HCCL_ERROR("[CcuKernel::GetFuncPc] kernel %s is not translated yet, call RegisterEnd first", name_.c_str());
+        return CcuResult::CCU_E_INTERNAL;
+    }
+    // 后端优化补 NOP 后入口 pc 回填失败时，repAddrFuncBlock 里留的是优化前的过期 pc，按它跳转会跳飞，
+    // 必须显式报错而不是把过期 pc 发布出去
+    if (funcIt->second.repAddrFuncBlock->RemapFailed()) {
+        HCCL_ERROR("[CcuKernel::GetFuncPc] func %s entry pc remap failed after backend optimization", name);
+        return CcuResult::CCU_E_INTERNAL;
+    }
+
+    *pc = static_cast<uint64_t>(funcIt->second.repAddrFuncBlock->StartInstrId());
+    HCCL_INFO("[CcuKernel::GetFuncPc] func %s pc=%lu", name, *pc);
     return CcuResult::CCU_SUCCESS;
 }
 
@@ -2564,10 +2761,6 @@ CcuResult CcuKernel::LoopGroupCreate(CcuLoopGroup* group, uint32_t maxLoopNum, c
         HCCL_ERROR("[CcuKernel::LoopGroupCreate] cannot create loop group inside a loop body");
         return LatchBodyError(CcuResult::CCU_E_INTERNAL);
     }
-    if (inFuncBody_) {
-        HCCL_ERROR("[CcuKernel::LoopGroupCreate] cannot create loop group inside a func body");
-        return LatchBodyError(CcuResult::CCU_E_INTERNAL);
-    }
 
     // 按需扩 LoopEngine 池；池足够则复用低位 executorId，跨组共享。
     CCU_CHK_RET(EnsureLoopEnginePool(maxLoopNum));
@@ -2604,10 +2797,6 @@ CcuResult CcuKernel::LoopGroupCreateFromVar(
     }
     if (CurrentBlock()->Type() == CcuRep::CcuRepType::LOOP_BLOCK) {
         HCCL_ERROR("[CcuKernel::LoopGroupCreateFromVar] cannot create loop group inside a loop body");
-        return LatchBodyError(CcuResult::CCU_E_INTERNAL);
-    }
-    if (inFuncBody_) {
-        HCCL_ERROR("[CcuKernel::LoopGroupCreateFromVar] cannot create loop group inside a func body");
         return LatchBodyError(CcuResult::CCU_E_INTERNAL);
     }
 
@@ -2651,10 +2840,6 @@ CcuResult CcuKernel::LoopGroupCreateFromVarV2(
     }
     if (CurrentBlock()->Type() == CcuRep::CcuRepType::LOOP_BLOCK) {
         HCCL_ERROR("[CcuKernel::LoopGroupCreateFromVarV2] cannot create loop group inside a loop body");
-        return LatchBodyError(CcuResult::CCU_E_INTERNAL);
-    }
-    if (inFuncBody_) {
-        HCCL_ERROR("[CcuKernel::LoopGroupCreateFromVarV2] cannot create loop group inside a func body");
         return LatchBodyError(CcuResult::CCU_E_INTERNAL);
     }
 
@@ -2909,7 +3094,7 @@ namespace {
     {
         const auto repType = rep->Type();
         if (repType != CcuRep::CcuRepType::BLOCK && repType != CcuRep::CcuRepType::FUNC_BLOCK
-            && repType != CcuRep::CcuRepType::LOOP_BLOCK) {
+            && repType != CcuRep::CcuRepType::LOOP_BLOCK && repType != CcuRep::CcuRepType::ADDRESSABLE_FUNC_BLOCK) {
             return 0;
         }
         auto* blockPtr = static_cast<CcuRep::CcuRepBlock*>(rep.get());
@@ -2928,7 +3113,7 @@ namespace {
     // 识别"会翻译出 LoadX/StoreX/ClearX (half-rtt 特殊指令) 的 rep". 后端优化 (CkeOnly) 对该指令双向补
     // NOP: 作为写者其后读者、作为读者其前写者各最多补 (CCU_XN_RAW_LATENCY - 1) 条, 故每个此类 rep 都要按
     // 2 * CCU_XN_RAW_LATENCY 预留指令空间, 保证优化后指令数不越界. 各 rep 恰出 1 条对应微指令 (见
-    // ccu_ins_generator_v2.cc):
+    // ccu_ins_generator_v2.cc), rep 内其余指令非 lsx, 不计入 (LOAD_ADD_IMM / STORE_ADD_IMM 另含 4 条护栏指令):
     //   LOAD_ADD_IMM   -> 1 条 LoadX;
     //   STORE_ADD_IMM  -> 1 条 StoreX;
     //   CASC_CNT_CLEAR -> 1 条 ClearX.
@@ -2956,7 +3141,7 @@ namespace {
     {
         const auto repType = rep->Type();
         if (repType != CcuRep::CcuRepType::BLOCK && repType != CcuRep::CcuRepType::FUNC_BLOCK
-            && repType != CcuRep::CcuRepType::LOOP_BLOCK) {
+            && repType != CcuRep::CcuRepType::LOOP_BLOCK && repType != CcuRep::CcuRepType::ADDRESSABLE_FUNC_BLOCK) {
             return 0;
         }
         auto* blockPtr = static_cast<CcuRep::CcuRepBlock*>(rep.get());
@@ -3141,6 +3326,18 @@ void CcuKernel::SetCascCntBlock(const std::unordered_map<HcommCcuCascCntHandle, 
 {
     std::lock_guard<std::mutex> lock(cascCntBlockMutex_);
     cascCntBlocks_ = cascCntBlocks;
+}
+
+void CcuKernel::AddCascCntHandle(HcommCcuCascCntHandle cntHandle)
+{
+    std::lock_guard<std::mutex> lock(cascCntBlockMutex_);
+    (void)cascCntHandles_.insert(cntHandle);
+}
+
+std::unordered_set<HcommCcuCascCntHandle> CcuKernel::GetCascCntHandles()
+{
+    std::lock_guard<std::mutex> lock(cascCntBlockMutex_);
+    return cascCntHandles_;
 }
 
 HcclResult CcuKernel::GetCascCntBlock(HcommCcuCascCntHandle cntHandle, CntXnBlock& cascCntBlock)
@@ -3458,15 +3655,25 @@ HcclResult CcuKernel::AddCcuProfiling(
     return HCCL_SUCCESS;
 }
 
-HcclResult CcuKernel::Add2ConstValue2VarMap(std::vector<uint64_t>& values)
+HcclResult
+CcuKernel::Add2ConstValue2VarMap(const std::vector<uint64_t>& values, const std::vector<uint64_t>& secretValues)
 {
-    // 记录当前context所需的常量，仅A6场景适用
+    // 记录当前context所需的常量，仅A6场景适用；secretValues 为其中的敏感值(token)，
+    // 一并登记进敏感集合，装载到寄存器时用于打 secFlag 标记，打印时以 tokenInfo 脱敏
     for (uint64_t value : values) {
         if (constValue2VarMap.find(value) == constValue2VarMap.end()) {
             constValue2VarMap[value] = CreateVariable();
         }
     }
+    for (uint64_t value : secretValues) {
+        secConstValueSet_.insert(value);
+    }
     return HCCL_SUCCESS;
+}
+
+bool CcuKernel::IsSecConstValue(uint64_t value) const
+{
+    return secConstValueSet_.find(value) != secConstValueSet_.end();
 }
 
 }; // namespace hcomm

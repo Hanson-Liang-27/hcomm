@@ -47,6 +47,7 @@ public:
     uint32_t GetDieId() const;
     int32_t GetUserDevId() const;
     uint64_t GetRmtCcuBufAddr() const;
+    uint64_t GetRmtCcuBufSize() const;
     uint32_t GetRmtCcuBufTokenId() const;
     uint32_t GetRmtCcuBufTokenValue() const;
     HcclResult Describe(std::string& dfxMsg);
@@ -107,6 +108,7 @@ private:
 
     // 通过ccu comp 获取 ccu buffer信息
     uint64_t ccuBufAddr_{0};
+    uint64_t ccuBufSize_{0};
     uint32_t ccuBufTokenId_{0};
     uint32_t ccuBufTokenValue_{0};
 
@@ -115,12 +117,15 @@ private:
 
     // 交换后获取对端ccu buffer信息
     uint64_t rmtCcuBufAddr_{0};
+    uint64_t rmtCcuBufSize_{0};
     uint32_t rmtCcuBufTokenId_{0};
     uint32_t rmtCcuBufTokenValue_{0};
 
     // 感知tp获取tp handle，import jetty后urma提供tpn
     TpInfo tpInfo_{};
     TpAttrInfo tpAttrInfo_{};
+    // Init 时缓存：ReleaseConnRes/析构期不经全局访问器重入半析构的资源树（README R10 处置 2）
+    TpMgr* tpMgr_{nullptr};
 
     // 异步import上下文信息
     std::vector<RequestHandle> reqHandles_;

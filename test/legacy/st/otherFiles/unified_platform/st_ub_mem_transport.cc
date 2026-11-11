@@ -278,7 +278,7 @@ TEST(UbMemTransportTest, UbMemTransport_get_status)
 
     int fakeFdStatus = SOCKET_CONNECTED;
     FdHandle fakeFdHandle = (void*)100;
-    RaSocketFdHandleParam fakeParam(fakeFdHandle, fakeFdStatus);
+    RaSocketFdHandleParam fakeParam(fakeFdHandle, fakeFdStatus, IpAddress());
 
     MOCKER(RaGetOneSocket).stubs().with(mockcpp::any(), mockcpp::any()).will(returnValue(fakeParam));
 
@@ -384,7 +384,7 @@ TEST(UbMemTransportTest, UbMemTransport_send_recv_exchange_data)
 
     int fakeFdStatus = SOCKET_CONNECTED;
     FdHandle fakeFdHandle = (void*)100;
-    RaSocketFdHandleParam fakeParam(fakeFdHandle, fakeFdStatus);
+    RaSocketFdHandleParam fakeParam(fakeFdHandle, fakeFdStatus, IpAddress());
 
     MOCKER(RaGetOneSocket).stubs().with(mockcpp::any(), mockcpp::any()).will(returnValue(fakeParam));
 
@@ -430,7 +430,7 @@ TEST(UbMemTransportTest, UbMemTransport_send_recv_finish)
     UbMemTransport transport(locRes, attr, link, fakeSocket, rdmaHandle, locCntRes, isRecvFirst);
 
     MOCKER(memcpy_s).stubs().will(returnValue(-1));
-    EXPECT_THROW(transport.SendFinish(), SocketException);
+    EXPECT_EQ(transport.SendFinish(), HCCL_E_TCP_CONNECT);
 
     GlobalMockObject::verify();
     MOCKER(memcpy_s).stubs().with().will(invoke(memcpy_stub));
@@ -441,7 +441,7 @@ TEST(UbMemTransportTest, UbMemTransport_send_recv_finish)
 
     int fakeFdStatus = SOCKET_CONNECTED;
     FdHandle fakeFdHandle = (void*)100;
-    RaSocketFdHandleParam fakeParam(fakeFdHandle, fakeFdStatus);
+    RaSocketFdHandleParam fakeParam(fakeFdHandle, fakeFdStatus, IpAddress());
 
     MOCKER(RaGetOneSocket).stubs().with(mockcpp::any(), mockcpp::any()).will(returnValue(fakeParam));
 

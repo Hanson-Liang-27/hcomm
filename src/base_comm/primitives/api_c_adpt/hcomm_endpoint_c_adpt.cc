@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -16,8 +17,7 @@
 #include "log.h"
 #include "endpoint.h"
 #include "endpoint_monitor.h"
-#include "hcomm_res_mgr.h"
-#include "hcomm_result_defs.h"
+#include "common/result_defs_pub.h"
 #include "param_check_pub.h"
 #include "exception_handler.h"
 #include "opbase_adpt.h"
@@ -29,10 +29,12 @@
 #include "nic_plugin_manager.h"
 #include "hcomm_adapter_hccp.h"
 #include "eid_info_mgr.h"
+#include "base_comm_node_accessors.h"
 #include "hccp_hdc_manager.h"
-#include "orion_adpt_utils.h"
+#include "common/orion_adpt_utils_pub.h"
 #include "rdma_handle_manager.h"
 #include "adapter_rts_common.h"
+#include "common/dev_type_utils_pub.h"
 
 using namespace hcomm;
 
@@ -40,7 +42,7 @@ namespace {
 HcclResult GetDeviceEidInfos(int32_t deviceLogicId, uint32_t devicePhyId, std::vector<DevEidInfo>& eidInfos)
 {
     Hccl::HccpHdcManager::GetInstance().Init(static_cast<uint32_t>(deviceLogicId));
-    CHK_RET(EidInfoMgr::GetInstance(devicePhyId).GetEidInfos(eidInfos));
+    CHK_RET(GetEidInfoMgr(devicePhyId).GetEidInfos(eidInfos));
     CHK_PRT_RET(
         eidInfos.empty(),
         HCCL_ERROR(
@@ -119,7 +121,7 @@ HcclResult RegisterDeviceEndpointMonitorIfNeeded(const EndpointDesc* endpoint, E
     CHK_PRT_RET(
         devLogicIdSigned < 0, HCCL_ERROR("[%s] HcclGetThreadDeviceId failed, ret[%d]", __func__, devLogicIdSigned),
         HCCL_E_INTERNAL);
-    auto* ep = HcommResMgr::GetInstance().GetEndpointMgr().Get(handle);
+    auto* ep = GetEndpointHandleMgr().Get(handle);
     CHK_PRT_RET(ep == nullptr, HCCL_ERROR("[%s] endpoint not found, handle[%p]", __func__, handle), HCCL_E_NOT_FOUND);
     ep->AttachMonitor(devLogicIdSigned);
     CHK_RET(ep->RegisterToEndpointMonitor(devLogicIdSigned, handle));
@@ -172,7 +174,7 @@ HcommResult CreatePluginEndpointHolder(
     auto holder = std::make_unique<PluginEndpointHolder>(*endpoint, pluginEntry);
     holder->SetNicEndpointCtx(pluginHolderOps, pluginCtx);
     const EndpointHandle handle = static_cast<EndpointHandle>(holder.get());
-    auto& epMgr = HcommResMgr::GetInstance().GetEndpointMgr();
+    auto& epMgr = GetEndpointHandleMgr();
     EXCEPTION_CATCH(epMgr.Add(handle, std::move(holder)), return HCCL_E_INTERNAL);
     *endpointHandle = handle;
     HCCL_INFO(
@@ -198,12 +200,31 @@ HcclResult CreateBuiltinEndpoint(const EndpointDesc* endpoint, EndpointHandle* e
 
     // 内置 endpoint 不再调 SetNicEndpointCtx（内存操作经 GetLocalRegMemMgr()/GetRemoteRegMemMgr() 路径）
 
+    // move 前保存 rdmaHandle（endpoint 注册后 endpointPtr 被转移，不可再解引用）
+    void* rdmaHandle = endpointPtr->GetRdmaHandle();
     const EndpointHandle handle = static_cast<EndpointHandle>(endpointPtr.get());
     CHK_PTR_NULL(handle);
-    auto& epMgr = HcommResMgr::GetInstance().GetEndpointMgr();
+    auto& epMgr = GetEndpointHandleMgr();
     EXCEPTION_CATCH(epMgr.Add(handle, std::move(endpointPtr)), return HCCL_E_INTERNAL);
     *endpointHandle = handle;
     CHK_RET(RegisterDeviceEndpointMonitorIfNeeded(endpoint, handle));
+
+    // UB 协议 endpoint 完整创建成功后，通知 HCCP 开始 DFX 快照采集（避免后续步骤失败时 start 去重占位无回滚）；
+    // 仅 DEVICE loc 生效（HOST loc 的 UB endpoint 无 device 语义，loc.device.devPhyId 无效）；
+    // 仅通知本 endpoint 所属 die：rdmaHandle 绑定本 EID（per-EID ctx），复用 EidInfoMgr 按本 endpoint 的
+    // commAddr 直接查得 dieId（内部经 IpAddress(GetEid()) 归一化后查 map，EID/IP 两种地址形式均可命中）
+    // （UB_MEM 无 RDMA 上下文，rdmaHandle 恒为 nullptr，不参与快照通知）
+    if (endpoint->loc.locType == ENDPOINT_LOC_TYPE_DEVICE
+        && (endpoint->protocol == COMM_PROTOCOL_UB_CTP || endpoint->protocol == COMM_PROTOCOL_UBC_TP
+            || endpoint->protocol == COMM_PROTOCOL_UB_RTP)) {
+        // 查询失败（EID 列表未覆盖本 endpoint）时跳过快照通知，不影响 endpoint 创建
+        DevEidInfo eidInfo;
+        if (GetEidInfoMgr(endpoint->loc.device.devPhyId).GetEidInfoByAddr(endpoint->commAddr, eidInfo)
+            == HCCL_SUCCESS) {
+            (void)HccpNotifyDfxSnapshot(rdmaHandle, endpoint->loc.device.devPhyId, eidInfo.dieId, true);
+        }
+    }
+
     HCCL_INFO(
         "[%s] endpointDesc.protocol [%d] and endpointDesc.loc.locType [%d] create endpointHandle [%p] done.", __func__,
         endpoint->protocol, endpoint->loc.locType, handle);
@@ -217,17 +238,17 @@ HcommResult HcommEndpointGetDescNum(int32_t deviceLogicId, uint32_t* descNum)
     EXCEPTION_HANDLE_BEGIN
     CHK_PTR_NULL(descNum);
     *descNum = 0;
-    HcommResMgr::RegisterDeviceResetCallback();
-    HcommResMgr::RegisterDeviceRefreshCallback();
+    BaseCommMgr::RegisterDeviceResetCallback();
+    BaseCommMgr::RegisterDeviceRefreshCallback();
 
     CHK_PRT_RET(
         deviceLogicId < 0, HCCL_ERROR("[%s] deviceLogicId[%d] is invalid.", __func__, deviceLogicId), HCCL_E_PARA);
     DevType deviceType = DevType::DEV_TYPE_COUNT;
     CHK_RET(hrtGetDeviceType(deviceType));
     CHK_PRT_RET(
-        deviceType != DevType::DEV_TYPE_950,
+        !hcomm::EqualToOrGreaterThan950().value_or(false),
         HCCL_ERROR(
-            "[%s] endpoint query only supports DEV_TYPE_950, current deviceType[%d].", __func__,
+            "[%s] endpoint query only supports DEV_TYPE_950 and later, current deviceType[%d].", __func__,
             static_cast<int32_t>(deviceType)),
         HCCL_E_NOT_SUPPORT);
     uint32_t devicePhyId = 0;
@@ -248,8 +269,8 @@ HcommResult HcommEndpointGetDescs(int32_t deviceLogicId, uint32_t* descNum, Endp
     EXCEPTION_HANDLE_BEGIN
     CHK_PTR_NULL(descNum);
     CHK_PTR_NULL(endpointDescs);
-    HcommResMgr::RegisterDeviceResetCallback();
-    HcommResMgr::RegisterDeviceRefreshCallback();
+    BaseCommMgr::RegisterDeviceResetCallback();
+    BaseCommMgr::RegisterDeviceRefreshCallback();
 
     uint32_t devicePhyId = 0;
     std::vector<DevEidInfo> eidInfos;
@@ -259,9 +280,9 @@ HcommResult HcommEndpointGetDescs(int32_t deviceLogicId, uint32_t* descNum, Endp
     DevType deviceType = DevType::DEV_TYPE_COUNT;
     CHK_RET(hrtGetDeviceType(deviceType));
     CHK_PRT_RET(
-        deviceType != DevType::DEV_TYPE_950,
+        !hcomm::EqualToOrGreaterThan950().value_or(false),
         HCCL_ERROR(
-            "[%s] endpoint query only supports DEV_TYPE_950, current deviceType[%d].", __func__,
+            "[%s] endpoint query only supports DEV_TYPE_950 and later, current deviceType[%d].", __func__,
             static_cast<int32_t>(deviceType)),
         HCCL_E_NOT_SUPPORT);
     CHK_RET(hrtGetDevicePhyIdByIndex(static_cast<uint32_t>(deviceLogicId), devicePhyId));
@@ -293,7 +314,7 @@ HcommResult HcommEndpointGet(EndpointHandle endpointHandle, void** endpoint) // 
 {
     CHK_PTR_NULL(endpoint);
 
-    auto it = HcommResMgr::GetInstance().GetEndpointMgr().Get(endpointHandle);
+    auto it = GetEndpointHandleMgr().Get(endpointHandle);
     CHK_PRT_RET(
         it == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
@@ -317,8 +338,8 @@ HcommResult HcommEndpointCreate(const EndpointDesc* endpoint, EndpointHandle* en
     }
     (void)HcommResMgrInit();
     CHK_RET(CreateBuiltinEndpoint(endpoint, endpointHandle));
-    HcommResMgr::RegisterDeviceResetCallback();
-    HcommResMgr::RegisterDeviceRefreshCallback();
+    BaseCommMgr::RegisterDeviceResetCallback();
+    BaseCommMgr::RegisterDeviceRefreshCallback();
     EXCEPTION_HANDLE_END
     return HCCL_SUCCESS;
 }
@@ -326,13 +347,13 @@ HcommResult HcommEndpointCreate(const EndpointDesc* endpoint, EndpointHandle* en
 HcommResult HcommEndpointDestroy(EndpointHandle endpointHandle)
 {
     HCCL_INFO("[%s] START. endpointHandle[0x%llx].", __func__, endpointHandle);
-    auto& epMgr = HcommResMgr::GetInstance().GetEndpointMgr();
+    auto& epMgr = GetEndpointHandleMgr();
     auto* endpoint = epMgr.Get(endpointHandle);
     auto* pluginHolder = dynamic_cast<PluginEndpointHolder*>(endpoint);
     if (endpoint != nullptr && pluginHolder != nullptr && pluginHolder->GetNicOps() != nullptr) {
         HCCL_INFO("[NicPlugin][%s] destroy plugin endpoint.", __func__);
         // 先摘除 SharedJettyMgr 中该 plugin endpoint 的 channel 注册记录, 避免 plugin 句柄复用误判
-        hcomm::SharedJettyMgr::GetInstance().UnregisterEndpoint(endpointHandle);
+        hcomm::GetSharedJettyMgr().UnregisterEndpoint(endpointHandle);
         endpoint->ReleaseEndpointMonitor(endpointHandle);
         auto ret = epMgr.Remove(endpointHandle);
         CHK_PRT_RET(
@@ -342,7 +363,7 @@ HcommResult HcommEndpointDestroy(EndpointHandle endpointHandle)
     }
     (void)HcommResMgrInit();
     // 需校验共享 jetty channel 是否已全部销毁，否则残留 channel 持有的 jetty 引用会在 endpoint 销毁后成为悬空引用。
-    HcclResult jettyRet = hcomm::SharedJettyMgr::GetInstance().CheckEndpointDestroy(endpointHandle);
+    HcclResult jettyRet = hcomm::GetSharedJettyMgr().CheckEndpointDestroy(endpointHandle);
     CHK_PRT_RET(
         jettyRet != HCCL_SUCCESS,
         HCCL_ERROR(
@@ -354,7 +375,7 @@ HcommResult HcommEndpointDestroy(EndpointHandle endpointHandle)
     }
     // 在 Remove 释放 Endpoint 对象前摘除 SharedJettyMgr 反查记录，
     // 避免 Endpoint* 复用误判；此处单例确定存活（运行期），不依赖 ~Endpoint 调用以规避静态析构顺序风险。
-    hcomm::SharedJettyMgr::GetInstance().UnregisterEndpoint(endpointHandle);
+    hcomm::GetSharedJettyMgr().UnregisterEndpoint(endpointHandle);
     auto ret = epMgr.Remove(endpointHandle);
     CHK_PRT_RET(
         ret == false, HCCL_ERROR("[%s] endpoint not found, endpointHandle[0x%llx]", __func__, endpointHandle),
@@ -366,7 +387,7 @@ HcommResult
 HcommEndpointStartListen(EndpointHandle endpointHandle, uint32_t port, const HcommEndpointListenConfig* config)
 {
     (void)config;
-    auto endpoint = HcommResMgr::GetInstance().GetEndpointMgr().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgr().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
@@ -383,7 +404,7 @@ HcommEndpointStartListen(EndpointHandle endpointHandle, uint32_t port, const Hco
 
 HcommResult HcommEndpointStopListen(EndpointHandle endpointHandle, uint32_t port)
 {
-    auto endpoint = HcommResMgr::GetInstance().GetEndpointMgr().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgr().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);
@@ -400,7 +421,7 @@ HcommResult HcommEndpointStopListen(EndpointHandle endpointHandle, uint32_t port
 HcommResult HcommEndpointGetListenPort(EndpointHandle endpointHandle, uint32_t* port)
 {
     (void)HcommResMgrInit();
-    auto endpoint = HcommResMgr::GetInstance().GetEndpointMgr().Get(endpointHandle);
+    auto endpoint = GetEndpointHandleMgr().Get(endpointHandle);
     CHK_PRT_RET(
         endpoint == nullptr, HCCL_ERROR("[%s] endpoint not found, endpointHandle[%p]", __func__, endpointHandle),
         HCCL_E_NOT_FOUND);

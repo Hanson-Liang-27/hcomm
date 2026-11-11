@@ -51,7 +51,18 @@ private:
         CHK_RANGE_CLOSED<u32>(HCCL_INVALID_IF_BASE_PORT_MIN, HCCL_INVALID_IF_BASE_PORT_MAX)};
     CfgField<SocketIfName> hcclSocketIfName{"HCCL_SOCKET_IFNAME", SocketIfName({}, false, false), CastSocketIfName};
     CfgField<bool> whitelistDisable{"HCCL_WHITELIST_DISABLE", true, CastBin2Bool};
-    CfgField<std::string> hcclWhiteListFile{"HCCL_WHITELIST_FILE", "", Str2T<std::string>, CheckFilePath, SetRealPath};
+    CfgField<std::string> hcclWhiteListFile{
+        "HCCL_WHITELIST_FILE", "", Str2T<std::string>,
+        [](const std::string& filePath) {
+            CHK_RET_THROW(
+                InvalidParamsException,
+                StringFormat(
+                    "env[HCCL_WHITELIST_FILE] or env[HCCL_RDMA_QP_PORT_CONFIG_PATH] is invalid, len is %u, "
+                    "should be (0,4096)",
+                    filePath.length()),
+                CheckFilePath(filePath));
+        },
+        SetRealPath};
     CfgField<std::vector<SocketPortRange>> hcclHostSocketPortRange{
         "HCCL_HOST_SOCKET_PORT_RANGE", {}, [](const std::string& s) -> std::vector<SocketPortRange> {
             return CastSocketPortRange(s, "HCCL_HOST_SOCKET_PORT_RANGE");
@@ -167,7 +178,17 @@ private:
         std::vector<std::uint16_t>& ports) const;
     void LogMultiQpSrcPortConfig() const;
     CfgField<std::string> qpPortConfigPath{
-        "HCCL_RDMA_QP_PORT_CONFIG_PATH", "", Str2T<std::string>, CheckFilePath, SetRealPath};
+        "HCCL_RDMA_QP_PORT_CONFIG_PATH", "", Str2T<std::string>,
+        [](const std::string& filePath) {
+            CHK_RET_THROW(
+                InvalidParamsException,
+                StringFormat(
+                    "env[HCCL_WHITELIST_FILE] or env[HCCL_RDMA_QP_PORT_CONFIG_PATH] is invalid, len is %u, "
+                    "should be (0,4096)",
+                    filePath.length()),
+                CheckFilePath(filePath));
+        },
+        SetRealPath};
     MultiQpSrcPortConfig multiQpSrcPortConfig_;
 };
 
@@ -228,7 +249,8 @@ public:
 private:
     CfgField<bool> entryLogEnable{"HCCL_ENTRY_LOG_ENABLE", false, CastBin2Bool};
     CfgField<std::string> cannVersion{"LD_LIBRARY_PATH", "", CastCannVersion};
-    CfgField<DfsConfig> dfsConfig{"HCCL_DFS_CONFIG", DfsConfig(true, true, 0), CastDfsConfig};
+    CfgField<DfsConfig> dfsConfig{
+        "HCCL_DFS_CONFIG", DfsConfig(true, true, 0, 0, HCCL_MIN_CONNECT_FAULT_DETECTION_TIME), CastDfsConfig};
 };
 
 // 绕路使能环境变量

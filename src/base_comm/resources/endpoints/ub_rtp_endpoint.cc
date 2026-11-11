@@ -13,12 +13,12 @@
 #include "hccl/hccl_res.h"
 #include "ub_reged_mem_mgr.h"
 #include "endpoint_remote_reged_mem_mgr.h"
+#include "base_comm_node_accessors.h"
 #include "adapter_rts_common.h"
 #include "rdma_handle_manager.h"
 #include "mgr/endpoint_ctx_mgr.h"
-#include "hcomm_res_mgr.h"
-#include "../../common/orion_adpt_utils.h"
-#include "dev_type_utils.h"
+#include "common/orion_adpt_utils_pub.h"
+#include "common/dev_type_utils_pub.h"
 
 namespace hcomm {
 
@@ -51,7 +51,7 @@ HcclResult UbRtpEndpoint::ReleaseEndpointCtx()
     // 先放掉自身引用，再触发 EndpointCtxMgr 移除
     EndpointCtxKey key = endpointCtx_->key;
     endpointCtx_.reset();
-    HcommResMgr::GetInstance().GetDeviceResMgr(key.devPhyId).GetEndpointCtxMgr().Release(key);
+    GetEndpointCtxMgr(key.devPhyId).Release(key);
     return HCCL_SUCCESS;
 }
 
@@ -74,10 +74,7 @@ HcclResult UbRtpEndpoint::Init()
 
     Hccl::HccpHdcManager::GetInstance().Init(deviceLogicId);
     EndpointCtxKey ctxKey{devPhyId, COMM_PROTOCOL_UB_CTP, endpointDesc_.loc.locType, eidAddr};
-    CHK_RET(HcommResMgr::GetInstance()
-                .GetDeviceResMgr(ctxKey.devPhyId)
-                .GetEndpointCtxMgr()
-                .Acquire(ctxKey, false, endpointCtx_));
+    CHK_RET(GetEndpointCtxMgr(ctxKey.devPhyId).Acquire(ctxKey, false, endpointCtx_));
     CHK_PTR_NULL(endpointCtx_);
     ctxHandle_ = endpointCtx_->ctxHandle;
     HCCL_INFO(
@@ -91,6 +88,18 @@ HcclResult UbRtpEndpoint::Init()
     });
     EXCEPTION_CATCH(
         remoteMemMgr_ = std::make_shared<EndpointRemoteRegedMemMgr>(ctxHandle_, ParseUbMemDesc, CreateUbRemoteBuffer), {
+            CHK_RET(ReleaseEndpointCtx());
+            return HCCL_E_INTERNAL;
+        });
+
+    // 接入真实监听上下文（替代历史 no-op 语义）：承载 HcommEndpointGetListenPort（惰性创建监听并
+    // 分配动态端口）与 StartListen/StopListen。devPhyId 已在上方解析写入，构造需晚于该步骤。
+    // 析构时仅释放 GetListenPort 惰性创建的监听引用；StartListen 创建的监听需配对 StopListen 释放。
+    EXCEPTION_CATCH(
+        serverSocketContext_.emplace(
+            Hccl::ConnectProtoType::UB, endpointDesc_.loc.device.devPhyId, endpointDesc_.loc.locType,
+            endpointDesc_.commAddr),
+        {
             CHK_RET(ReleaseEndpointCtx());
             return HCCL_E_INTERNAL;
         });

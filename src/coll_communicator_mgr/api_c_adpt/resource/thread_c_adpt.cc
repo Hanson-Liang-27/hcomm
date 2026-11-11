@@ -19,18 +19,17 @@
 #include "hccl_comm_pub.h"
 #include "hccl_independent_common.h"
 #include "coll_comm_profiling.h"
-#include "comm_engine_utils.h"
+#include "common/comm_engine_utils_pub.h"
 #include "coll_comm_mgr.h"
 #include "orion_adapter_rts.h"
 #include "hccl_common.h"
-#include "dfx_dlprof_function.h"
-#include "adapter_rts.h"
-#include "hcclCommOp.h"
-#include "hcomm_thread_c_adpt.h"
-#include "hcomm_res.h"
-#include "thread.h"
-#include "res_pub.h"
-#include "prof_cycle_time.h"
+#include "adapter_rts_common.h"
+#include "comm_engine/thread/dfx/thread_dfx_pub.h"
+#include "comm_engine/thread/thread_pub.h"
+#include "comm_engine/thread/order_ctrl_thread_pub.h"
+#include "comm_engine/aicpu_comm_def_pub.h"
+#include "dfx/prof_utils_pub.h"
+#include "common/cast_utils_pub.h"
 using namespace hccl;
 constexpr u32 MAX_EXPORT_THREAD_NUM = 40U;
 static const std::unordered_set<HcclDedicatedThreadType> ORDER_LAUNCH_TYPES = {
@@ -95,7 +94,7 @@ HcclResult HcclThreadAcquireWithConfigDfx(
         mc2CommInfo.myRankId = collComm->GetMyRankId();
         mc2CommInfo.rankSize = collComm->GetRankSize();
         CHK_RET(collComm->GetParentRankId(mc2CommInfo.parentRankId));
-        hcclCommDfx->ReportMc2CommInfo(mc2CommInfo);
+        CHK_RET(hcclCommDfx->ReportMc2CommInfo(mc2CommInfo));
         HCCL_INFO("[HcclThreadAcquireWithConfigDfx] ReportThreadAcquireKernel begin");
         const std::string KernelName = "RunAicpuIndOpThreadInit";
         // 这个地方获取不到当前是单算子还是图模式，所以全部都不保存
@@ -219,6 +218,7 @@ static CommEngine ConvertEngineToTsType(CommEngine engine)
 HcclResult HcclThreadAcquire(
     HcclComm comm, CommEngine engine, uint32_t threadNum, uint32_t notifyNumPerThread, ThreadHandle* threads)
 {
+    EXCEPTION_HANDLE_BEGIN
     u64 beginTime = hcomm::GetProfCycleTime();
     CHK_PRT_RET(comm == nullptr, HCCL_ERROR("[%s] comm is null", __func__), HCCL_E_PTR);
     CHK_PRT_RET(threads == nullptr, HCCL_ERROR("[%s] threads is null", __func__), HCCL_E_PTR);
@@ -241,8 +241,10 @@ HcclResult HcclThreadAcquire(
         ThreadConfigInit(config.get(), threadNum) != 0, HCCL_ERROR("[%s] ThreadConfigInit failed", __func__),
         HCCL_E_INTERNAL);
     CHK_PRT_RET(
-        notifyNumPerThread >= HCOMM_THREAD_NOTIFY_MAX_NUM,
-        HCCL_ERROR("[%s] notifyNumPerThread[%u] exceeds HCOMM_THREAD_NOTIFY_MAX_NUM", __func__, notifyNumPerThread),
+        notifyNumPerThread > UINT16_MAX,
+        HCCL_ERROR(
+            "[%s] notifyNumPerThread[%u] exceeds ThreadConfig uint16 limit[%u]", __func__, notifyNumPerThread,
+            UINT16_MAX),
         HCCL_E_PARA);
     for (u32 i = 0; i < threadNum; i++) {
         config[i].notifyNumPerThread = static_cast<uint16_t>(notifyNumPerThread);
@@ -284,6 +286,8 @@ HcclResult HcclThreadAcquire(
     HCCL_INFO(
         "[%s] Allocated %u threads for engine[%s], notifyPerThread[%u]", __func__, threadNum,
         GetEnumToString(GetCommEngineStatusStrMap(), engine).c_str(), notifyNumPerThread);
+    EXCEPTION_HANDLE_END
+
     return HCCL_SUCCESS;
 }
 
@@ -300,11 +304,12 @@ HcclResult HcclThreadAcquireWithStreamDfx(
         uint64_t sqIdVal = 0;
         ThreadResTypeStream stream = nullptr;
         uint32_t size = sizeof(ThreadResTypeStream);
-        HcommResult infoRet = HcommThreadResGetInfo(thread, THREAD_RES_TYPE_STREAM, size, (void**)&stream);
+        HcommResult infoRet
+            = HcommThreadResGetInfo(thread, THREAD_RES_TYPE_STREAM, size, ReinterpretAs<void**>(&stream));
         CHK_PRT_RET(
             (infoRet != HCCL_SUCCESS) || (stream == nullptr),
             HCCL_ERROR("[%s] HcommThreadResGetInfo failed, ret[%d] stream[%p]", __func__, infoRet, stream),
-            (HcclResult)infoRet);
+            static_cast<HcclResult>(infoRet));
         uint32_t sqId = 0;
         HcclResult sqIdRet = hrtStreamGetSqid(stream, &sqId);
         CHK_PRT_RET(
@@ -320,7 +325,7 @@ HcclResult HcclThreadAcquireWithStreamDfx(
         CHK_RET(collComm->GetParentRankId(mc2CommInfo.parentRankId));
         HcclCommDfx* hcclCommDfx = collComm->GetHcclCommDfx();
         CHK_PTR_NULL(hcclCommDfx);
-        hcclCommDfx->ReportMc2CommInfo(mc2CommInfo);
+        CHK_RET(hcclCommDfx->ReportMc2CommInfo(mc2CommInfo));
     }
     return HCCL_SUCCESS;
 }
@@ -372,16 +377,17 @@ HcclResult HcclDedicatedThreadAcquire(
     CHK_PRT_RET(comm == nullptr, HCCL_ERROR("[%s] comm is null", __func__), HCCL_E_PTR);
     CHK_PRT_RET(thread == nullptr, HCCL_ERROR("[%s] thread is null", __func__), HCCL_E_PTR);
     CHK_PRT_RET(
-        useType == HCCL_DED_THREAD_TYPE_INVALID, HCCL_ERROR("[%s] dedThreadType is invalid", __func__), HCCL_E_PARA);
+        useType == HCCL_DED_THREAD_TYPE_INVALID, HCCL_ERROR("[%s] HcclDedicatedThreadType is invalid", __func__),
+        HCCL_E_PARA);
 
     auto* hcclComm = static_cast<hccl::hcclComm*>(comm);
     const std::string& commId = hcclComm->GetIdentifier();
     HCCL_INFO(
-        "Entry-%s:comm[%s] dedThreadType[%u] notifyNumPerThread[%u]", __func__, commId.c_str(), useType,
+        "Entry-%s:comm[%s] HcclDedicatedThreadType[%u] notifyNumPerThread[%u]", __func__, commId.c_str(), useType,
         notifyNumPerThread);
     hccl::CollComm* collComm = hcclComm->GetCollComm();
     CHK_PTR_NULL(collComm);
-    /* 保序场景：委托给 OrderLaunchThreadMgr（进程粒度）；不提前返回，统一落到函数末尾审计日志 */
+    /* 保序场景：委托给 OrderLaunchThreadMgr（进程粒度） */
     if (ORDER_LAUNCH_TYPES.find(useType) != ORDER_LAUNCH_TYPES.end()) {
         s32 deviceLogicId = Hccl::HrtGetDevice();
         auto& resMgr = hccl::CollCommMgr::GetInstance().GetOrderLaunchThreadMgr(deviceLogicId);
@@ -390,7 +396,8 @@ HcclResult HcclDedicatedThreadAcquire(
         CHK_PRT_RET(
             ret != HCCL_SUCCESS,
             HCCL_ERROR(
-                "[%s] OrderLaunchThreadAcquire fail, ret[%d], useType[%d]", __func__, ret, static_cast<s32>(useType)),
+                "[%s] OrderLaunchThreadAcquire fail, ret[%d], HcclDedicatedThreadType[%d]", __func__, ret,
+                static_cast<s32>(useType)),
             ret);
         *thread = th;
         // 仅context级共享的OPBASE/ACLGRAPH登记order控制流集合（白名单，时序早于export、miss查询
@@ -401,109 +408,23 @@ HcclResult HcclDedicatedThreadAcquire(
                 || useType == HCCL_DED_THREAD_TYPE_AICPU_ORDER_LAUNCH_ACLGRAPH)) {
             hccl::MarkOrderCtrlThread(*thread);
         }
-    } else {
-        CommEngineResMgr* engineResMgr = collComm->GetCommEngineResMgr();
-        CHK_PTR_NULL(engineResMgr);
-        CHK_RET(engineResMgr->HcclDedicatedThreadAcquire(useType, notifyNumPerThread, thread));
+        return HCCL_SUCCESS;
     }
 
+    CommEngineResMgr* engineResMgr = collComm->GetCommEngineResMgr();
+    CHK_PTR_NULL(engineResMgr);
+    // DFX回调经独立记录接口下发至ThreadMgr，首建点注册（GE分支在ThreadMgr内注册no-op，无需回调）
+    if (useType == HCCL_DED_THREAD_TYPE_AICPU_LAUNCH) {
+        HcclCommDfx* hcclCommDfx = collComm->GetHcclCommDfx();
+        CHK_PTR_NULL(hcclCommDfx);
+        CHK_RET(engineResMgr->HcclDedicatedThreadDfx(collComm->GetDfxCallback()));
+    }
+    CHK_RET(engineResMgr->HcclDedicatedThreadAcquire(useType, notifyNumPerThread, thread));
+    HCCL_INFO(
+        "[%s] success, dedThreadType[%u], thread[0x%llx], notifyNumPerThread[%u]", __func__, useType,
+        static_cast<unsigned long long>(*thread), notifyNumPerThread);
     EXCEPTION_HANDLE_END
 
-    return HCCL_SUCCESS;
-}
-
-HcclResult HcclAllocNotify(
-    HcclComm comm, CommEngine commEngine, ::NotifyType notifyType, uint32_t notifyNum, NotifyHandle** notifyHandleList)
-{
-    CHK_PRT_RET(comm == nullptr, HCCL_ERROR("[%s] comm is null", __func__), HCCL_E_PARA);
-    CHK_PRT_RET(
-        !IsValidCommEngine(commEngine),
-        HCCL_ERROR(
-            "[%s] commEngine[%s] is invalid", __func__,
-            GetEnumToString(GetCommEngineStatusStrMap(), commEngine).c_str()),
-        HCCL_E_PARA);
-    CHK_PRT_RET(
-        !IsValidNotify(notifyType), HCCL_ERROR("[%s] notifyType[%u] is invalid", __func__, notifyType), HCCL_E_PARA);
-    CHK_PRT_RET(
-        notifyNum > NOTIFY_MAX_NUM || notifyNum == 0, HCCL_ERROR("[%s] notifyNum[%u] is invalid", __func__, notifyNum),
-        HCCL_E_PARA);
-    CHK_PRT_RET(notifyHandleList == nullptr, HCCL_ERROR("[%s] notifyHandleList is null", __func__), HCCL_E_PARA);
-    CHK_PRT_RET(*notifyHandleList != nullptr, HCCL_ERROR("[%s] notifyHandleList is not null", __func__), HCCL_E_PARA);
-
-    if (commEngine == CommEngine::COMM_ENGINE_CPU || commEngine == CommEngine::COMM_ENGINE_CPU_TS
-        || commEngine == CommEngine::COMM_ENGINE_CCU) {
-        if (notifyType != ::NOTIFY_TYPE_RTS_NOTIFY) {
-            HCCL_ERROR(
-                "[%s] commEngine[%s] and notifyType[%u] are mismatch", __func__,
-                GetEnumToString(GetCommEngineStatusStrMap(), commEngine).c_str(), notifyType);
-            return HCCL_E_PARA;
-        }
-    } else {
-        if (notifyType != ::NOTIFY_TYPE_DEVICE_MEM) {
-            HCCL_ERROR(
-                "[%s] commEngine[%s] and notifyType[%u] are mismatch", __func__,
-                GetEnumToString(GetCommEngineStatusStrMap(), commEngine).c_str(), notifyType);
-            return HCCL_E_PARA;
-        }
-    }
-
-    auto* hcclComm = static_cast<hccl::hcclComm*>(comm);
-    std::string commId = hcclComm->GetIdentifier();
-    HCCL_RUN_INFO(
-        "Entry-%s:comm[%s] commEngine[%s] notifyType[%u] notifyNum[%u]", __func__, commId.c_str(),
-        GetEnumToString(GetCommEngineStatusStrMap(), commEngine).c_str(), notifyType, notifyNum);
-    HcclResult ret = HCCL_SUCCESS;
-    if (hcclComm->IsCommunicatorV2()) {
-        hccl::CollComm* collComm = hcclComm->GetCollComm();
-        CHK_PTR_NULL(collComm);
-        CommEngineResMgr* engineResMgr = collComm->GetCommEngineResMgr();
-        CHK_PTR_NULL(engineResMgr);
-        ret = engineResMgr->HcclAllocNotify(commEngine, notifyType, notifyNum, notifyHandleList);
-    } else {
-        auto& engineResMgr = hcclComm->GetIndependentOp().GetCommEngineResMgr();
-        ret = engineResMgr.HcclAllocNotify(commEngine, notifyType, notifyNum, notifyHandleList);
-    }
-
-    if (ret != HCCL_SUCCESS) {
-        HCCL_ERROR(
-            "[%s] Failed to create notify for commEngine[%s]", __func__,
-            GetEnumToString(GetCommEngineStatusStrMap(), commEngine).c_str());
-        return ret;
-    }
-
-    HCCL_RUN_INFO(
-        "[%s] Allocated notify for commEngine[%s], notifyType[%u], notifyNum[%u]", __func__,
-        GetEnumToString(GetCommEngineStatusStrMap(), commEngine).c_str(), notifyType, notifyNum);
-    return HCCL_SUCCESS;
-}
-
-HcclResult HcommFreeNotify(HcclComm comm, uint32_t notifyNum, NotifyHandle* notifyHandleList)
-{
-    CHK_PRT_RET(comm == nullptr, HCCL_ERROR("[%s] comm is null", __func__), HCCL_E_PARA);
-    CHK_PRT_RET(notifyHandleList == nullptr, HCCL_ERROR("[%s] notifyHandleList is null", __func__), HCCL_E_PARA);
-    CHK_PRT_RET(
-        notifyNum > NOTIFY_MAX_NUM || notifyNum == 0, HCCL_ERROR("[%s] notifyNum[%u] is invalid", __func__, notifyNum),
-        HCCL_E_PARA);
-    auto* hcclComm = static_cast<hccl::hcclComm*>(comm);
-    std::string commId = hcclComm->GetIdentifier();
-    HCCL_RUN_INFO("Entry-%s:comm[%s] notifyNum[%u]", __func__, commId.c_str(), notifyNum);
-    HcclResult ret = HCCL_SUCCESS;
-    if (hcclComm->IsCommunicatorV2()) {
-        hccl::CollComm* collComm = hcclComm->GetCollComm();
-        CHK_PTR_NULL(collComm);
-        CommEngineResMgr* engineResMgr = collComm->GetCommEngineResMgr();
-        CHK_PTR_NULL(engineResMgr);
-        ret = engineResMgr->HcommFreeNotify(notifyNum, notifyHandleList);
-    } else {
-        auto& engineResMgr = hcclComm->GetIndependentOp().GetCommEngineResMgr();
-        ret = engineResMgr.HcommFreeNotify(notifyNum, notifyHandleList);
-    }
-    if (ret != HCCL_SUCCESS) {
-        HCCL_ERROR("[%s] Failed to free notify", __func__);
-        return ret;
-    }
-
-    HCCL_RUN_INFO("[%s] Free notify for notifyNum[%u]", __func__, notifyNum);
     return HCCL_SUCCESS;
 }
 

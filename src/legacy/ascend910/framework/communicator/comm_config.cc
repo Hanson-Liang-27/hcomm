@@ -36,7 +36,8 @@ CommConfig::CommConfig(const std::string& commName)
       bufferName_(""),
       hcclQos_(HCCL_COMM_QOS_CONFIG_NOT_SET),
       symmetricMemoryStride_(HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE),
-      sqDepth_(HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET)
+      sqDepth_(HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET),
+      scqDepth_(HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET)
 {
     InitAlgoConfig();
     InitRetryEnable();
@@ -61,7 +62,8 @@ CommConfig::CommConfig()
       bufferName_(""),
       hcclQos_(HCCL_COMM_QOS_CONFIG_NOT_SET),
       symmetricMemoryStride_(HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE),
-      sqDepth_(HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET)
+      sqDepth_(HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET),
+      scqDepth_(HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET)
 {
     InitAlgoConfig();
     InitRetryEnable();
@@ -150,18 +152,18 @@ HcclResult CommConfig::CheckMagicWord(const CommConfigHandle& config)
 
 HcclResult CommConfig::SetConfigByVersion(const CommConfigHandle& config)
 {
-    if (config.info.version > CommConfigVersion::COMM_CONFIG_VERSION_ELEVEN) {
+    if (config.info.version > CommConfigVersion::COMM_CONFIG_VERSION_TWELVE) {
         // 传入的config的版本高于当前版本，警告不支持的配置项将被忽略
         HCCL_WARNING(
             "[SetConfigByVersion] The version of provided config[%u] is higher than the current version[%u], "
             "unsupported configuration will be ignored.",
-            config.info.version, CommConfigVersion::COMM_CONFIG_VERSION_ELEVEN);
-    } else if (config.info.version < CommConfigVersion::COMM_CONFIG_VERSION_ELEVEN) {
+            config.info.version, CommConfigVersion::COMM_CONFIG_VERSION_TWELVE);
+    } else if (config.info.version < CommConfigVersion::COMM_CONFIG_VERSION_TWELVE) {
         // 传入的config的版本低于当前版本，警告高版本支持的配置项将被忽略
         HCCL_WARNING(
             "[SetConfigByVersion] The version of provided config[%u] is lower than the current version[%u], "
             "configurations supported by later versions will be ignored.",
-            config.info.version, CommConfigVersion::COMM_CONFIG_VERSION_ELEVEN);
+            config.info.version, CommConfigVersion::COMM_CONFIG_VERSION_TWELVE);
     }
 
     if (config.info.version >= CommConfigVersion::COMM_CONFIG_VERSION_ONE) {
@@ -204,7 +206,7 @@ HcclResult CommConfig::SetConfigByVersion(const CommConfigHandle& config)
             std::vector<std::string>({"ccl_op", "value", "parameter", "expect"}),
             std::vector<std::string>(
                 {"HcclCommInitRootInfoConfig", std::to_string(config.aclGraphZeroCopyEnable), "aclGraphZeroCopy",
-                 "0 or 1."}));
+                 "0 or 1"}));
         CHK_PRT_RET(
             config.aclGraphZeroCopyEnable > 1,
             HCCL_ERROR(
@@ -240,6 +242,11 @@ HcclResult CommConfig::SetConfigByVersion(const CommConfigHandle& config)
         // 版本大于等于11，支持配置通信域级别的sqDepth
         sqDepth_ = config.sqDepth;
     }
+
+    if (config.info.version >= CommConfigVersion::COMM_CONFIG_VERSION_TWELVE) {
+        // 版本大于等于12，支持配置通信域级别的scqDepth
+        scqDepth_ = config.scqDepth;
+    }
     HCCL_INFO("CommConfig version: config.info.version = [%u].", config.info.version);
     return HCCL_SUCCESS;
 }
@@ -256,7 +263,7 @@ HcclResult CommConfig::SetConfigBufferSize(const CommConfigHandle& config)
             true, "EI0003", std::vector<std::string>({"ccl_op", "value", "parameter", "expect"}),
             std::vector<std::string>(
                 {"HcclCommInitRootInfoConfig", std::to_string(config.bufferSize), "hcclBufferSize",
-                 "should be equal to or greater than 1(MB)."}));
+                 "should be equal to or greater than 1(MB)"}));
         HCCL_ERROR(
             "[%s][%s] The configuration of hcclBufferSize[%u(MB)] is invalid, which should be "
             "greater than %u(MB).",
@@ -282,7 +289,7 @@ HcclResult CommConfig::SetConfigDeterministic(const CommConfigHandle& config)
             true, "EI0003", std::vector<std::string>({"ccl_op", "value", "parameter", "expect"}),
             std::vector<std::string>(
                 {"HcclCommInitRootInfoConfig", std::to_string(config.deterministic), "hcclDeterministic",
-                 "should be 0(disable) , 1(enable) or 2(strict)."}));
+                 "should be 0(disable) , 1(enable) or 2(strict)"}));
         HCCL_ERROR(
             "[%s][%s] The configuration of hcclDeterministic[%u] is invalid, "
             "which should be 0(disable) , 1(enable) or 2(strict).",
@@ -297,7 +304,7 @@ HcclResult CommConfig::SetConfigDeterministic(const CommConfigHandle& config)
                     true, "EI0003", std::vector<std::string>({"ccl_op", "value", "parameter", "expect"}),
                     std::vector<std::string>(
                         {"HcclCommInitRootInfoConfig", std::to_string(config.deterministic), "hcclDeterministic",
-                         "set to 2(strict), only support A2/A3."}));
+                         "set to 2(strict), only support A2/A3"}));
                 HCCL_ERROR(
                     "[%s][%s] The configuration of hcclDeterministic[%u] is set to "
                     "2(strict), and only support A2/A3",
@@ -712,6 +719,18 @@ HcclResult CommConfig::SetConfigSqDepth(u32 sqDepth)
     return HCCL_SUCCESS;
 }
 
+HcclResult CommConfig::SetConfigScqDepth(u32 scqDepth)
+{
+    scqDepth_ = scqDepth;
+    return HCCL_SUCCESS;
+}
+
+HcclResult CommConfig::SetConfigSymmetricMemoryStride(u64 stride)
+{
+    symmetricMemoryStride_ = stride;
+    return HCCL_SUCCESS;
+}
+
 HcclResult CommConfig::SetConfigDeterministic(u8 deterministic)
 {
     deterministic_ = deterministic;
@@ -779,4 +798,6 @@ u32 CommConfig::GetConfigHcclQos() const
 u64 CommConfig::GetConfigSymmetricMemoryStride() const { return symmetricMemoryStride_; }
 
 u32 CommConfig::GetConfigSqDepth() const { return sqDepth_; }
+
+u32 CommConfig::GetConfigScqDepth() const { return scqDepth_; }
 } // namespace hccl

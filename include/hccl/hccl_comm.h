@@ -129,10 +129,10 @@ extern HcclResult HcclCommInitRootInfoScalable(
     const HcclCommConfig* config, HcclComm* comm);
 
 /**
- * @brief Set deterministic calculate
+ * @brief Set HCCL config.
  *
- * @param config A struct identifying the Config
- * @param configValue An integer identifying the identify for the config.
+ * @param config An enum identifying the config item.
+ * @param configValue A union identifying the value for the config.
  */
 
 extern HcclResult HcclSetConfig(HcclConfig config, HcclConfigValue configValue) HCOMM_WEAK_SYMBOL;
@@ -164,6 +164,9 @@ extern HcclResult HcclCommGetHandleWithName(const char* commName, HcclComm* comm
  * @param comm A pointer identifying the communication resource based on.
  * @param rankSize  A pointer identifying the rank size.
  * @return HcclResult
+ * @note 独立标量出参，通信域保持存活期间支持多线程并发查询；
+ *       Ascend 950PR&950DT系列产品支持多线程并发调用，Atlas A2系列与Atlas A3系列产品不支持多线程并发调用。
+ *       通信域销毁（HcclCommDestroy）不得与本接口并发。
  */
 extern HcclResult HcclGetRankSize(HcclComm comm, uint32_t* rankSize) HCOMM_WEAK_SYMBOL;
 
@@ -173,6 +176,9 @@ extern HcclResult HcclGetRankSize(HcclComm comm, uint32_t* rankSize) HCOMM_WEAK_
  * @param comm A pointer identifying the communication resource based on.
  * @param rank  A pointer identifying the rank id.
  * @return HcclResult
+ * @note 独立标量出参，通信域保持存活期间支持多线程并发查询；
+ *       Ascend 950PR&950DT系列产品支持多线程并发调用，Atlas A2系列与Atlas A3系列产品不支持多线程并发调用。
+ *       通信域销毁（HcclCommDestroy）不得与本接口并发。
  */
 extern HcclResult HcclGetRankId(HcclComm comm, uint32_t* rank) HCOMM_WEAK_SYMBOL;
 /**
@@ -190,6 +196,10 @@ extern HcclResult HcclBarrier(HcclComm comm, aclrtStream stream) HCOMM_WEAK_SYMB
  * @param comm A pointer identifying the communication resource targeting
  * @return HcclResult
  * @see HcclCommInitClusterInfo()
+ * @note 通信域销毁不得与任何查询类接口（HcclGetRankId、HcclGetRankSize、HcclRankGraphGet系列、
+ *       HcclGetHcclBuffer系列、HcclChannelGet系列、HcclGetHeterogMode、HcclCommQuery系列、
+ *       HcclThreadResGetInfo、HcclEngineCtxGet等）在同一通信域上并发；
+ *       销毁前须确保所有使用该通信域的线程已结束对该通信域的所有调用。
  */
 extern HcclResult HcclCommDestroy(HcclComm comm) HCOMM_WEAK_SYMBOL;
 
@@ -264,6 +274,7 @@ static inline void HcclCommConfigInit(HcclCommConfig* config)
     config->hcclQos = HCCL_COMM_QOS_CONFIG_NOT_SET;
     config->hcclSymWinMaxMemSizePerRank = HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE;
     config->hcclChannelSqDepth = HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET;
+    config->hcclChannelScqDepth = HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET;
 }
 
 /**
@@ -373,6 +384,25 @@ extern HcclResult HcclGroupEnd();
 extern HcclResult HcclGroupStatusGet(bool* isGroupEnabled);
 
 /**
+ * @brief Send/Receive算子入口检测group状态，group开启时将算子信息按序加入队列缓存
+ *
+ * @details 需在HcclGroupStart之后调用；HcclGroupEnd时按序出队，并将HcclOpDesc中的
+ *          Send/Receive算子信息转换为批量执行函数的入参后统一执行
+ *
+ * @param comm Communication domain handle
+ * @param opDesc Operator descriptor，仅支持Send/Receive算子
+ * @param stream 本rank所使用的stream，GroupEnd时批量执行以同一通信域内首条任务的stream为准
+ * @param func GroupEnd时批量执行的函数指针，签名须为
+ *             HcclResult (*)(HcclSendRecvItem* sendRecvInfo, uint32_t itemNum, HcclComm comm, aclrtStream stream)
+ * @return HcclResult
+ *   HCCL_SUCCESS: 入队成功
+ *   HCCL_E_INTERNAL: group未开启（未调用HcclGroupStart）
+ *   HCCL_E_PTR: 参数为空指针或通信域无队列实例（即非V2通信域）
+ *   HCCL_E_PARA: 参数非法
+ */
+extern HcclResult HcclGroupEnqueueOp(HcclComm comm, const HcclOpDesc* opDesc, aclrtStream stream, void* func);
+
+/**
  * @brief Register a memory window for HCCL communication.
  *
  * @param comm A pointer identifying the communication resource based on.
@@ -414,7 +444,9 @@ typedef enum {
     HCCL_OP_EXPANSION_MODE_HOST_TS = 3,
     HCCL_OP_EXPANSION_MODE_CCU_MS = 4,
     HCCL_OP_EXPANSION_MODE_CCU_SCHED = 5,
-    HCCL_OP_EXPANSION_AIV_ONLY = 6
+    HCCL_OP_EXPANSION_AIV_ONLY = 6,
+    HCCL_OP_EXPANSION_MODE_CCU_MS_ONLY = 7,
+    HCCL_OP_EXPANSION_MODE_CCU_SCHED_ONLY = 8
 } HcclOpExpansionMode;
 
 typedef enum {

@@ -89,6 +89,12 @@ namespace CcuRep {
         HcclResult CcuRepFuncCallTranslate(
             CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepFuncCall* funcCallPtr,
             const TransDep& dep) override;
+        HcclResult CcuRepAddressableFuncBlockTranslate(
+            CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepAddressableFuncBlock* funcBlockPtr,
+            const TransDep& dep, uint32_t step) override;
+        HcclResult CcuRepAddrFuncCallTranslate(
+            CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepAddrFuncCall* funcCallPtr,
+            const TransDep& dep) override;
         HcclResult CcuRepJumpTranslate(
             CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepJump* jumpPtr,
             const TransDep& dep) override;
@@ -169,6 +175,9 @@ namespace CcuRep {
         HcclResult PrepareConstValue(CcuRepBase* repPtr, const TransDep& dep, CcuKernel* ccuKernel) override;
 
     private:
+        void GenAddressableFuncPrelude(
+            CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, const TransDep& dep) const;
+
         HcclResult CcuRepJumpTranslateV2Base(
             const CcuInstr* const& curInstr, const uint16_t& curInstrId, CcuRepJumpBase* jumpBasePtr, uint64_t expected,
             const Variable& condition, const Variable& expectedVar, ConditionType condType) const;
@@ -198,9 +207,15 @@ namespace CcuRep {
         HcclResult LoopGroupConfigTranslate(
             CcuInstr*& instr, uint16_t& curInstrId, const CcuRepLoopGroupBundle* bundlePtr, const TransDep& dep,
             bool isConfig, bool isCompat, uint16_t& loopGroupConfigId) const;
+        void EmitLsxBoundGuard(CcuInstr*& instr, uint16_t offsetXnId, uint16_t arraySize, const TransDep& dep) const;
 
-        static constexpr uint32_t V2_FUNC_BLOCK_INSTR_NUM = 11; // FuncBlock: RelJmp(9)+Jump(1)+Nop(1)
-        static constexpr uint32_t V2_FUNC_CALL_INSTR_NUM = 13;  // FuncCall: FuncBlock(11)+Call(2)
+        static constexpr uint32_t V2_FUNC_BLOCK_INSTR_NUM = 11;     // FuncBlock: RelJmp(9)+Jump(1)+Nop(1)
+        static constexpr uint32_t V2_FUNC_CALL_INSTR_NUM = 13;      // FuncCall: FuncBlock(11)+Call(2)
+        static constexpr uint32_t V2_LSX_BOUND_GUARD_INSTR_NUM = 4; // 护栏: LoadImdToXn(2)+Jump(1)+Wait(1)
+        static constexpr uint32_t V2_LSX_INSTR_NUM = V2_LSX_BOUND_GUARD_INSTR_NUM + 1;
+        // RecordSharedNotify 两分支构成(见 CcuRepRecordSharedNotifyTranslate, 改发射条数须同步):
+        // 跨Die: AssignI(ckeAddr立即数入commXn[2])+StoreXToMem+SetCKE; 本Die: SetCKE+2*Nop
+        static constexpr uint32_t V2_RECORD_SHARED_NOTIFY_INSTR_NUM = 3;
 
         std::unordered_map<CcuRepType, uint32_t> repTypeInstrCount
             = {{CcuRepType::READ, 1},
@@ -222,13 +237,15 @@ namespace CcuRep {
                {CcuRepType::LOC_RECORD_EVENT, 1},
                {CcuRepType::LOC_WAIT_EVENT, 1},
                {CcuRepType::LOC_WAIT_NOTIFY, 1},
-               {CcuRepType::RECORD_SHARED_NOTIFY, 1},
+               {CcuRepType::RECORD_SHARED_NOTIFY, V2_RECORD_SHARED_NOTIFY_INSTR_NUM},
                {CcuRepType::REM_POST_SEM, 1},
                {CcuRepType::REM_POST_VAR, 1},
                {CcuRepType::REM_WAIT_SEM, 1},
 
                {CcuRepType::FUNC_BLOCK, V2_FUNC_BLOCK_INSTR_NUM},
                {CcuRepType::FUNC_CALL, V2_FUNC_CALL_INSTR_NUM},
+               {CcuRepType::ADDRESSABLE_FUNC_BLOCK, V2_FUNC_BLOCK_INSTR_NUM},
+               {CcuRepType::ADDR_FUNC_CALL, V2_FUNC_CALL_INSTR_NUM},
                {CcuRepType::JUMP, 2},
                {CcuRepType::JUMP_NE, 3},
                {CcuRepType::JUMP_EQ, 3},
@@ -243,11 +260,11 @@ namespace CcuRep {
                {CcuRepType::STORE_VAR, 3},
 
                {CcuRepType::WRITE_VAR_ATOMIC, 1},
-               {CcuRepType::WRITE_WITH_CNT_INC, 1},
+               {CcuRepType::WRITE_WITH_CNT_INC, 9},
                {CcuRepType::CASC_CNT_WAIT, 2},
                {CcuRepType::CASC_CNT_CLEAR, 1},
-               {CcuRepType::LOAD_ADD_IMM, 1},
-               {CcuRepType::STORE_ADD_IMM, 1},
+               {CcuRepType::LOAD_ADD_IMM, V2_LSX_INSTR_NUM},
+               {CcuRepType::STORE_ADD_IMM, V2_LSX_INSTR_NUM},
 
                {CcuRepType::AND, 1},
                {CcuRepType::NOT, 1},

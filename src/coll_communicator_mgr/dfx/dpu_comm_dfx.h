@@ -19,7 +19,8 @@
 #include <functional>
 #include "hccl_common.h"
 #include "common.h"
-#include "hcclCommOp.h"
+#include "task_param.h"
+#include "task_info.h"
 
 namespace hccl {
 
@@ -54,9 +55,17 @@ public:
         u32 streamId{0};
     };
     const DpuTaskInfoEntry& GetDpuTaskInfo() const { return dpuTaskInfo_; }
+    u32 GetChannelStreamIdBase() const { return channelStreamIdBase_; }
 
 private:
     u32 GetDpuChannelStreamId(u64 handle);
+    u32 GetReportStreamId(u32 stored) const
+    {
+        if (stored < channelStreamIdBase_ || stored >= channelStreamIdBase_ + CHANNEL_STREAM_ID_RANGE) {
+            return stored;
+        }
+        return stored - channelStreamIdBase_;
+    }
     bool HandleWNotifyCache(const Hccl::TaskParam& taskParam, u64 handle, std::shared_ptr<Hccl::DfxOpInfo> dpuOpInfo);
     void CacheWNotify(
         const Hccl::TaskParam& taskParam, u64 handle, std::shared_ptr<Hccl::TaskParam>& failedTaskParam,
@@ -86,7 +95,9 @@ private:
     std::unordered_map<u64, PendingWriteInfo> pendingWriteInfos_;
     std::unordered_map<u64, u32> channelStreamIdMap_;
     static constexpr u32 CHANNEL_STREAM_ID_BASE = 0x80000000;
-    u32 nextChannelStreamId_{CHANNEL_STREAM_ID_BASE};
+    static constexpr u32 CHANNEL_STREAM_ID_RANGE = 0x1000;
+    u32 channelStreamIdBase_{CHANNEL_STREAM_ID_BASE};
+    u32 nextChannelStreamId_{channelStreamIdBase_};
     DpuTaskInfoEntry dpuTaskInfo_{};
     u32 dpuStreamId_{0};
     std::function<HcclResult(const Hccl::TaskParam&, u64)> dpuCallback_{};
@@ -96,6 +107,7 @@ private:
     std::atomic<bool> dpuOpInfoEnabled_{false};
     static std::mutex taskIdMutex_;
     static std::unordered_map<u32, u32> streamIdToTaskId_;
+    static std::atomic<u32> g_nextChannelStreamIdBase;
 };
 
 } // namespace hccl

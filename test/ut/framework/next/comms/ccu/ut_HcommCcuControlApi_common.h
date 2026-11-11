@@ -15,6 +15,7 @@
 #define UT_HCOMM_CCU_CONTROL_API_COMMON_H
 
 #include <iostream>
+#include "hcomm/hcomm_res_expt.h"
 #include <acl/acl.h>
 #include <set>
 #include <utility>
@@ -28,11 +29,13 @@
 #include "hcomm_c_adpt.h"
 #include "op_base.h"
 
-#include "ccu_device_pub.h"
+#include "comm_engine/ccu/ccu_device_pub.h"
+#include "ccu_device.h"
+#include "ccu_res_repo.h"
 #include "ccu_kernel_mgr.h"
 #include "ccu_ins_generator_v1.h"
 #include "ccu_instance_mgr.h"
-#include "ccu_device_res.h"
+#include "comm_engine/ccu/ccu_device_res_pub.h"
 #include "ccu_res_batch_allocator.h"
 #include "ccu_res_specs.h"
 #include "ccu_comp.h"
@@ -104,17 +107,22 @@ inline void MockControlDeviceRefresh(int32_t deviceLogicId)
     MOCKER(hrtGetDeviceRefresh).stubs().with(mockcpp::any()).will(invoke(MockHrtGetDeviceRefresh));
 }
 
+// cnt xn 块布局(wish/total/expected)由 CcuResBatchAllocator 计算, 设备层只回填申请的连续区间
 inline CcuResult
-MockControlAllocCntXnBlock(const int32_t deviceLogicId, const uint8_t dieId, hcomm::CntXnBlock& cntXnBlock)
+MockControlAllocCntXn(const int32_t deviceLogicId, const uint8_t dieId, const uint32_t num, hcomm::ResInfo& resInfo)
 {
     (void)deviceLogicId;
     (void)dieId;
     constexpr uint32_t startId = 12288;
-    constexpr uint32_t count = 1024;
-    cntXnBlock.resInfo = hcomm::ResInfo(startId, count);
-    cntXnBlock.wishCntXns = {startId, startId + 1021};
-    cntXnBlock.totalCntXn = startId + 1022;
-    cntXnBlock.expectedCntXn = startId + 1023;
+    resInfo = hcomm::ResInfo(startId, num);
+    return CcuResult::CCU_SUCCESS;
+}
+
+inline CcuResult MockControlConfirmCntXns(
+    const int32_t, const uint8_t, const std::pair<uint32_t, uint32_t>&, const uint32_t, const uint32_t,
+    uint32_t& blockIdx)
+{
+    blockIdx = 0;
     return CcuResult::CCU_SUCCESS;
 }
 } // namespace
@@ -136,12 +144,21 @@ public:
             .stubs()
             .with(outBound(HCCL_VERSION_USING_VALIDATE_AND_APPLY_DIE))
             .will(returnValue(HCCL_SUCCESS));
-        // PR 新增 CcuAllocCntXnBlock / CcuReleaseCntXnBlock 在 AllocCascCntBlock 路径中被调用
-        MOCKER(hcomm::CcuAllocCntXnBlock)
+        // CcuAllocCntXn / CcuConfirmCntXns / CcuReleaseCntXn / CcuResetTotalCntXn
+        // 在设备层 AllocCascCntRes / ReleaseCascCntRes 路径中被调用
+        MOCKER(hcomm::CcuAllocCntXn)
+            .stubs()
+            .with(mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any())
+            .will(invoke(MockControlAllocCntXn));
+        MOCKER(hcomm::CcuConfirmCntXns)
+            .stubs()
+            .with(mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any())
+            .will(invoke(MockControlConfirmCntXns));
+        MOCKER(hcomm::CcuReleaseCntXn)
             .stubs()
             .with(mockcpp::any(), mockcpp::any(), mockcpp::any())
-            .will(invoke(MockControlAllocCntXnBlock));
-        MOCKER(hcomm::CcuReleaseCntXnBlock)
+            .will(returnValue(CcuResult::CCU_SUCCESS));
+        MOCKER(hcomm::CcuResetTotalCntXn)
             .stubs()
             .with(mockcpp::any(), mockcpp::any(), mockcpp::any())
             .will(returnValue(CcuResult::CCU_SUCCESS));
@@ -277,6 +294,11 @@ inline int32_t MockCcuDeviceEnv(uint32_t fakeDevId, hcomm::CcuVersion fakeCcuVer
         .stubs()
         .with(mockcpp::any(), outBound(static_cast<uint32_t>(fakeDeviceLogicId)), mockcpp::any())
         .will(returnValue(HcclResult::HCCL_SUCCESS));
+    // 窄访问器的预期回落路径走 quiet 变体（hrtTryGetDevicePhyIdByIndex），与上方同行为打桩
+    MOCKER(hrtTryGetDevicePhyIdByIndex)
+        .stubs()
+        .with(mockcpp::any(), outBound(static_cast<uint32_t>(fakeDeviceLogicId)))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MockCcuNetworkDeviceDefault(fakeDeviceLogicId);
     EXPECT_EQ(MockCcuResourcesDefault(fakeDeviceLogicId, fakeCcuVersion), HcclResult::HCCL_SUCCESS);
     MockCcuChannelGetRes();
@@ -284,17 +306,20 @@ inline int32_t MockCcuDeviceEnv(uint32_t fakeDevId, hcomm::CcuVersion fakeCcuVer
     return fakeDeviceLogicId;
 }
 
-// 创建两个 die（dieId 0/1）的资源描述符并按 CcuMs 默认值填充
-inline void
-CreateCcuResDescsPair(HcommCcuResDescHandle resDescs[hcomm::CCU_MAX_IODIE_NUM], hcomm::CcuVersion ccuVersion)
+// 创建两个 die（dieId 0/1）的资源描述符；withDefaults 为 false 时不预置 CcuMs 默认资源，
+// 供用例按需仅设置特定资源类型
+inline void CreateCcuResDescsPair(
+    HcommCcuResDescHandle resDescs[hcomm::CCU_MAX_IODIE_NUM], hcomm::CcuVersion ccuVersion, bool withDefaults = true)
 {
     CcuResult ccuRet = CcuResult::CCU_E_RESERVED;
     ccuRet = HcommCcuInsResDescCreate(0, &resDescs[0]);
     EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
     ccuRet = HcommCcuInsResDescCreate(1, &resDescs[1]);
     EXPECT_EQ(ccuRet, CcuResult::CCU_SUCCESS);
-    SetCcuResDescCcuMs(resDescs[0], ccuVersion);
-    SetCcuResDescCcuMs(resDescs[1], ccuVersion);
+    if (withDefaults) {
+        SetCcuResDescCcuMs(resDescs[0], ccuVersion);
+        SetCcuResDescCcuMs(resDescs[1], ccuVersion);
+    }
 }
 
 // 各用例通用的 V1 CCU 实例初始化: mock 设备环境 -> 建两 die 资源描述符 -> 创建 CcuInstance。

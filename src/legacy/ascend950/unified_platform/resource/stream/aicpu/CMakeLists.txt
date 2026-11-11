@@ -10,7 +10,6 @@
 
 set(src_list
     stream_lite.cc
-    hccl_sqe_v82.cc
     hccl_sqe.cc
     sqe_mgr.cc
     sqe_build_a5.cc
@@ -26,7 +25,8 @@ endif()
 
 if(TARGET ccl_kernel)
     target_sources(ccl_kernel PRIVATE
-        ${src_list}
+        hccl_sqe.cc
+        sqe_mgr.cc
     )
 endif()
 

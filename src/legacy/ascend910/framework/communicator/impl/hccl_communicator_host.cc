@@ -232,10 +232,8 @@ HcclCommunicator::~HcclCommunicator()
             identifier_.c_str(), userRank_, deviceLogicId_);
     }
 
-    if (dpuManager_ != nullptr) {
-        (void)dpuManager_->DeInitDpuKernel();
-        dpuManager_ = nullptr;
-    }
+    // 此处不再经 DpuManager 做 kernel 终止；仅释放 workspace 管理器实例。
+    dpuManager_ = nullptr;
 
     UnRegisterToHeartBeat();
     DeleteOpInfoToHeartBeat();
@@ -442,9 +440,7 @@ HcclResult HcclCommunicator::Init(HcclCommParams& params, const RankTable_t& ran
     CHK_RET(InitSymmetricMemory());
 
     CHK_RET(InitMyRankConnectMode(params, rankTable));
-    if (dpuManager_ != nullptr && myRankConnectMode_ != 0) { /* 当前只有host nic--device nic使用 */
-        CHK_RET(dpuManager_->Init(identifier_, deviceLogicId_));
-    }
+    // 通信域初始化不再经 DpuManager 拉起旧 kernel（原 5 字段参数块已随 RunDpuRpcSrvLaunch 改造失效）。
 
     return HCCL_SUCCESS;
 }
@@ -4765,7 +4761,8 @@ HcclResult HcclCommunicator::ExecOp(HcclCMDType opType, OpParam& opParam, bool i
     std::vector<HcclSendRecvItem> hostSendRecvInfo;
     std::vector<HcclSendRecvItem> aicpuSendRecvInfo;
     std::vector<u8> isDirectRemoteRank;
-    if (opType == HcclCMDType::HCCL_CMD_BATCH_SEND_RECV && deviceType_ == DevType::DEV_TYPE_910_93) {
+    if (opType == HcclCMDType::HCCL_CMD_BATCH_SEND_RECV
+        && (deviceType_ == DevType::DEV_TYPE_910_93 || (deviceType_ == DevType::DEV_TYPE_910B && isGroupMode_))) {
         SplitBsrData(opParam, isDirectRemoteRank, hostSendRecvInfo, aicpuSendRecvInfo);
         // A3 bsr记录Direct下发方式数据
         opParam.BatchSendRecvDataDes.isDirectRemoteRank = isDirectRemoteRank.data();
@@ -4774,11 +4771,7 @@ HcclResult HcclCommunicator::ExecOp(HcclCMDType opType, OpParam& opParam, bool i
             opParam.BatchSendRecvDataDes.itemNum = aicpuSendRecvInfo.size();
         }
     }
-    // A2 Group SendRecv 将isDirectRemoteRank全部置为false
-    if (opType == HcclCMDType::HCCL_CMD_BATCH_SEND_RECV && deviceType_ == DevType::DEV_TYPE_910B && isGroupMode_) {
-        isDirectRemoteRank.resize(userRankSize_, 0);
-        opParam.BatchSendRecvDataDes.isDirectRemoteRank = isDirectRemoteRank.data();
-    }
+
     auto algType = algOperator->GetAlgType();
     CHK_RET(RegisterDfxInfo(opParam, algType, resMap_[newTag].slaveStreams, selectAivAlg, tag));
     // 头计数
@@ -7689,11 +7682,10 @@ HcclResult HcclCommunicator::AicpuKfcTilingDataLaunch(
     return HCCL_SUCCESS;
 }
 
-HcclResult HcclCommunicator::AicpuKfcClearOpResLaunch(const std::unordered_set<std::string>& tags)
+HcclResult HcclCommunicator::AicpuKfcClearOpResLaunch(const std::unordered_set<std::string>& tags, const u64 modelId)
 {
-    if (tags.empty()) {
-        return HCCL_SUCCESS;
-    }
+    // 注意: tags为空(非零拷贝capture图不登记tag)时也需下发一次清理kernel (tagCount=0),
+    // 保证aicpu侧清理capture期产生的op-unfold cache entry
     // 仅 aicpu unfold 模式有 aicpu 端 resMap_/linkRes_ 需要清理；host 模式下没有 binHandle_
     if (binHandle_ == nullptr) {
         HCCL_DEBUG(
@@ -7726,9 +7718,13 @@ HcclResult HcclCommunicator::AicpuKfcClearOpResLaunch(const std::unordered_set<s
     size_t totalBatches = 0;
 
     // 分批 launch：同 buffer 复用，每批最多 MAX_BATCH 个 tag；launch 后 sync 保证 aicpu 完成才覆盖 buffer 下一批
+    // 注意: tags为空时至少下发一批(tagCount=0), 驱动aicpu侧清理capture期产生的op-unfold cache entry
+    bool isFirstBatch = true;
     auto it = tags.begin();
-    while (it != tags.end()) {
+    while (it != tags.end() || isFirstBatch) {
+        isFirstBatch = false;
         payload.magic = HCCL_KFC_CLEAR_OP_RES_MAGIC;
+        payload.modelId = modelId;
         CHK_SAFETY_FUNC_RET(memcpy_s(payload.group, sizeof(payload.group), identifier_.c_str(), groupCopyLen));
         payload.group[sizeof(payload.group) - 1] = '\0';
 
@@ -7844,6 +7840,15 @@ HcclResult HcclCommunicator::AicpuInitOpTilingDataBuf(
     opTilingData->debugMode = 0;
     opTilingData->isZeroCopy = opParam.isZeroCopy;
     opTilingData->isCapture = opParam.isCapture;
+    // capture场景记录算子所属图的modelId, 用于图销毁时精确清理aicpu侧capture期产生的op-unfold cache entry
+    if (opParam.isCapture) {
+        aclmdlRI rtModel = nullptr;
+        bool isCap = false;
+        CHK_RET(GetStreamCaptureInfo(opParam.stream.ptr(), rtModel, isCap));
+        if (isCap && rtModel != nullptr) {
+            CHK_RET(GetModelId(rtModel, opTilingData->captureModelId));
+        }
+    }
     opTilingData->orderLaunchMode = GetOrderLaunchMode(opParam.isCapture);
     opTilingData->isSymmetricMemory = opParam.supportSymmetricMemory;
     opTilingData->needIncreLink = opParam.needIncreLink;

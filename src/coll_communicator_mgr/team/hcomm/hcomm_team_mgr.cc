@@ -14,7 +14,7 @@
 
 #include "adapter_rts_common.h"
 #include "hcomm_res_entity_defs.h"
-#include "hcomm_result_defs.h"
+#include "common/result_defs_pub.h"
 #include "hcomm_team_entity_defs.h"
 #include "log.h"
 #include "securec.h"
@@ -709,7 +709,11 @@ HcommResult HcommTeamMgr::AllocWindowNetWin(WindowEntry* winEntry, const uint32_
 
     // 首次分配后整体同步，device 侧才能看到 netWin.baseRemoteMemAddr/windowSize/worldTeamAccumulateId
     ret = SyncWindowToDevice(winEntry);
-    CHK_PRT_RET(ret != HCOMM_SUCCESS, HCCL_ERROR("[AllocWindowNetWin] SyncWindowToDevice failed, ret[%d]", ret), ret);
+    if (ret != HCOMM_SUCCESS) {
+        HCCL_ERROR("[AllocWindowNetWin] SyncWindowToDevice failed, ret[%d]", ret);
+        ClearWindowNetWin(winEntry);
+        return ret;
+    }
     return HCOMM_SUCCESS;
 }
 

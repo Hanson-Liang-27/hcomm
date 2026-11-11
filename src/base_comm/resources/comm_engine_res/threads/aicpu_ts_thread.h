@@ -15,7 +15,9 @@
 #include <functional>
 #include "thread.h"
 #include "aicpu_ts_thread_interface.h"
-#include "dfx_circular_queue.h"
+#include "common/dev_type_utils_pub.h"
+#include "hccl_dispatcher_ctx.h"
+#include "comm_engine/thread/device/dfx/dfx_circular_queue_pub.h"
 
 namespace hccl {
 class AicpuTsThread : public Thread {
@@ -29,20 +31,21 @@ public:
     HcclResult DeInit() override;
     std::string& GetUniqueId() override;
     uint32_t GetNotifyNum() const override;
+    size_t GetNotifySize() const override;
     LocalNotify* GetNotify(uint32_t index) const override;
     HcclResult GetNotifyByUniqueId(u32& notifyNum, std::string& notifyDesc);
     HcclResult SupplementNotify(uint32_t notifyNum) override;
     HcclResult SupplementNotify(u32 notifyNum, const std::string& notifyDesc);
-
     // A3 Stream & A5 Stream
     inline bool IsDeviceA5() const override
     {
         return devType_ == DevType::DEV_TYPE_950 || devType_ == DevType::DEV_TYPE_960;
     }
-
     Stream* GetStream() const override;
 
     inline void* GetStreamLitePtr() const override { return pImpl_ ? pImpl_->GetStreamLitePtr() : nullptr; }
+
+    s32 GetStreamId() const override;
 
     void LaunchTask() const override;
     void TryLaunchTask() const override;
@@ -52,13 +55,30 @@ public:
     HcclResult LocalNotifyRecord(uint32_t notifyId) const override;
 
     HcclResult LocalNotifyRecord(ThreadHandle dstThread, uint32_t dstNotifyIdx) const override;
-    HcclResult LocalNotifyWait(uint32_t notifyId, uint32_t timeout) const override;
+    HcclResult LocalNotifyWait(uint32_t notifyIdx, uint32_t timeout) const override;
+
+    HcclResult LocalChannelNotifyWait(ChannelHandle channel, uint32_t notifyIdx, uint32_t timeout) const override;
+    HcclResult LocalChannelNotifyRecord(ChannelHandle channel, uint32_t notifyIdx) const override;
+    HcclResult LocalChannelDrain(ChannelHandle channel) const override;
+    HcclResult LocalChannelFence(ChannelHandle channel) const override;
+
+    HcclResult LocalNotifyWaitById(uint32_t notifyId, uint32_t timeout) const override;
+
+    HcclResult GetNotifyId(uint32_t notifyIdx, uint32_t& notifyId) const override;
 
     HcclResult LocalCopy(void* dst, const void* src, uint64_t size) const override;
     HcclResult LocalReduce(
         void* dst, const void* src, uint64_t size, HcommDataType dataType, HcommReduceOp reduceOp) const override;
 
     // Non-override functions
+    HcclResult GetExportRtsqInfo(int32_t& streamId, uint32_t& sqId);
+    // Device 恢复线程后刷新 ThreadEntity 的 RTSQ 硬件字段；Notify 描述仍由 Host 发布。
+    HcclResult FillThreadEntityRtsq(HcommThreadEntity& entity);
+#ifndef CCL_KERNEL_AICPU
+    // 本线程导出到目标引擎时持有的 Entity；生命周期随本线程对象。
+    HcclResult PreAllocThreadEntity(ThreadHandle& handle, CommEngine targetEngine);
+    ThreadEntityResources* GetThreadEntityResources(CommEngine targetEngine) const;
+#endif
     HcclResult GetSqHeadAndTail(uint32_t& sqHead, uint32_t& sqTail) const;
     bool GetMaster() const override;
     void SetIsMaster(bool isMaster) override;
@@ -99,7 +119,6 @@ private:
 
     // 成员变量（适配 AICPU-TS）
     bool isDeviceSide_ = false;
-    rtStream_t rtStream_ = nullptr;
     StreamType streamType_ = StreamType::STREAM_TYPE_RESERVED;
     uint32_t notifyNum_ = 0;
     NotifyLoadType notifyLoadType_ = NotifyLoadType::HOST_NOTIFY;
@@ -111,6 +130,9 @@ private:
     DevType devType_ = DevType::DEV_TYPE_COUNT;
     std::unique_ptr<Hccl::IAicpuTsThread> pImpl_{nullptr};
     bool isMaster_{false};
+    // Thread私有dispatcher：dispatcher归属Thread，确保(dispatcher, stream)配对稳定
+    DispatcherCtxPtr threadDispatcherCtx_{nullptr};
+    std::string threadDispatcherCommId_;
 };
 
 } // namespace hccl

@@ -33,6 +33,7 @@
 #include "error_message_v2.h"
 #include "manager_common.h"
 #include "group_schedule_mgr.h"
+#include "op_group_queue_mgr.h"
 #include "include/hccl_communicator.h"
 #include "hccl/hccl_res.h"
 #include "symmetric_memory/symmetric_memory.h"
@@ -76,6 +77,11 @@ public:
     inline CommConfig& GetCommConfig() { return config_; }
     inline RankGraph* GetRankGraph() { return rankgraph_; }
     inline CommEngineResMgr* GetCommEngineResMgr() { return commEngineResMgr_.get(); }
+    // 经 CommEngineResMgr 取线程管理器；未初始化时返回 nullptr（HostDpu 收编链的宿主侧入口）
+    inline ThreadMgr* GetThreadMgr()
+    {
+        return commEngineResMgr_ == nullptr ? nullptr : commEngineResMgr_->GetThreadMgr();
+    }
     inline ContextManager* GetContextManager() { return contextMgr_.get(); }
     inline CommMemMgr* GetCommMemMgr() { return commMemMgr_.get(); }
     inline ChannelManager* GetChannelManager() { return channelMgr_.get(); }
@@ -142,8 +148,9 @@ public:
     UpdateSymmetricRemoteMem(uint32_t remoteRank, const CommMem* remoteMems, const std::vector<std::string>& memTags);
     HcclResult
     UpdateHcommWindowRemoteMem(uint32_t remoteRank, const CommMem* remoteMems, const std::vector<std::string>& memTags);
-    HcclResult GetHcclBinHandle(aclrtBinHandle& binHcclHandle);
+    HcclResult GetHcclBinHandle(aclrtBinHandle& binHcclHandle, const std::string& soName);
     std::shared_ptr<class GroupScheduleMgr> groupScheduleMgr{nullptr}; // for group
+    OpGroupQueueMgr groupQueueMgr{};                                   // for group enqueue
 
 private:
     using ProtocolRankMap = std::unordered_map<CommProtocol, std::vector<uint32_t>>;
@@ -207,6 +214,7 @@ private:
 
     ManagerCallbacks callbacks_;
     s32 deviceLogicId_{0};
+    bool dcaInited_{false}; // 保证 DetectConnectionAnomalies 的 Deinit 与 Init 严格配对
     uint32_t index_{0};
 
     // 持有CommunicatorImpl中cclBuffer的shared_ptr拷贝，延长其生命周期

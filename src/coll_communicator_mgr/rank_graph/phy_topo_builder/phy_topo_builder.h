@@ -37,15 +37,20 @@ struct LinkParams {
 class PhyTopoBuilder {
 public:
     static PhyTopoBuilder& GetInstance();
-    void Build(const std::string& topoPath);
+    // 350L(UBX)拆分已应用: topo.json未分层但rootinfo已拆层的机器在Build时复制过UB CLOS边。
+    // 原生两层机型(如8PMESH, topo.json本身含netLayer=1)不会置位——RestoreSymmetricLevel0View
+    // 据此区分"350L拆层形态"与"原生多层形态", 防止误还原破坏原生多级行为
+    static bool IsUbxClosSplit() { return ubxClosSplit_; }
+    HcclResult Build(const std::string& topoPath);
     std::shared_ptr<TopoInfo> GetTopoInfo() const;
-    void RecoverBuild(const TopoInfo& topoInfo);
+    HcclResult RecoverBuild(const TopoInfo& topoInfo);
 
 private:
     std::shared_ptr<TopoInfo> LoadTopoInfo(const std::string& topoPath);
     std::shared_ptr<Graph<PhyTopo::Node, PhyTopo::Link>> CreateGraph(const std::vector<EdgeInfo>& edges) const;
     std::shared_ptr<TopoInfo> topoInfo_;
     std::mutex phyTopoMutex;
+    inline static bool ubxClosSplit_ = false;
 };
 } // namespace Hccl
 

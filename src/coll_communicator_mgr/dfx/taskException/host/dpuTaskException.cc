@@ -18,8 +18,7 @@
 #include <adapter_error_manager_pub.h>
 #include "hccl_types.h"
 #include "hcclCommTaskException.h"
-#include "dpu_kernel_entrance.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 #include "task_info.h"
 #include "global_mirror_tasks.h"
 
@@ -34,31 +33,62 @@ std::string AicpuGetAndPrintClusterMonitorErr(const rtExceptionInfo* exceptionIn
 
 HcclResult DpuTaskException::ProcessDpuException(const rtExceptionInfo_t* exceptionInfo, const TaskExceptionHost& host)
 {
-    std::lock_guard<std::mutex> lock(GetSerMapMutex());
     uint16_t dpuErrCode = 0;
     std::string commId;
-    uint8_t* taskExpPtr = nullptr;
-    CHK_RET(GetDpuExceptionInfo(exceptionInfo, dpuErrCode, commId, taskExpPtr));
+    // 异常区随 DPU 线程实体释放，expRef 须持有到读完并清零为止
+    hccl::DpuTaskExpMemRef expRef;
+    CHK_RET(GetDpuExceptionInfo(exceptionInfo, dpuErrCode, commId, expRef));
+    if (dpuErrCode == 0) {       // 没有dpu任务出错
+        return HCCL_E_NOT_FOUND; // 调用处根据返回值判断执行逻辑，如果是success则代表dpu
+                                 // taskexception执行成功，流程结束。notfound则表示不是dpu任务出错，执行后续流程。
+    }
 
     HCCL_ERROR("[DpuTaskException][ProcessDpuException] Task from HCCL run failed.");
 
-    CHK_RET(ReportDpuException(exceptionInfo, dpuErrCode, commId, taskExpPtr, host));
+    CHK_RET(ReportDpuException(exceptionInfo, dpuErrCode, commId, static_cast<uint8_t*>(expRef.addr), host));
 
     return ClearDpuExceptionInfo(exceptionInfo, commId);
 }
 
 HcclResult DpuTaskException::GetDpuExceptionInfo(
-    const rtExceptionInfo_t* exceptionInfo, uint16_t& dpuErrCode, std::string& commId, uint8_t*& taskExpPtr)
+    const rtExceptionInfo_t* exceptionInfo, uint16_t& dpuErrCode, std::string& commId, hccl::DpuTaskExpMemRef& expRef)
 {
-    void* expPtr = nullptr;
-    if (!FindDpuExceptionByDevice(exceptionInfo->deviceid, commId, expPtr, dpuErrCode)) {
-        return HCCL_E_NOT_FOUND;
+    expRef.addr = nullptr;
+    expRef.keepAlive = nullptr;
+    // 收编后异常区随 DPU 线程走 ThreadMgr 链，不再跨 so 读 g_taskExpMemMap；快照只取 commId，
+    // 遍历中经 GetDpuTaskExpMem 按 id 反查，避免直接解引用快照里的裸指针（可能已被并发销毁）。
+    std::vector<std::string> commIds = hccl::CollCommMgr::GetInstance().SnapshotCollComms();
+    for (const std::string& curCommId : commIds) {
+        uint32_t devId = 0;
+        if (hccl::CollCommMgr::GetInstance().GetDpuDevId(curCommId, devId) != HCCL_SUCCESS
+            || devId != exceptionInfo->deviceid) {
+            continue; // 该通信域未拉起 DPU 线程，或 legacy 实体缺失、非本设备的 DPU 任务
+        }
+        hccl::DpuTaskExpMemRef curRef;
+        if (hccl::CollCommMgr::GetInstance().GetDpuTaskExpMem(curCommId, curRef) != HCCL_SUCCESS
+            || curRef.addr == nullptr) {
+            continue;
+        }
+        // 读 dstret[2]（排布：|stopflag[1]|hcclret[2]|dstret[2]|opIndex[4]|taskId[4]|streamId[4]|reserved[3]|）。
+        // dstret 是 host 侧读出的槽位；hcclret 由 AICPU 侧读完即清零，host 读它可能已被清零。
+        errno_t ret = memcpy_s(
+            &dpuErrCode, sizeof(uint16_t), static_cast<uint8_t*>(curRef.addr) + sizeof(uint8_t) + sizeof(uint16_t),
+            sizeof(uint16_t));
+        if (ret != EOK) {
+            HCCL_ERROR("[%s] memcpy_s get dpu dstRet failed, ret[%d].", __func__, ret);
+            return HCCL_E_INTERNAL;
+        }
+        if (dpuErrCode == 0) {
+            continue; // 错误码为空说明不是本通信域的异常，继续找
+        }
+        expRef = curRef;
+        commId = curCommId;
+        break;
     }
-    taskExpPtr = reinterpret_cast<uint8_t*>(expPtr);
-    if (dpuErrCode == 0 || taskExpPtr == nullptr) {
-        HCCL_ERROR(
-            "[%s] dpu exception info invalid, dpuErrCode[%u], taskExpPtr[%p].", __func__, dpuErrCode, taskExpPtr);
-        return HCCL_E_NOT_FOUND;
+    if (dpuErrCode == 0 || expRef.addr == nullptr) {
+        HCCL_RUN_WARNING(
+            "[%s] dpuErrCode[%u], taskExpPtr[%p]. maybe not dpu task, please check if dpu ERROR before.", __func__,
+            dpuErrCode, expRef.addr);
     }
     return HCCL_SUCCESS;
 }
@@ -87,7 +117,8 @@ HcclResult DpuTaskException::ReportDpuException(
             HCCL_ERROR(
                 "[DpuTaskException][%s] FindTaskInfo fail, deviceId[%u], streamId[%u], taskId[%u], ret[%d], "
                 "dpuErrCode[%u], commId[%s].",
-                __func__, exceptionInfo->deviceid, infoStreamId, infoTaskId, findRet, dpuErrCode, commId.c_str());
+                __func__, exceptionInfo->deviceid, StoredToReportStreamId(commId, infoStreamId), infoTaskId, findRet,
+                dpuErrCode, commId.c_str());
             return HCCL_SUCCESS;
         }
     }
@@ -104,13 +135,14 @@ HcclResult DpuTaskException::ReportDpuException(
 
 HcclResult DpuTaskException::ClearDpuExceptionInfo(const rtExceptionInfo_t* exceptionInfo, const std::string& commId)
 {
-    void* taskExpPtr = FindTaskExpMem(commId, exceptionInfo->deviceid);
-    if (taskExpPtr == nullptr) {
+    hccl::DpuTaskExpMemRef expRef;
+    if (hccl::CollCommMgr::GetInstance().GetDpuTaskExpMem(commId, expRef) != HCCL_SUCCESS || expRef.addr == nullptr) {
         HCCL_ERROR(
             "[%s] commId[%s] deviceId[%u] not found during memset, may have been destroyed.", __func__, commId.c_str(),
             exceptionInfo->deviceid);
         return HCCL_E_NOT_FOUND;
     }
+    void* taskExpPtr = expRef.addr;
     constexpr size_t CLEAR_OFFSET = sizeof(uint8_t) + sizeof(uint16_t);
     constexpr size_t CLEAR_SIZE
         = sizeof(uint16_t) + sizeof(u32) + sizeof(u32) + sizeof(u32); // dstRet + opIndex + taskId + streamId
@@ -129,20 +161,23 @@ void DpuTaskException::HandleDpuErrorReport(
     HCCL_ERROR(
         "%sTask from HCCL run failed, errorCode[%u], commId[%s].", stageErrInfo.c_str(), hcclRet, commId.c_str());
     HCCL_ERROR(
-        "%sTask run failed, base information is deviceID:[%u], %s.", stageErrInfo.c_str(), exceptionInfo->deviceid,
-        taskInfo.GetIndopBaseInfo().c_str());
+        "%sTask run failed, base information is deviceID:[%u], streamID(sqId):[%u], taskID(sqeId):[%u], taskType:[%s].",
+        stageErrInfo.c_str(), exceptionInfo->deviceid, taskInfo.taskParam_.reportStreamId, taskInfo.taskId_,
+        taskInfo.taskParam_.taskType.Describe().c_str());
     HCCL_ERROR("%sTask run failed, para information is %s.", stageErrInfo.c_str(), taskInfo.GetParaInfo().c_str());
     HCCL_ERROR(
         "%sTask run failed, groupRank information is %s.", stageErrInfo.c_str(), GetGroupRankInfo(taskInfo).c_str());
     PrintDpuTaskContextInfo(exceptionInfo->deviceid, taskInfo, stageErrInfo);
     std::string clusterMonitorErrMsg = AicpuGetAndPrintClusterMonitorErr(exceptionInfo);
     if (host.ShouldReportError()) {
+        std::string baseInfo = Hccl::StringFormat(
+            "streamID(sqId):[%u], taskID(sqeId):[%u], taskType:[%s]", taskInfo.taskParam_.reportStreamId,
+            taskInfo.taskId_, taskInfo.taskParam_.taskType.Describe().c_str());
         RPT_INPUT_ERR(
             true, "EI0002",
             std::vector<std::string>({"remote_rankid", "base_information", "task_information", "group_rank_content"}),
             std::vector<std::string>(
-                {std::to_string(taskInfo.remoteRank_), taskInfo.GetBaseInfo(),
-                 (taskInfo.GetParaInfo() + clusterMonitorErrMsg), ""}));
+                {std::to_string(taskInfo.remoteRank_), baseInfo, (taskInfo.GetParaInfo() + clusterMonitorErrMsg), ""}));
     } else {
         HCCL_WARNING(
             "[DpuTaskException] EI0002 already reported on device[%u], skip duplicate.", exceptionInfo->deviceid);
@@ -156,12 +191,16 @@ void DpuTaskException::PrintDpuTaskContextInfo(
     try {
         queue = Hccl::GlobalMirrorTasks::Instance().GetQueue(deviceId, taskInfo.streamId_);
     } catch (Hccl::HcclException& e) {
-        HCCL_ERROR("Exception task queue not found. deviceId[%u], streamId[%u].", deviceId, taskInfo.streamId_);
+        HCCL_ERROR(
+            "Exception task queue not found. deviceId[%u], streamId[%u].", deviceId,
+            taskInfo.taskParam_.reportStreamId);
         return;
     }
 
     if (queue == nullptr) {
-        HCCL_ERROR("Exception task queue not found. deviceId[%u], streamId[%u].", deviceId, taskInfo.streamId_);
+        HCCL_ERROR(
+            "Exception task queue not found. deviceId[%u], streamId[%u].", deviceId,
+            taskInfo.taskParam_.reportStreamId);
         return;
     }
 
@@ -172,8 +211,8 @@ void DpuTaskException::PrintDpuTaskContextInfo(
     auto taskIterPtr = queue->Find(func);
     if (taskIterPtr == nullptr || *taskIterPtr == *queue->End()) {
         HCCL_ERROR(
-            "Exception task queue not found. deviceId[%u], streamId[%u], taskId[%u].", deviceId, taskInfo.streamId_,
-            taskId);
+            "Exception task queue not found. deviceId[%u], streamId[%u], taskId[%u].", deviceId,
+            taskInfo.taskParam_.reportStreamId, taskId);
         return;
     }
 
@@ -250,5 +289,17 @@ u32 DpuTaskException::GetOpIndex(const Hccl::TaskInfo* taskInfo)
         return UINT32_MAX;
     }
     return taskInfo->dfxOpInfo_->opIndex_;
+}
+
+u32 DpuTaskException::StoredToReportStreamId(const std::string& commId, u32 stored)
+{
+    u32 base = 0;
+    if (hccl::CollCommMgr::GetInstance().GetChannelStreamIdBase(commId, base) != HCCL_SUCCESS) {
+        return stored;
+    }
+    if (stored < base) {
+        return stored;
+    }
+    return stored - base;
 }
 } // namespace hcomm

@@ -35,7 +35,7 @@ public:
     {}
     ~RankInfoDetectService();
 
-    void Setup();
+    HcclResult Setup();
 
 private:
     u32 devPhyId_{0};
@@ -48,17 +48,17 @@ private:
     std::string identifier_{};
     vector<RaSocketWhitelist> wlistInfo_{};
 
-    void GetConnections();
-    void GetRankTable();
-    void BroadcastRankTable();
+    HcclResult GetConnections();
+    HcclResult GetRankTable();
+    HcclResult BroadcastRankTable();
     void Disconnect();
     void TearDown();
 
     bool RecvRemoteAgentId(SocketAgent& connSocketAgent, std::string& agentId);
     bool RecvRemoteRankSize(SocketAgent& connSocketAgent, u32& rankSize);
-    void RecvRankInfoMsg(SocketAgent& connSocketAgent, vector<char>& rankInfoMsg);
+    HcclResult RecvRankInfoMsg(SocketAgent& connSocketAgent, vector<char>& rankInfoMsg) const;
     void SortRankTable();
-    void ParseRankTable(vector<char>& rankInfoMsg);
+    HcclResult ParseRankTable(vector<char>& rankInfoMsg);
 
     // 异常流程处理方法
     void FailedConnectionAgentIdString(u32 rankSize);
@@ -67,6 +67,8 @@ private:
     bool RecvAndVerifyRemoteAgentIdAndRankSize(
         std::shared_ptr<Socket> connSocket, u32& expectedSocketNum, u32& previousRankSize);
     bool VerifyRemoteRankSize(u32& previousRankSize, u32 remoteRankSize) const;
+    // 白名单开启时校验远端IP是否在拓扑探测白名单内：仅校验remoteIp(tag 由驱动层白名单校验)
+    bool IsRemoteIpInWhiteList(const IpAddress& remoteIp) const;
 
     // DFX相关方法
     void DisplayConnectingStatus(u32 totalSockets, u32 waitSockets);

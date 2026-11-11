@@ -42,6 +42,9 @@ add_executable(hcomm_utest_api_data_aicpu_ts ${src_to_test_list})
 #头文件搜索路径
 target_include_directories(hcomm_utest_api_data_aicpu_ts PRIVATE
     ${UT_COMMON_INCLUDE_LIST}
+    # aicpu_ts_primitives_c_adpt.cc 的 DPU 线程分支引用 CpuDeviceThread（cpu_device_thread.h -> cpu_device_sq_submitter.h）
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/cpu_thread
+    ${HCCL_CODE_ROOT}/src/base_comm/resources/comm_engine_res/threads/device
 )
 
 target_compile_definitions(hcomm_utest_api_data_aicpu_ts PRIVATE
@@ -66,7 +69,7 @@ target_link_libraries(hcomm_utest_api_data_aicpu_ts PRIVATE
     -pthread
     hccl_llt
     -Wl,--whole-archive
-    -Wl,--no-whole-archi
+    -Wl,--no-whole-archive
     -lgcov
     -lrt
     -ldl

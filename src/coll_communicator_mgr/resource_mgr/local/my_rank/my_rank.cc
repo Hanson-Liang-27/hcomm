@@ -9,23 +9,22 @@
  */
 
 #include "my_rank.h"
-#include "hcomm_c_adpt.h"
-#include "endpoint_pair.h"
+#include "endpoint_pair/channel/channel_c_adpt_pub.h"
+#include "endpoint_pair/endpoint_c_adpt_pub.h"
+#include "comm_mem_c_adpt.h"
+#include "hcomm_res_defs.h"
 #include "hccl_res.h"
 #include "../common/loggers/channel_logger.h" // 日志记录器
 #include "hcclCommDfx.h"
 #include "config/env_config.h"
 #include "env_config/env_config_v2.h"
-#include "channel_process.h"
-#include "ccu_dev_mgr_imp.h"
-#include "ccu_device_res.h"
-#include "ccu_res_desc.h"
-#include "ccu_device_pub.h"
-#include "ccu_res_desc_mgr.h"
-#include "ccu_log.h"
-#include "dfx_dlprof_function.h"
+#include "endpoint_pair/channel/channel_process_pub.h"
+#include "coll_comm_aicpu_kernel.h"
+#include "launch_aicpu.h"
+#include "comm_engine/ccu/ccu_device_res_pub.h"
+#include "comm_engine/ccu/ccu_device_pub.h"
 #include "config_log.h"
-#include "comm_engine_utils.h"
+#include "common/comm_engine_utils_pub.h"
 #include "hcom_common.h"
 #include "op_base.h"
 #include "ccu_res.h"
@@ -34,11 +33,15 @@
 #include "roce_channel_desc_configurator.h"
 
 #include <acl/acl.h>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include "shared_jetty_channel_pool.h"
-#include "hccl_log_keywords.h"
-#include "../../../base_comm/common/orion_adpt_utils.h"
+#include "common/hccl_log_keywords_pub.h"
+#include "common/orion_adpt_utils_pub.h"
+#include "common/dev_type_utils_pub.h"
+#include "common/cast_utils_pub.h"
 
 using namespace hcomm;
 
@@ -68,6 +71,9 @@ HcommChannelDesc ChannelDescHccl2Hcomm(const HcclChannelDesc& hcclDesc, const hc
         hcommDesc.roceAttr.retryInterval = hcclDesc.roceAttr.retryInterval;
         hcommDesc.roceAttr.sl = hcclDesc.roceAttr.sl;
         hcommDesc.roceAttr.tc = hcclDesc.roceAttr.tc;
+        // HcclChannelDesc无深度字段，raws拷贝可能带入未初始化字节，固定置为未配置
+        hcommDesc.roceAttr.sqDepth = INVALID_UINT;
+        hcommDesc.roceAttr.scqDepth = INVALID_UINT;
         return hcommDesc;
     }
     // UB 等：未配置时落默认 4，供下游 Jetty/TP 使用
@@ -111,6 +117,42 @@ inline const char* GetTlsStatusStr(Hccl::TlsStatus tlsStatus)
     return "UNKNOWN";
 }
 
+// 批量建链状态归类：只要还有通道处于 CONNECTING（非 READY 非终态）就返回 HCCL_E_AGAIN 继续轮询；
+// 全批 READY 返回 HCCL_SUCCESS；有 FAILED / TIMEOUT 返回 HCCL_E_NETWORK；其余（RES_LOC_UNAVAIL /
+// RES_RMT_UNAVAIL）返回 HCCL_E_UNAVAIL。
+// 注：枚举值经 hcomm:: 限定——全局枚举 HcommChannelStatus 与本枚举的 READY / CONNECTING 同名
+static HcclResult ClassifyChannelStatus(const int32_t* statusList, uint32_t channelNum)
+{
+    uint32_t connectingCount = 0;
+    uint32_t failCount = 0;
+    bool hasResUnavailable = false;
+    for (uint32_t i = 0; i < channelNum; ++i) {
+        if (statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_READY) {
+            continue;
+        }
+        if (statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_CONNECTING) {
+            connectingCount++;
+        } else if (
+            statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_FAILED
+            || statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_TIMEOUT) {
+            // 失败与超时归一类，对外都报 HCCL_E_NETWORK
+            failCount++;
+        } else {
+            hasResUnavailable = true;
+        }
+    }
+    if (connectingCount > 0) {
+        return HCCL_E_AGAIN;
+    }
+    if (failCount > 0) {
+        return HCCL_E_NETWORK;
+    }
+    if (hasResUnavailable) {
+        return HCCL_E_UNAVAIL;
+    }
+    return HCCL_SUCCESS;
+}
+
 } // namespace MyRankUtils
 
 namespace hccl {
@@ -127,6 +169,10 @@ MyRank::MyRank(
       rankGraph_(rankGraph),
       rankIpPortMap_(rankIpPortMap)
 {}
+
+void MyRank::SetCcuInstance(CcuInsHandle ccuInsHandle) { ccuInsHandle_ = ccuInsHandle; }
+
+void MyRank::SetAssignedCcuInstance(CcuInsHandle ccuInsHandle) { assignedCcuInsHandle_ = ccuInsHandle; }
 
 MyRank::~MyRank()
 {
@@ -216,7 +262,7 @@ void MyRank::GetAbnormalChannelTlsStatus(
 {
     tlsStatusList.assign(channelNum, Hccl::TlsStatus::UNKNOWN);
     for (uint32_t i = 0; i < channelNum; ++i) {
-        if (statusList[i] == ChannelStatus::READY) {
+        if (statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_READY) {
             continue;
         }
         Hccl::TlsStatus tlsStatus = Hccl::TlsStatus::UNKNOWN;
@@ -275,6 +321,12 @@ HcclResult MyRank::ReserveCcuMsCommOrFallback()
         return HCCL_SUCCESS;
     }
 
+    if (IsOnlyModeConfigured()) {
+        HCCL_ERROR(
+            "[MyRank][%s] ccu ms comm already exists on device[%d], op expansion mode[%u] does not support fallback.",
+            __func__, devLogicId_, opExpansionModeRaw_);
+        return HcclResult::HCCL_E_NOT_SUPPORT;
+    }
     opExpansionMode_ = CCU_SCHED_MODE;
     HCCL_RUN_WARNING(
         "[MyRank][%s] CCU_MS comm already exists on device[%d], fallback to CCU_SCHED, rankId[%u].", __func__,
@@ -321,6 +373,13 @@ HcclResult MyRank::TryInitCcuInstanceOnDemand()
     // 避免向设备侧发起必然失败的CCU驱动拉起（会产生ERROR日志且初始化失败）；
     // 依据RankGraph持久化的pcie_fallback显式标记判断，不影响有UB场景下CCU驱动真实故障的显式报错
     if (rankGraph_ != nullptr && rankGraph_->IsLevel0PcieFallback()) {
+        if (IsOnlyModeConfigured()) {
+            HCCL_ERROR(
+                "[MyRank][%s] level0 is pcie fallback (UB unavailable), op expansion mode[%u] does not support "
+                "fallback, rankId[%u].",
+                __func__, opExpansionModeRaw_, rankId_);
+            return HcclResult::HCCL_E_NOT_SUPPORT;
+        }
         opExpansionMode_ = AICPU_TS_MODE;
         ccuInsHandle_ = 0;
         HCCL_RUN_WARNING(
@@ -332,6 +391,12 @@ HcclResult MyRank::TryInitCcuInstanceOnDemand()
         auto ccuInitRet = CcuInitFeature(devLogicId_, ccuDrvHandle_);
         // ccu驱动拉起失败，直接回退至aicpu ts
         if (ccuInitRet == CcuResult::CCU_E_DRV_BUSY) {
+            if (IsOnlyModeConfigured()) {
+                HCCL_ERROR(
+                    "[MyRank][%s] ccu driver is busy, op expansion mode[%u] does not support fallback, rankId[%u].",
+                    __func__, opExpansionModeRaw_, rankId_);
+                return HcclResult::HCCL_E_NOT_SUPPORT;
+            }
             opExpansionMode_ = AICPU_TS_MODE;
             ccuInsHandle_ = 0;
             HCCL_RUN_WARNING(
@@ -452,6 +517,16 @@ HcclResult MyRank::Init(HcclMem cclBuffer, const uint32_t opExpansionMode, uint3
         opExpansionMode_ = static_cast<uint32_t>(accelerator);
     }
 
+    opExpansionModeRaw_ = opExpansionMode_;
+    // 不感知ccu only语义，转换为对应的ccu模式
+    if (opExpansionMode_ == CCU_MS_ONLY_MODE) {
+        opExpansionMode_ = CCU_MS_MODE;
+    }
+
+    if (opExpansionMode_ == CCU_SCHED_ONLY_MODE) {
+        opExpansionMode_ = CCU_SCHED_MODE;
+    }
+
     // 仅自定义算子ccu流程初始化资源
     if (ccuInsHandle_ == 0 && rankNum != 1 && (opExpansionMode_ == CCU_MS_MODE || opExpansionMode_ == CCU_SCHED_MODE)) {
         const uint32_t originOpExpansionMode = opExpansionMode_; // 记录原始加速模式，避免中间执行修改后丢失
@@ -469,7 +544,6 @@ HcclResult MyRank::Init(HcclMem cclBuffer, const uint32_t opExpansionMode, uint3
     // rankPairMgr_初始化
     EXCEPTION_CATCH(rankPairMgr_ = std::make_unique<RankPairMgr>(rankIpPortMap_), return HCCL_E_PTR);
 
-    Hccl::DfxDlProfFunction::GetInstance().DfxDlProfFunctionInit();
     // EXCEPTION_HANDLE_END
     return HCCL_SUCCESS;
 }
@@ -542,7 +616,8 @@ HcclResult MyRank::GetEndpointPairFromChannel(
 }
 
 void MyRank::FillEndpointPairIpIndex(
-    hcomm::EndpointPair* endpointPair, uint32_t remoteRank, const EndpointDesc& localEp, const EndpointDesc& remoteEp)
+    hcomm::EndpointPair* endpointPair, uint32_t remoteRank, const EndpointDesc& localEp,
+    const EndpointDesc& remoteEp) const
 {
     if (rankGraph_ == nullptr || endpointPair == nullptr) {
         return;
@@ -685,23 +760,47 @@ HcclResult MyRank::BatchCreateSockets(
     return HCCL_SUCCESS;
 }
 
+HcclResult MyRank::NeedCheckConsistency(bool& needCheck) const
+{
+    needCheck = false;
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(
+        !isGe950.has_value(), HCCL_ERROR("[MyRank][%s] get device type failed, cannot check consistency.", __func__),
+        HCCL_E_RUNTIME);
+    if (!(*isGe950)) {
+        HCCL_INFO("[MyRank][%s] devType is not 950 or later, no need to check consistency.", __func__);
+        return HCCL_SUCCESS;
+    }
+
+    const int32_t mode = Hccl::EnvConfig::GetInstance().GetLogConfig().GetDfsConfig().rankConsistentState;
+    needCheck = (mode == Hccl::RANK_CONSISTENT_STATE_FIRST || mode == Hccl::RANK_CONSISTENT_STATE_ON);
+    HCCL_INFO("[MyRank][%s] rankConsistentState[%d], needCheck[%d].", __func__, mode, static_cast<int32_t>(needCheck));
+    return HCCL_SUCCESS;
+}
+
 HcclResult MyRank::BatchExchangeAndCheckConsistency(
-    const HcclChannelDesc* channelDescs, const std::vector<HcommChannelDesc>& hcommDescs, uint32_t channelNum,
-    const std::vector<std::pair<u32, u32>>& newChannels, CommEngine engine)
+    const HcclChannelDesc* channelDescs, const ChannelHandle* channelHandles, uint32_t channelNum)
 {
     CHK_PTR_NULL(channelDescs);
+    CHK_PTR_NULL(channelHandles);
     CHK_PRT_RET(channelNum == 0, HCCL_ERROR("[%s] invalid param: channelNum is zero", __func__), HCCL_E_PARA);
 
-    // 与非共享路径 MyRank::CreateChannels 一致：DEV_TYPE_950 和 DEV_TYPE_960 需要执行通信域一致性校验交换。
-    DevType devType;
-    CHK_RET(hrtGetDeviceType(devType));
-    if (devType != DevType::DEV_TYPE_950 && devType != DevType::DEV_TYPE_960) {
+    bool needCheck = false;
+    CHK_RET(NeedCheckConsistency(needCheck));
+    if (!needCheck) {
+        HCCL_INFO("[MyRank][%s] no need to check consistency, skip.", __func__);
         return HCCL_SUCCESS;
+    }
+
+    // 仅需远端rank列表，无需向ExchangeInfoMgr透传完整channelDesc
+    std::vector<uint32_t> remoteRanks(channelNum);
+    for (uint32_t i = 0; i < channelNum; ++i) {
+        remoteRanks[i] = channelDescs[i].remoteRank;
     }
 
     auto startConsistency = std::chrono::steady_clock::now();
     CHK_RET(exchangeInfoMgr_.BatchExchangeAndCheckConsistency(
-        channelDescs, hcommDescs, channelNum, newChannels, collCommConfigConsistency_, engine));
+        remoteRanks.data(), channelHandles, channelNum, collCommConfigConsistency_));
     auto endConsistency = std::chrono::steady_clock::now();
     auto durationConsistency
         = std::chrono::duration_cast<std::chrono::microseconds>(endConsistency - startConsistency).count();
@@ -736,19 +835,19 @@ HcclResult MyRank::CheckChannelParam(CommEngine engine, const HcclChannelDesc* c
     for (u32 index = 0; index < channelNum; ++index) {
         if (engine == COMM_ENGINE_AIV) {
             CHK_PRT_RET(
-                (channelDesc->memHandleNum > MEM_HANDLE_NUM_MAX),
+                (channelDesc[index].memHandleNum > MEM_HANDLE_NUM_MAX),
                 HCCL_ERROR(
                     "[%s]Channeldesc[%u] invalid memHandleNum, memHandleNum[%u], max channel num[%u]", __func__, index,
-                    channelDesc->memHandleNum, MEM_HANDLE_NUM_MAX),
+                    channelDesc[index].memHandleNum, MEM_HANDLE_NUM_MAX),
                 HCCL_E_PARA);
             CHK_PRT_RET(
-                (channelDesc->memHandleNum != 0 && channelDesc->memHandles == nullptr),
+                (channelDesc[index].memHandleNum != 0 && channelDesc[index].memHandles == nullptr),
                 HCCL_ERROR("[%s]Channeldesc[%u] invalid memHandles, memHandles is null", __func__, index), HCCL_E_PARA);
         } else {
-            if (channelDesc->memHandleNum != 0) {
+            if (channelDesc[index].memHandleNum != 0) {
                 HCCL_WARNING(
                     "[%s]Channeldesc[%u] memHandleNum[%u] is non-zero, memHandle exchange is not supported.", __func__,
-                    index, channelDesc->memHandleNum);
+                    index, channelDesc[index].memHandleNum);
             }
         }
 
@@ -760,10 +859,10 @@ HcclResult MyRank::CheckChannelParam(CommEngine engine, const HcclChannelDesc* c
             return HCCL_E_PARA;
         }
         CHK_PRT_RET(
-            channelDesc->notifyNum > NOTIFY_NUM_MAX,
+            channelDesc[index].notifyNum > NOTIFY_NUM_MAX,
             HCCL_ERROR(
                 "[%s]Channeldesc[%u] invalid notifyNum [%u], max notify num[%u]", __func__, index,
-                channelDesc->notifyNum, NOTIFY_NUM_MAX),
+                channelDesc[index].notifyNum, NOTIFY_NUM_MAX),
             HCCL_E_PARA);
     }
 
@@ -780,11 +879,12 @@ HcclResult MyRank::CheckChannelParam(CommEngine engine, const HcclChannelDesc* c
 // 批量创建channels，如果CCU资源不足（如Xn, Cke, channel ctx, jetty ctx, wqebb）会失败，返回HCCL_E_UNAVAIL
 HcclResult MyRank::BatchCreateChannels(
     CommEngine engine, const HcclChannelDesc* channelDescs, uint32_t channelNum,
-    std::vector<HcommChannelDesc>& hcommDescs, ChannelHandle* channelHandles,
+    std::vector<HcommChannelDesc>& hcommDescs, ChannelHandle* channelHandles, ChannelHandle* deviceChannelHandles,
     std::vector<std::vector<MemHandle>>& allHandles)
 {
     CHK_PTR_NULL(channelDescs);
     CHK_PTR_NULL(channelHandles);
+    CHK_PTR_NULL(deviceChannelHandles);
     CHK_PRT_RET(channelNum == 0, HCCL_ERROR("[%s] invalid param: channelNum is zero", __func__), HCCL_E_PARA);
 
     // 持锁保护 newChannels_/handleToEpPair_；失败路径调用的 DestroyNewChannels 由本函数持锁，内部不再加锁
@@ -875,7 +975,8 @@ HcclResult MyRank::BatchCreateChannels(
         bool isNewChannel = (endpointPair->IsChannelNotExist(engine, reuseIdx) || (idx == UNREUSE_CHANNEL_IDX));
 
         // CreateChannel 返回 HCCL_E_UNAVAIL 表示资源不足创建失败
-        ret = endpointPair->CreateChannel(epHandle, engine, idx, &hcommDescs[i], channelHandles + i);
+        ret = endpointPair->CreateChannel(
+            epHandle, engine, idx, &hcommDescs[i], channelHandles + i, deviceChannelHandles + i);
         if (ret == HCCL_E_TIMEOUT || ret == HCCL_E_INTERNAL) {
             Hccl::TlsStatus tlsStatus = Hccl::TlsStatus::UNKNOWN;
             CHK_PRT_CONT(
@@ -1142,22 +1243,34 @@ HcclResult MyRank::DestroyChannels(const ChannelHandle* channels, uint32_t chann
     return HCCL_SUCCESS;
 }
 
-HcclResult MyRank::BatchConnectChannels(
-    const HcclChannelDesc* channelDescs, ChannelHandle* channelHandles, uint32_t channelNum) const
+HcclResult MyRank::WaitForChannelsReady(
+    const HcclChannelDesc* channelDescs, ChannelHandle* channelHandles, uint32_t channelNum, CommEngine engine)
 {
     auto timeout = std::chrono::seconds(Hccl::EnvConfig::GetInstance().GetSocketConfig().GetLinkTimeOut());
     auto startTime = std::chrono::steady_clock::now();
 
     HCCL_INFO(
-        "[%s] start connecting channels, channelNum[%u], timeout[%lld]sec", __func__, channelNum, timeout.count());
+        "[%s] start waiting channels ready, channelNum[%u], timeout[%lld]sec", __func__, channelNum, timeout.count());
 
-    std::vector<int32_t> statusVec(channelNum, 0);
+    std::vector<int32_t> statusVec(channelNum, hcomm::HCOMM_CHANNEL_STATUS_CONNECTING);
     int32_t* statusList = statusVec.data();
-    uint32_t retryCount = 0;
-    while (true) {
-        HcclResult ret = hcomm::ChannelProcess::ChannelGetStatus(channelHandles, channelNum, statusList);
+    uint32_t retryCount = 0; // 轮询次数
 
-        // 卫语句：先处理异常情况
+    auto printChannelErrors = [this, &channelNum, &channelDescs, &channelHandles, &statusList](int64_t elapsed) {
+        // TLS 探测与错误表打印均按 HcommChannelLinkStatus 语义解读 statusList
+        std::vector<Hccl::TlsStatus> tlsStatusList(channelNum, Hccl::TlsStatus::UNKNOWN);
+        GetAbnormalChannelTlsStatus(channelDescs, statusList, channelNum, tlsStatusList);
+        logger::ChannelLogger::PrintChannelErrorDetails(
+            rankId_, channelNum, channelDescs, channelHandles, statusList, static_cast<uint64_t>(elapsed),
+            tlsStatusList.data());
+    };
+
+    while (true) {
+        HcclResult ret = static_cast<HcclResult>(HcommChannelGetStatus(channelHandles, channelNum, statusList));
+        // HcommChannelGetStatus 的返回码只表示接口自身调用结果，批次结论由 statusList 归类得出
+        if (ret == HCCL_SUCCESS) {
+            ret = MyRankUtils::ClassifyChannelStatus(statusList, channelNum);
+        }
 
         // 1. 检查超时
         if ((std::chrono::steady_clock::now() - startTime) >= timeout) {
@@ -1165,18 +1278,14 @@ HcclResult MyRank::BatchConnectChannels(
                 = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
                       .count();
             HCCL_ERROR(
-                "[%s][%s] wait socket establish timeout, channel connect timeout after %lld sec, "
-                "channelNum[%u], elapsed[%lld]ms, retryCount[%u]",
+                "[%s][%s] wait channel ready timeout after %lld sec, channelNum[%u], elapsed[%lld]ms, retryCount[%u]",
                 LOG_KEYWORDS_INIT_CHANNEL.c_str(), LOG_KEYWORDS_TIMEOUT.c_str(), timeout.count(), channelNum, elapsed,
                 retryCount);
             RPT_INPUT_ERR(
                 true, "EI0006", std::vector<std::string>({"reason"}),
                 std::vector<std::string>({GET_SOCKET_TIMEOUT_REASON_CLOSE_DETECT}));
-            std::vector<Hccl::TlsStatus> tlsStatusList(channelNum, Hccl::TlsStatus::UNKNOWN);
-            GetAbnormalChannelTlsStatus(channelDescs, statusList, channelNum, tlsStatusList);
-            logger::ChannelLogger::PrintChannelErrorDetails(
-                rankId_, channelNum, channelDescs, channelHandles, statusList, static_cast<uint64_t>(elapsed),
-                tlsStatusList.data());
+            printChannelErrors(elapsed);
+            StartDcaDetect(channelDescs, statusList, channelNum, engine);
             return HCCL_E_TIMEOUT;
         }
 
@@ -1188,12 +1297,9 @@ HcclResult MyRank::BatchConnectChannels(
 
         // 3. 处理资源不足（属于可预期回退场景）
         if (ret == HCCL_E_UNAVAIL) {
-            auto elapsed
-                = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - startTime)
-                      .count();
             HCCL_WARNING(
-                "[%s] channel connect resource unavailable, channelNum[%u], elapsed[%lld]ms, retryCount[%u]", __func__,
-                channelNum, elapsed, retryCount);
+                "[%s] channel connect resource unavailable, channelNum[%u], retryCount[%u]", __func__, channelNum,
+                retryCount);
             return ret;
         }
 
@@ -1205,11 +1311,8 @@ HcclResult MyRank::BatchConnectChannels(
             HCCL_ERROR(
                 "[%s] channel connect failed, channelNum[%u], ret[%d], elapsed[%lld]ms, retryCount[%u]", __func__,
                 channelNum, ret, elapsed, retryCount);
-            std::vector<Hccl::TlsStatus> tlsStatusList(channelNum, Hccl::TlsStatus::UNKNOWN);
-            GetAbnormalChannelTlsStatus(channelDescs, statusList, channelNum, tlsStatusList);
-            logger::ChannelLogger::PrintChannelErrorDetails(
-                rankId_, channelNum, channelDescs, channelHandles, statusList, static_cast<uint64_t>(elapsed),
-                tlsStatusList.data());
+            printChannelErrors(elapsed);
+            StartDcaDetect(channelDescs, statusList, channelNum, engine);
             return ret;
         }
 
@@ -1225,22 +1328,268 @@ HcclResult MyRank::BatchConnectChannels(
     return HCCL_SUCCESS;
 }
 
+void MyRank::StartDcaDetect(
+    const HcclChannelDesc* channelDescs, const int32_t* statusList, uint32_t channelNum, CommEngine engine)
+{
+    // 收集仍在建链、建链失败或建链超时的对端
+    std::unordered_map<uint32_t, uint32_t> failedRanks;
+    CollectFailedRanks(channelDescs, statusList, channelNum, failedRanks);
+    StartDcaDetectByFailedRanks(channelDescs, channelNum, failedRanks, engine);
+}
+
+void MyRank::StartDcaDetectByFailedRanks(
+    const HcclChannelDesc* channelDescs, uint32_t channelNum, const std::unordered_map<uint32_t, uint32_t>& failedRanks,
+    CommEngine engine)
+{
+    if (channelDescs == nullptr || channelNum == 0) {
+        HCCL_ERROR(
+            "[%s] invalid param, channelDescs[%p], channelNum[%u], skip DCA detect", __func__, channelDescs,
+            channelNum);
+        return;
+    }
+    if (failedRanks.empty()) {
+        HCCL_WARNING("[%s] failedRanks is empty, skip DCA detect", __func__);
+        return;
+    }
+    DevType devType = DevType::DEV_TYPE_COUNT;
+    HcclResult devRet = hrtGetDeviceType(devType);
+    if (devRet != HCCL_SUCCESS || devType != DevType::DEV_TYPE_950) {
+        HCCL_WARNING(
+            "[%s] device gate not pass, ret[%d], deviceType[%d], skip DCA detect", __func__, devRet,
+            static_cast<int32_t>(devType));
+        return;
+    }
+    std::vector<hcomm::DcaPeerInfo> peers;
+    if (CollectDcaPeerInfo(channelDescs, failedRanks, peers, engine) != HCCL_SUCCESS || peers.empty()) {
+        HCCL_WARNING("[%s] collect dca peer info failed, skip DCA detect", __func__);
+        return;
+    }
+
+    std::vector<hcomm::LocalIpInfo> localIps;
+    if (CollectDcaLocalInfo(localIps, engine) != HCCL_SUCCESS || localIps.empty()) {
+        HCCL_WARNING("[%s] collect dca local info failed, skip DCA detect", __func__);
+        return;
+    }
+
+    uint32_t localDevPhyId = UINT32_MAX;
+    if (hrtGetDevicePhyIdByIndex(static_cast<u32>(devLogicId_), localDevPhyId) != HCCL_SUCCESS) {
+        HCCL_WARNING("[%s] get device phyId failed, devLogicId[%d], skip DCA detect", __func__, devLogicId_);
+        return;
+    }
+
+    std::string localNetInstId;
+    GetNetInstId(rankId_, localNetInstId);
+
+    HCCL_INFO(
+        "[%s] start detect, localDevPhyId[%u], localNetInstId[%s], localIps[%zu], failed peers[%zu]", __func__,
+        localDevPhyId, localNetInstId.c_str(), localIps.size(), peers.size());
+
+    hccl::CollCommMgr::GetInstance()
+        .GetDetectConnectionAnomalies(devLogicId_)
+        .AddIpQueue(devLogicId_, localDevPhyId, localNetInstId, peers, localIps);
+}
+
+HcclResult MyRank::GetNetInstId(uint32_t remoteRank, std::string& netInstId)
+{
+    // 参考集群心跳：用 netLayer=0 的 netInstance ID 标记机器，相当于server ID
+    CHK_PTR_NULL(rankGraph_);
+    RankGraphV2* rankGraphV2 = dynamic_cast<RankGraphV2*>(rankGraph_);
+    if (rankGraphV2 == nullptr) {
+        HCCL_WARNING("[%s] rankGraph is not RankGraphV2, GetNetInstId not supported", __func__);
+        return HCCL_E_NOT_SUPPORT;
+    }
+    return rankGraphV2->GetNetInstId(remoteRank, netInstId);
+}
+
+void MyRank::CollectFailedRanks(
+    const HcclChannelDesc* channelDescs, const int32_t* statusList, uint32_t channelNum,
+    std::unordered_map<uint32_t, uint32_t>& failedRanks)
+{
+    if (channelDescs == nullptr || statusList == nullptr || channelNum == 0) {
+        HCCL_ERROR(
+            "[%s] invalid param, channelDescs[%p], statusList[%p], channelNum[%u]", __func__, channelDescs, statusList,
+            channelNum);
+        return;
+    }
+    for (uint32_t i = 0; i < channelNum; ++i) {
+        if (statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_CONNECTING
+            || statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_FAILED
+            || statusList[i] == hcomm::HCOMM_CHANNEL_STATUS_TIMEOUT) {
+            failedRanks.emplace(channelDescs[i].remoteRank, i);
+        }
+    }
+}
+
+HcclResult MyRank::CollectDcaPeerInfo(
+    const HcclChannelDesc* channelDescs, const std::unordered_map<uint32_t, uint32_t>& failedRanks,
+    std::vector<hcomm::DcaPeerInfo>& peers, CommEngine engine)
+{
+    for (const auto& failedRank : failedRanks) {
+        uint32_t remoteRank = failedRank.first;
+        uint32_t descIdx = failedRank.second;
+        const auto& desc = channelDescs[descIdx];
+        EndpointLocType locType = desc.remoteEndpoint.loc.locType;
+        Hccl::IpAddress remoteIp;
+        if (CommAddrToIpAddress(desc.remoteEndpoint.commAddr, remoteIp) != HCCL_SUCCESS) {
+            continue; // 取不到 IP 跳过（异常防御）
+        }
+        Hccl::IpAddress localIp;
+        (void)CommAddrToIpAddress(desc.localEndpoint.commAddr, localIp);
+
+        uint32_t remotePort = GetDcaPort(remoteRank, remoteIp, locType, engine);
+
+        uint32_t remoteDevPhyId = 0;
+        if (locType == ENDPOINT_LOC_TYPE_HOST) {
+            (void)rankGraph_->GetDeviceId(remoteRank, &remoteDevPhyId);
+        } else {
+            remoteDevPhyId = desc.remoteEndpoint.loc.device.devPhyId;
+        }
+        // 机器标识用 netLayer0 NetInstId（机器唯一）：本端传本机 rank，对端传 remoteRank
+        hcomm::DcaPeerInfo peer{};
+        peer.remoteRankId = remoteRank;
+        peer.remoteDevPhyId = remoteDevPhyId;
+        peer.remoteIp = remoteIp;
+        peer.remotePort = remotePort;
+        peer.localIp = localIp;
+        peer.localEndpoint = desc.localEndpoint;
+        peer.remoteEndpoint = desc.remoteEndpoint;
+        // 对端机器标识（netLayer0 NetInstId，机器唯一）；本端标识由 InjectDetectBatch 一次获取传 AddIpQueue
+        std::string remoteNetInstId;
+        (void)GetNetInstId(remoteRank, remoteNetInstId);
+        (void)snprintf_s(peer.remoteNetInstId, DEST_MAX_LEN, DEST_MAX_LEN - 1, "%.127s", remoteNetInstId.c_str());
+        peers.push_back(peer);
+    }
+    return HCCL_SUCCESS;
+}
+
+uint32_t MyRank::GetDcaPort(uint32_t rank, const Hccl::IpAddress& ip, EndpointLocType locType, CommEngine engine)
+{
+    uint32_t port = 0;
+    // device 侧按 (rank, IP) 两级端口表查询，host/CPU 引擎走 rank 级查询
+    HcclResult ret = GetListenPortByAddr(rank, ip, locType, engine, &port);
+    if (ret != HCCL_SUCCESS || port > Hccl::MAX_VALUE_TCPPORT) {
+        HCCL_WARNING(
+            "[%s] Get listen port of Rank[%u] ip[%s] locType[%d] failed, ret[%d], use default port", __func__, rank,
+            ip.GetIpStr().c_str(), static_cast<int>(locType), ret);
+        port = (locType == ENDPOINT_LOC_TYPE_HOST) ? Hccl::DEFAULT_LISTENING_PORT : Hccl::DEFAULT_VALUE_TCPPORT;
+    }
+    return port;
+}
+
+HcclResult MyRank::CollectEndpointDescs(std::vector<EndpointDesc>& descs) const
+{
+    descs.clear();
+    CHK_PTR_NULL(rankGraph_);
+    RankGraphV2* rankGraphV2 = dynamic_cast<RankGraphV2*>(rankGraph_);
+    if (rankGraphV2 == nullptr) {
+        HCCL_WARNING("[%s] rankGraph is not RankGraphV2, collect endpoint descs not supported", __func__);
+        return HCCL_E_NOT_SUPPORT;
+    }
+    uint32_t* netLayers = nullptr;
+    uint32_t netLayerNum = 0;
+    HcclResult ret = rankGraphV2->GetNetLayers(&netLayers, &netLayerNum);
+    if (ret != HCCL_SUCCESS || netLayers == nullptr || netLayerNum == 0) {
+        HCCL_ERROR("[%s] GetNetLayers failed, ret[%d]", __func__, ret);
+        return HCCL_E_NOT_FOUND;
+    }
+    for (uint32_t layerIdx = 0; layerIdx < netLayerNum; ++layerIdx) {
+        uint32_t netLayer = netLayers[layerIdx];
+        uint32_t* topoInsts = nullptr;
+        uint32_t topoInstNum = 0;
+        ret = rankGraphV2->GetTopoInstsByLayer(netLayer, &topoInsts, &topoInstNum);
+        if (ret != HCCL_SUCCESS || topoInsts == nullptr) {
+            HCCL_ERROR("[%s] GetTopoInstsByLayer failed, netLayer[%u], ret[%d]", __func__, netLayer, ret);
+            continue;
+        }
+        for (uint32_t topoInstIdx = 0; topoInstIdx < topoInstNum; ++topoInstIdx) {
+            uint32_t descNum = 0;
+            ret = rankGraphV2->GetEndpointNum(netLayer, topoInsts[topoInstIdx], &descNum);
+            if (ret != HCCL_SUCCESS || descNum == 0) {
+                HCCL_ERROR(
+                    "[%s] GetEndpointNum failed, netLayer[%u] topoInstId[%u], ret[%d], descNum[%u]", __func__, netLayer,
+                    topoInsts[topoInstIdx], ret, descNum);
+                continue;
+            }
+            std::vector<EndpointDesc> layerDescs(descNum);
+            ret = rankGraphV2->GetEndpointDesc(netLayer, topoInsts[topoInstIdx], &descNum, layerDescs.data());
+            if (ret != HCCL_SUCCESS) {
+                HCCL_ERROR(
+                    "[%s] GetEndpointDesc failed, netLayer[%u] topoInstId[%u], ret[%d]", __func__, netLayer,
+                    topoInsts[topoInstIdx], ret);
+                continue;
+            }
+            // GetEndpointDesc 写回的 descNum 为实际填充条数，按实际条数截断
+            if (descNum < layerDescs.size()) {
+                layerDescs.resize(descNum);
+            }
+            descs.insert(descs.end(), layerDescs.begin(), layerDescs.end());
+        }
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult MyRank::CollectDcaLocalInfo(std::vector<hcomm::LocalIpInfo>& localIps, CommEngine engine)
+{
+    // 收集本 rank 全量建链地址和端口（按 IP 去重）
+    localIps.clear();
+    std::vector<EndpointDesc> descs;
+    CHK_RET(CollectEndpointDescs(descs));
+
+    std::set<Hccl::IpAddress> knownIps;
+    for (const auto& desc : descs) {
+        EndpointLocType locType = desc.loc.locType;
+        if (locType != ENDPOINT_LOC_TYPE_DEVICE && locType != ENDPOINT_LOC_TYPE_HOST) {
+            continue;
+        }
+        Hccl::IpAddress ip;
+        if (CommAddrToIpAddress(desc.commAddr, ip) != HCCL_SUCCESS) {
+            HCCL_ERROR(
+                "[%s] CommAddrToIpAddress failed, locType[%d], protocol[%d]", __func__, static_cast<int>(locType),
+                static_cast<int32_t>(desc.protocol));
+            continue;
+        }
+        if (knownIps.count(ip) == 0) {
+            knownIps.insert(ip);
+            hcomm::LocalIpInfo info;
+            info.ip = ip;
+            info.port = GetDcaPort(rankId_, info.ip, locType, engine);
+            info.endpoint = desc;
+            localIps.push_back(info);
+        }
+    }
+    return HCCL_SUCCESS;
+}
+
 HcclResult MyRank::ConfigSqDepthByExpansionMode(CommEngine engine, HcommChannelDesc& hcommDesc) const
 {
     const u32 configuredSqDepth = config_.GetConfigSqDepth();
+    const u32 configuredScqDepth = config_.GetConfigScqDepth();
+    const CommProtocol remoteProtocol = hcommDesc.remoteEndpoint.protocol;
+    const bool isAivUrma = (engine == COMM_ENGINE_AIV)
+                           && (remoteProtocol == COMM_PROTOCOL_UBC_TP || remoteProtocol == COMM_PROTOCOL_UBC_CTP
+                               || remoteProtocol == COMM_PROTOCOL_UBG);
     if (configuredSqDepth != HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET) {
-        const CommProtocol remoteProtocol = hcommDesc.remoteEndpoint.protocol;
-        if (engine == COMM_ENGINE_AIV
-            && (remoteProtocol == COMM_PROTOCOL_UBC_TP || remoteProtocol == COMM_PROTOCOL_UBC_CTP
-                || remoteProtocol == COMM_PROTOCOL_UBG)) {
+        if (isAivUrma) {
             hcommDesc.ubAttr.sqDepth = configuredSqDepth;
-            return HCCL_SUCCESS;
         } else {
             HCCL_WARNING(
                 "[%s] configured sqDepth[%u] is not supported when engine[%s] protocol[%s].", __func__,
                 configuredSqDepth, GetEnumToString(GetCommEngineStatusStrMap(), engine).c_str(),
                 MyRankUtils::GetCommProtocolEnumStr(remoteProtocol).c_str());
         }
+    }
+    if (configuredScqDepth != HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET) {
+        if (isAivUrma) {
+            hcommDesc.ubAttr.scqDepth = configuredScqDepth;
+        } else {
+            HCCL_WARNING(
+                "[%s] configured scqDepth[%u] is not supported when engine[%s] protocol[%s].", __func__,
+                configuredScqDepth, GetEnumToString(GetCommEngineStatusStrMap(), engine).c_str(),
+                MyRankUtils::GetCommProtocolEnumStr(remoteProtocol).c_str());
+        }
+    }
+    if (isAivUrma) {
+        return HCCL_SUCCESS;
     }
 
     constexpr u32 CCU_MS_MODE_DEPTH = 128;
@@ -1289,26 +1638,41 @@ void MyRank::LogChannelCreationInfo(
     }
 }
 
+static HcclResult BuildAicpuPublicChannelHandle(const ChannelHandle& deviceHandle, ChannelHandle& publicHandle)
+{
+    publicHandle = deviceHandle;
+    bool isAicpuTsUrma = false;
+    CHK_RET(hcomm::ChannelProcess::ChannelIsAicpuTsUrma(deviceHandle, isAicpuTsUrma));
+    if (!isAicpuTsUrma) {
+        return HCCL_SUCCESS;
+    }
+
+    uint64_t entityHandle = 0;
+    CHK_RET(static_cast<HcclResult>(HcommChannelBuildDeviceEntity(deviceHandle, &entityHandle)));
+    publicHandle = static_cast<ChannelHandle>(entityHandle);
+    return HCCL_SUCCESS;
+}
+
 HcclResult MyRank::FinalizeChannelsByEngine(
-    CommEngine engine, const std::string& commTag, uint32_t channelNum, std::vector<HcommChannelDesc>& hcommDescs,
-    ChannelHandle* hostChannelHandleList, ChannelHandle* channelHandles)
+    CommEngine engine, const std::string& commTag, uint32_t channelNum, ChannelHandle* hostChannelHandleList,
+    const ChannelHandle* deviceChannelHandleList, ChannelHandle* channelHandles)
 {
     if (engine == COMM_ENGINE_AICPU || engine == COMM_ENGINE_AICPU_TS) {
-        // 新增：添加 kernelLaunchAicpuCommInit 调用
-        if (!callbacks_.getAicpuCommState()) {
-            HCCL_INFO("MyRank::%s kernelLaunchAicpuCommInit start.", __func__);
-            HcclResult ret = callbacks_.kernelLaunchAicpuCommInit();
-            CHK_PRT_RET(
-                ret != HCCL_SUCCESS, HCCL_ERROR("[%s] kernelLaunchAicpuCommInit failed, return [%d].", __func__, ret),
-                ret);
-            callbacks_.setAicpuCommState(true);
+        // 输出 handle = device 句柄（ctx 模式为 ctxPtr）；URMA 通道转换为 ChannelEntity，
+        // 兼容 asc-comm 数据面，其它协议保持 upstream ctx/device 句柄。
+        CHK_SAFETY_FUNC_RET(memcpy_s(
+            channelHandles, channelNum * sizeof(ChannelHandle), deviceChannelHandleList,
+            channelNum * sizeof(ChannelHandle)));
+        std::vector<ChannelHandle> deviceHandles(channelHandles, channelHandles + channelNum);
+        for (uint32_t i = 0; i < channelNum; ++i) {
+            ChannelHandle publicHandle = 0;
+            CHK_RET(BuildAicpuPublicChannelHandle(channelHandles[i], publicHandle));
+            channelHandles[i] = publicHandle;
         }
-        HcommChannelDesc* hcommDesc = hcommDescs.data();
-        CHK_RET(ChannelProcess::ChannelKernelLaunchForComm(
-            channelHandles, hostChannelHandleList, hcommDesc, channelNum, commTag, binHandle_));
 
-        // ns recovery
-        nsRecoveryProcessor_->AddNsRecoveryData(engine, channelHandles, hostChannelHandleList, channelNum, commTag);
+        // ns recovery 登记转换前的原始 device 句柄；hostChannelHandleList_ 为 host Channel*。
+        nsRecoveryProcessor_->AddNsRecoveryData(
+            engine, deviceHandles.data(), hostChannelHandleList, channelNum, commTag);
 
         return HCCL_SUCCESS;
     }
@@ -1324,6 +1688,178 @@ HcclResult MyRank::FinalizeChannelsByEngine(
         "[MyRank][%s] unsupported comm engine[%s].", __func__,
         GetEnumToString(GetCommEngineStatusStrMap(), engine).c_str());
     return HCCL_E_NOT_SUPPORT;
+}
+
+// 记录 channel kernel 下发：建链后把本 comm 的 handle 列表记录到 CollCommAicpu，
+// 并按 remoteRank 注册 per-comm DFX 表
+static HcclResult LaunchRunAicpuCommRecordChannels(
+    const ChannelHandle* deviceChannelHandleList, const u32* remoteRankList, u32 channelNum, const std::string& commTag,
+    aclrtBinHandle binHandle)
+{
+    CHK_PTR_NULL(deviceChannelHandleList);
+    CHK_PTR_NULL(remoteRankList);
+
+    hccl::DeviceMem deviceChannelList = hccl::DeviceMem::alloc(channelNum * sizeof(ChannelHandle));
+    CHK_PTR_NULL(deviceChannelList.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        deviceChannelList.ptr(), channelNum * sizeof(ChannelHandle), deviceChannelHandleList,
+        channelNum * sizeof(ChannelHandle), HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+
+    hccl::DeviceMem deviceRemoteRankList = hccl::DeviceMem::alloc(channelNum * sizeof(u32));
+    CHK_PTR_NULL(deviceRemoteRankList.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        deviceRemoteRankList.ptr(), channelNum * sizeof(u32), remoteRankList, channelNum * sizeof(u32),
+        HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+
+    HcclAicpuCommRecordChannelsRes channelParam{};
+    channelParam.deviceHandleList = static_cast<const uint64_t*>(deviceChannelList.ptr());
+    channelParam.remoteRankList = static_cast<const uint32_t*>(deviceRemoteRankList.ptr());
+    channelParam.num = channelNum;
+    size_t copyLen = sizeof(channelParam.commTag) - 1;
+    if (commTag.size() < copyLen) {
+        copyLen = commTag.size();
+    }
+    CHK_SAFETY_FUNC_RET(memcpy_s(channelParam.commTag, sizeof(channelParam.commTag), commTag.c_str(), copyLen));
+    channelParam.commTag[copyLen] = '\0';
+
+    hccl::Stream localStream = hccl::Stream(hccl::StreamType::STREAM_TYPE_ONLINE);
+    constexpr u32 aicpuStreamMode = 1;
+    CHK_RET(hrtStreamSetMode(localStream.ptr(), aicpuStreamMode));
+
+    hccl::DeviceMem paramAddr = hccl::DeviceMem::alloc(sizeof(HcclAicpuCommRecordChannelsRes));
+    CHK_PTR_NULL(paramAddr.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        paramAddr.ptr(), sizeof(HcclAicpuCommRecordChannelsRes), &channelParam, sizeof(HcclAicpuCommRecordChannelsRes),
+        HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+
+    uint64_t context = ReinterpretAs<uint64_t>(paramAddr.ptr());
+
+    uint32_t envTimeout = Hccl::EnvConfig::GetInstance().GetRtsConfig().GetExecTimeOut();
+    s32 timeOut = envTimeout + 25 > std::numeric_limits<u16>::max() ? std::numeric_limits<u16>::max() :
+                                                                      envTimeout + 25; // 多25s，避免超时
+
+    CHK_RET(hccl::AicpuAclKernelLaunch(
+        localStream.ptr(), static_cast<void*>(&context), sizeof(context), binHandle, "RunAicpuCommRecordChannels", true,
+        static_cast<u16>(timeOut)));
+    CHK_RET(hcclStreamSynchronize(localStream.ptr(), timeOut));
+
+    HCCL_INFO("[%s] RunAicpuCommRecordChannels launch success, channelNum[%u].", __func__, channelNum);
+    return HCCL_SUCCESS;
+}
+
+// 复用通道追加内存后的 device 侧补齐：只推「非本次新建 且 本次追加过内存」的通道——
+// 新建通道由建链 kernel 连同地址表一起下发，未追加内存的通道 device 侧无需变更。
+// newChannels 的 first 是本批通道下标；allHandles[i] 即写入 hcommDescs[i].memHandleNum 的同一个值
+static HcclResult LaunchRunAicpuChannelMemUpdate(
+    const ChannelHandle* hostChannelHandleList, const ChannelHandle* deviceChannelHandleList, u32 channelNum,
+    const std::vector<std::pair<u32, u32>>& newChannels, const std::vector<std::vector<MemHandle>>& allHandles,
+    aclrtBinHandle binHandle)
+{
+    CHK_PTR_NULL(hostChannelHandleList);
+    CHK_PTR_NULL(deviceChannelHandleList);
+
+    std::vector<bool> isNewChannel(channelNum, false);
+    for (const auto& it : newChannels) {
+        if (it.first < channelNum) {
+            isNewChannel[it.first] = true;
+        }
+    }
+
+    // 第一轮：逐通道问所需字节数并累计总长，顺带记下各自在段内的偏移
+    std::vector<char> packHost;
+    std::vector<uint32_t> packSizeList(channelNum, 0);
+    std::vector<uint32_t> packOffsetList(channelNum, 0);
+    u32 totalSize = 0;
+    for (u32 i = 0; i < channelNum; ++i) {
+        if (isNewChannel[i] || allHandles[i].size() <= 1) {
+            continue;
+        }
+        uint32_t packSize = 0;
+        CHK_RET(static_cast<HcclResult>(HcommChannelGetMemUpdatePack(hostChannelHandleList[i], nullptr, &packSize)));
+        if (packSize == 0) {
+            continue;
+        }
+        packSizeList[i] = packSize;
+        packOffsetList[i] = totalSize;
+        totalSize += packSize;
+    }
+    if (totalSize == 0) {
+        return HCCL_SUCCESS;
+    }
+
+    // 第二轮：把各通道条目填进同一段 host 缓冲
+    packHost.resize(totalSize);
+    for (u32 i = 0; i < channelNum; ++i) {
+        if (packSizeList[i] == 0) {
+            continue;
+        }
+        uint32_t packSize = packSizeList[i];
+        CHK_RET(static_cast<HcclResult>(
+            HcommChannelGetMemUpdatePack(hostChannelHandleList[i], packHost.data() + packOffsetList[i], &packSize)));
+    }
+
+    hccl::Stream localStream = hccl::Stream(hccl::StreamType::STREAM_TYPE_ONLINE);
+    constexpr u32 aicpuStreamMode = 1;
+    CHK_RET(hrtStreamSetMode(localStream.ptr(), aicpuStreamMode));
+
+    hccl::DeviceMem packDev = hccl::DeviceMem::alloc(totalSize);
+    CHK_PTR_NULL(packDev.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        packDev.ptr(), totalSize, packHost.data(), totalSize, HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+    const uint64_t packBase = ReinterpretAs<uint64_t>(packDev.ptr());
+
+    std::vector<uint64_t> deviceHandleList(channelNum, 0);
+    std::vector<uint64_t> packAddrList(channelNum, 0);
+    for (u32 i = 0; i < channelNum; ++i) {
+        deviceHandleList[i] = deviceChannelHandleList[i];
+        packAddrList[i] = packSizeList[i] == 0 ? 0 : packBase + packOffsetList[i];
+    }
+
+    hccl::DeviceMem deviceHandleListDev = hccl::DeviceMem::alloc(channelNum * sizeof(uint64_t));
+    CHK_PTR_NULL(deviceHandleListDev.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        deviceHandleListDev.ptr(), channelNum * sizeof(uint64_t), deviceHandleList.data(),
+        channelNum * sizeof(uint64_t), HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+
+    hccl::DeviceMem packAddrListDev = hccl::DeviceMem::alloc(channelNum * sizeof(uint64_t));
+    CHK_PTR_NULL(packAddrListDev.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        packAddrListDev.ptr(), channelNum * sizeof(uint64_t), packAddrList.data(), channelNum * sizeof(uint64_t),
+        HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+
+    hccl::DeviceMem packSizeListDev = hccl::DeviceMem::alloc(channelNum * sizeof(uint32_t));
+    CHK_PTR_NULL(packSizeListDev.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        packSizeListDev.ptr(), channelNum * sizeof(uint32_t), packSizeList.data(), channelNum * sizeof(uint32_t),
+        HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+
+    HcclAicpuChannelMemUpdateRes channelParam{};
+    channelParam.deviceHandleList = static_cast<const uint64_t*>(deviceHandleListDev.ptr());
+    channelParam.packAddrList = static_cast<const uint64_t*>(packAddrListDev.ptr());
+    channelParam.packSizeList = static_cast<const uint32_t*>(packSizeListDev.ptr());
+    channelParam.num = channelNum;
+
+    hccl::DeviceMem paramAddr = hccl::DeviceMem::alloc(sizeof(HcclAicpuChannelMemUpdateRes));
+    CHK_PTR_NULL(paramAddr.ptr());
+    CHK_RET(hrtMemSyncCopy(
+        paramAddr.ptr(), sizeof(HcclAicpuChannelMemUpdateRes), &channelParam, sizeof(HcclAicpuChannelMemUpdateRes),
+        HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE));
+
+    uint64_t context = ReinterpretAs<uint64_t>(paramAddr.ptr());
+
+    uint32_t envTimeout = Hccl::EnvConfig::GetInstance().GetRtsConfig().GetExecTimeOut();
+    s32 timeOut = envTimeout + 25 > std::numeric_limits<u16>::max() ? std::numeric_limits<u16>::max() :
+                                                                      envTimeout + 25; // 多25s，避免超时
+
+    CHK_RET(hccl::AicpuAclKernelLaunch(
+        localStream.ptr(), static_cast<void*>(&context), sizeof(context), binHandle, "RunAicpuChannelMemUpdate", true,
+        static_cast<u16>(timeOut)));
+    CHK_RET(hcclStreamSynchronize(localStream.ptr(), timeOut));
+
+    HCCL_INFO(
+        "[%s] RunAicpuChannelMemUpdate launch success, channelNum[%u], totalSize[%u].", __func__, channelNum,
+        totalSize);
+    return HCCL_SUCCESS;
 }
 
 HcclResult MyRank::CreateChannels(
@@ -1343,6 +1879,9 @@ HcclResult MyRank::CreateChannels(
 
     std::vector<ChannelHandle> hostChannelHandles(channelNum);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
+    // 与 hostChannelHandles 一一对应：device 可见句柄由 CreateChannel 出参回填，AICPU 引擎的输出/DFX 下发都用它
+    std::vector<ChannelHandle> deviceChannelHandles(channelNum);
+    ChannelHandle* deviceChannelHandleList = deviceChannelHandles.data();
 
     auto& rdmaConfig = Hccl::EnvConfig::GetInstance().GetRdmaConfig();
     std::vector<HcommChannelDesc> hcommDescs(channelNum);
@@ -1358,8 +1897,8 @@ HcclResult MyRank::CreateChannels(
     auto start = std::chrono::steady_clock::now();
     std::string socketTag = commTag + "_engine_" + std::to_string(engine);
     CHK_RET(BatchCreateSockets(channelDescs, channelNum, socketTag, hcommDescs, engine));
-    CHK_RET_UNAVAIL(
-        BatchCreateChannels(engine, channelDescs, channelNum, hcommDescs, hostChannelHandleList, allHandles));
+    CHK_RET_UNAVAIL(BatchCreateChannels(
+        engine, channelDescs, channelNum, hcommDescs, hostChannelHandleList, deviceChannelHandleList, allHandles));
 
     // 锁内快照本次新建列表：connect 阶段不再持 channelIndexMtx_，避免长耗时 IO 阻塞
     // Query/Destroy；回滚时基于快照重新取锁清理，保证 newChannels_ 读写均在锁内
@@ -1370,11 +1909,11 @@ HcclResult MyRank::CreateChannels(
     }
 
     if (!newChannelsSnapshot.empty()) {
-        HcclResult connRet = BatchConnectChannels(channelDescs, hostChannelHandleList, channelNum);
+        HcclResult connRet = WaitForChannelsReady(channelDescs, hostChannelHandleList, channelNum, engine);
         if (connRet == HCCL_E_UNAVAIL && engine == COMM_ENGINE_CCU) {
             // CCU 场景额外回滚本次新建的 channel，避免资源残留
             HCCL_RUN_WARNING(
-                "[%s] BatchConnectChannels is unsuccessful[%d], engine[%s], new channels num[%u]", __func__, connRet,
+                "[%s] WaitForChannelsReady is unsuccessful[%d], engine[%s], new channels num[%u]", __func__, connRet,
                 GetEnumToString(GetCommEngineStatusStrMap(), engine).c_str(), newChannelsSnapshot.size());
             std::lock_guard<std::mutex> lock(channelIndexMtx_);
             HcclResult destroyRet = DestroyNewChannels(engine, channelDescs, newChannelsSnapshot);
@@ -1392,13 +1931,54 @@ HcclResult MyRank::CreateChannels(
             "[MyRank][CreateChannels] CreateChannels Time Elapsed [%lld]us, channelNum [%u]", duration, channelNum);
     }
 
-    // 借用hcommDescs.socket，完成一致性校验必要的数据交换
-    CHK_RET(BatchExchangeAndCheckConsistency(channelDescs, hcommDescs, channelNum, newChannels_, engine));
+    // 借用channel内保存的socket，完成一致性校验必要的数据交换
+    HcclResult ret = BatchExchangeAndCheckConsistency(channelDescs, hostChannelHandleList, channelNum);
+    // 一致性校验超时/网络异常（host 同步收发失败映射为 E_TCP_CONNECT）：触发故障根节点探测
+    if (ret == HCCL_E_TIMEOUT || ret == HCCL_E_TCP_CONNECT) {
+        std::unordered_map<uint32_t, uint32_t> failedRanks; // remoteRank → 首条未完成 channel 下标
+        for (uint32_t i = 0; i < channelNum; ++i) {
+            HcommSocket rawSocket = hcommDescs[i].socket;
+            Hccl::Socket* socket = static_cast<Hccl::Socket*>(rawSocket);
+            if (socket == nullptr || socket->GetSocketStatus() != Hccl::SocketStatus::OK) {
+                failedRanks.emplace(channelDescs[i].remoteRank, i);
+            }
+        }
+        StartDcaDetectByFailedRanks(channelDescs, channelNum, failedRanks, engine);
+    }
+    CHK_RET(ret);
 
     // 添加初始化时进行填表
     LogChannelCreationInfo(engine, commTag, channelDescs, channelNum, hostChannelHandleList);
 
-    return FinalizeChannelsByEngine(engine, commTag, channelNum, hcommDescs, hostChannelHandleList, channelHandles);
+    // device DFX 填表：数据源为描述符的 remoteRank
+    if (engine == COMM_ENGINE_AICPU || engine == COMM_ENGINE_AICPU_TS) {
+        // 全复用批次不轮询，init kernel 无触发机会（ctx 全零，kernel 解引用会崩溃）；
+        // 兜底不查链路状态、仅补发未就绪实体
+        CHK_RET(static_cast<HcclResult>(HcommChannelEnsureDeviceReady(hostChannelHandleList, channelNum)));
+
+        // 记录 kernel 依赖 g_configEnv（由 RunAicpuCommInit 写入），先确保 commInit 已执行
+        if (!callbacks_.getAicpuCommState()) {
+            HcclResult initRet = callbacks_.kernelLaunchAicpuCommInit();
+            CHK_PRT_RET(
+                initRet != HCCL_SUCCESS,
+                HCCL_ERROR("[%s] kernelLaunchAicpuCommInit failed, return [%d].", __func__, initRet), initRet);
+            callbacks_.setAicpuCommState(true);
+        }
+        // 建链后记录 channel：存档 handle 列表供后台线程 Clean 使用，并按 remoteRank 注册 per-comm DFX 表
+        std::vector<u32> remoteRankList(channelNum);
+        for (u32 i = 0; i < channelNum; ++i) {
+            remoteRankList[i] = channelDescs[i].remoteRank;
+        }
+        CHK_RET(LaunchRunAicpuCommRecordChannels(
+            deviceChannelHandleList, remoteRankList.data(), channelNum, commTag, binHandle_));
+
+        // device 侧地址条目下发：复用槽位建链时该通道不下发建链包，本次追加的对端内存由本流程补齐
+        CHK_RET(LaunchRunAicpuChannelMemUpdate(
+            hostChannelHandleList, deviceChannelHandleList, channelNum, newChannelsSnapshot, allHandles, binHandle_));
+    }
+
+    return FinalizeChannelsByEngine(
+        engine, commTag, channelNum, hostChannelHandleList, deviceChannelHandleList, channelHandles);
 }
 
 HcclResult MyRank::ChannelGetHcclBuffer(ChannelHandle channel, void** buffer, uint64_t* size)
@@ -1497,61 +2077,77 @@ void MyRank::SetKfcControlTransfer(
 
 HcclResult MyRank::StopLaunch()
 {
-    HCCL_INFO("[NsRecovery][StopLaunch] MyRank::StopLaunch start!");
+    HCCL_INFO("[NsRecovery][%s] MyRank::StopLaunch start, commId[%s].", __func__, config_.GetConfigCommName().c_str());
     auto ret = nsRecoveryProcessor_->StopLaunch();
     if (ret != HcclResult::HCCL_SUCCESS) {
-        HCCL_ERROR("[NsRecovery][StopLaunch] MyRank::StopLaunch failed, ret = 0x%016llx", HCCL_ERROR_CODE(ret));
+        HCCL_ERROR(
+            "[NsRecovery][%s] MyRank::StopLaunch failed, commId[%s], ret = 0x%016llx", __func__,
+            config_.GetConfigCommName().c_str(), HCCL_ERROR_CODE(ret));
+        return ret;
     }
-    HCCL_INFO("[NsRecovery][StopLaunch] MyRank::StopLaunch success!");
+    HCCL_INFO(
+        "[NsRecovery][%s] MyRank::StopLaunch success, commId[%s].", __func__, config_.GetConfigCommName().c_str());
     return ret;
 }
 
 HcclResult MyRank::Clean()
 {
-    HCCL_INFO("[NsRecovery][Clean] MyRank::Clean start!");
+    HCCL_INFO("[NsRecovery][%s] MyRank::Clean start, commId[%s].", __func__, config_.GetConfigCommName().c_str());
     auto channelList = GetAllChannelList();
     if (channelList.empty()) {
-        HCCL_INFO("[NsRecovery][Clean] Channel list empty, No need to clean!");
+        HCCL_INFO(
+            "[NsRecovery][%s] commId[%s] Channel list empty, No need to clean!", __func__,
+            config_.GetConfigCommName().c_str());
         return HcclResult::HCCL_SUCCESS;
     }
     auto ret = ChannelProcess::ChannelClean(channelList.data(), channelList.size());
     if (ret != HcclResult::HCCL_SUCCESS) {
-        HCCL_ERROR("[NsRecovery][Clean] MyRank::Clean failed, ret = 0x%016llx", HCCL_ERROR_CODE(ret));
+        HCCL_ERROR(
+            "[NsRecovery][%s] MyRank::Clean failed, commId[%s], ret = 0x%016llx", __func__,
+            config_.GetConfigCommName().c_str(), HCCL_ERROR_CODE(ret));
         return ret;
     }
 
     ret = nsRecoveryProcessor_->Clean();
     if (ret != HcclResult::HCCL_SUCCESS) {
-        HCCL_ERROR("[NsRecovery][Clean] MyRank::Clean failed, ret = 0x%016llx", HCCL_ERROR_CODE(ret));
+        HCCL_ERROR(
+            "[NsRecovery][%s] MyRank::Clean failed, commId[%s], ret = 0x%016llx", __func__,
+            config_.GetConfigCommName().c_str(), HCCL_ERROR_CODE(ret));
         return ret;
     }
 
-    HCCL_INFO("[NsRecovery][Clean] MyRank::Clean success!");
+    HCCL_INFO("[NsRecovery][%s] MyRank::Clean success, commId[%s].", __func__, config_.GetConfigCommName().c_str());
     return HcclResult::HCCL_SUCCESS;
 }
 
 HcclResult MyRank::Resume()
 {
-    HCCL_INFO("[NsRecovery][Resume] MyRank::Resume start!");
+    HCCL_INFO("[NsRecovery][%s] MyRank::Resume start, commId[%s].", __func__, config_.GetConfigCommName().c_str());
     auto channelList = GetAllChannelList();
     if (channelList.empty()) {
-        HCCL_INFO("[NsRecovery][Resume] Resume list empty, No need to resume!");
+        HCCL_INFO(
+            "[NsRecovery][%s] commId[%s] Resume list empty, No need to resume!", __func__,
+            config_.GetConfigCommName().c_str());
         return HcclResult::HCCL_SUCCESS;
     }
 
     auto ret = ChannelProcess::ChannelResume(channelList.data(), channelList.size());
     if (ret != HcclResult::HCCL_SUCCESS) {
-        HCCL_ERROR("[NsRecovery][Resume] MyRank::Resume failed, ret = 0x%016llx", HCCL_ERROR_CODE(ret));
+        HCCL_ERROR(
+            "[NsRecovery][%s] MyRank::Resume failed, commId[%s], ret = 0x%016llx", __func__,
+            config_.GetConfigCommName().c_str(), HCCL_ERROR_CODE(ret));
         return ret;
     }
 
     ret = nsRecoveryProcessor_->Resume(binHandle_);
     if (ret != HcclResult::HCCL_SUCCESS) {
-        HCCL_ERROR("[NsRecovery][Resume] MyRank::Resume failed, ret = 0x%016llx", HCCL_ERROR_CODE(ret));
+        HCCL_ERROR(
+            "[NsRecovery][%s] MyRank::Resume failed, commId[%s], ret = 0x%016llx", __func__,
+            config_.GetConfigCommName().c_str(), HCCL_ERROR_CODE(ret));
         return ret;
     }
 
-    HCCL_INFO("[NsRecovery][Resume] MyRank::Resume success!");
+    HCCL_INFO("[NsRecovery][%s] MyRank::Resume success, commId[%s].", __func__, config_.GetConfigCommName().c_str());
     return HCCL_SUCCESS;
 }
 

@@ -12,6 +12,8 @@
 #include "json_parser.h"
 #include "invalid_params_exception.h"
 #include "exception_util.h"
+#include "adapter_error_manager_pub.h"
+#include "common/hccl_log_keywords_pub.h"
 #include "rank_table_report_macro.h"
 
 namespace Hccl {
@@ -41,58 +43,67 @@ const unordered_map<string, LinkType> EdgeInfo::strToLinkType
 const unordered_map<string, AddrPosition> EdgeInfo::strToAddrPosition
     = (unordered_map<string, AddrPosition>{{"DEVICE", AddrPosition::DEVICE}, {"HOST", AddrPosition::HOST}});
 
-void EdgeInfo::Deserialize(const nlohmann::json& edgeInfoJson)
+HcclResult EdgeInfo::Deserialize(const nlohmann::json& edgeInfoJson)
 {
-    std::string msgNetLayer = "[EdgeInfo::Deserialize] error occurs when parser object of propName \"net_layer\"";
-    TRY_CATCH_THROW_REPORT_TOPO(
-        InvalidParamsException, msgNetLayer, (netLayer = GetJsonPropertyUInt(edgeInfoJson, "net_layer")), edgeInfoJson,
-        "net_layer", "0 ~ UINT32_MAX");
+    HcclResult ret = GetJsonPropertyUInt(edgeInfoJson, "net_layer", true, 0, netLayer);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(edgeInfoJson, "net_layer", "0 ~ UINT32_MAX", RankTableSource::RANKTABLE);
+        return ret;
+    }
     if (netLayer > MAX_VALUE_LEVEL) {
-        THROW<InvalidParamsException>(StringFormat(
-            "[EdgeInfo::%s] netLayer value[%u] is out of range[0, %u].", __func__, netLayer, MAX_VALUE_LEVEL));
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>(
+                {std::to_string(netLayer), "net_layer", "[0, " + std::to_string(MAX_VALUE_LEVEL) + "]"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] net_layer[%u] is out of range [0, %u]", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), netLayer, MAX_VALUE_LEVEL);
+        return HCCL_E_PARA;
     }
 
-    DeserializeProtocol(edgeInfoJson);
+    CHK_RET(DeserializeProtocol(edgeInfoJson));
 
     if (edgeInfoJson.contains("topo_type")) {
         std::string topoTypeStr;
-        std::string msgtopoType = "[EdgeInfo::Deserialize] error occurs when parser object of propName \"topo_type\"";
-        TRY_CATCH_THROW_REPORT_TOPO(
-            InvalidParamsException, msgtopoType, (topoTypeStr = GetJsonProperty(edgeInfoJson, "topo_type")),
-            edgeInfoJson, "topo_type", "non-empty string");
-        topoType = GetTopoType(topoTypeStr);
+        ret = GetJsonProperty(edgeInfoJson, "topo_type", true, topoTypeStr);
+        if (ret != HCCL_SUCCESS) {
+            ReportJsonConfigError(edgeInfoJson, "topo_type", "non-empty string", RankTableSource::RANKTABLE);
+            return ret;
+        }
+        TRY_CATCH_RETURN(topoType = GetTopoType(topoTypeStr););
     } else {
         HCCL_WARNING("[EdgeInfo::%s] topo_type not found, [default]topo_type=TopoType::CLOS", __func__);
         topoType = TopoType::CLOS; // topo_type字段不存在时，取默认值CLOS
     }
 
-    std::string msgtopoInstIdType
-        = "[EdgeInfo::Deserialize] error occurs when parser object of propName \"topo_instance_id\"";
     if (edgeInfoJson.contains("topo_instance_id")) {
-        TRY_CATCH_THROW_REPORT_TOPO(
-            InvalidParamsException, msgtopoInstIdType,
-            (topoInstId = GetJsonPropertyUInt(edgeInfoJson, "topo_instance_id")), edgeInfoJson, "topo_instance_id",
-            "0 ~ UINT32_MAX");
+        ret = GetJsonPropertyUInt(edgeInfoJson, "topo_instance_id", true, 0, topoInstId);
+        if (ret != HCCL_SUCCESS) {
+            ReportJsonConfigError(edgeInfoJson, "topo_instance_id", "0 ~ UINT32_MAX", RankTableSource::RANKTABLE);
+            return ret;
+        }
     } else {
         HCCL_WARNING("[EdgeInfo::%s] topo_instance_id not found, [default]topo_instance_id=0", __func__);
         topoInstId = 0;
     }
 
     // 解析localA 和 localB
-    DeserializeEndpoint(edgeInfoJson);
+    CHK_RET(DeserializeEndpoint(edgeInfoJson));
+    return HCCL_SUCCESS;
 }
 
-void EdgeInfo::DeserializeProtocol(const nlohmann::json& edgeInfoJson)
+HcclResult EdgeInfo::DeserializeProtocol(const nlohmann::json& edgeInfoJson)
 {
     nlohmann::json jsonProtocols;
-    std::string msgProtocols
-        = "[EdgeInfo::DeserializeProtocol] error occurs when parser object of propName \"protocols\"";
-    TRY_CATCH_THROW_REPORT_TOPO(
-        InvalidParamsException, msgProtocols, (GetJsonPropertyList(edgeInfoJson, "protocols", jsonProtocols)),
-        edgeInfoJson, "protocols", "array");
+    HcclResult ret = GetJsonPropertyList(edgeInfoJson, "protocols", jsonProtocols);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(edgeInfoJson, "protocols", "array", RankTableSource::RANKTABLE);
+        return ret;
+    }
     for (auto& protocolEle : jsonProtocols) {
         auto protocolStr = protocolEle.get<std::string>();
-        LinkProtocol protocol = GetLinkProtocol(protocolStr);
+        LinkProtocol protocol;
+        TRY_CATCH_RETURN(protocol = GetLinkProtocol(protocolStr););
         if (protocols.count(protocol) == 0) {
             protocols.emplace(protocol);
         } else {
@@ -101,45 +112,71 @@ void EdgeInfo::DeserializeProtocol(const nlohmann::json& edgeInfoJson)
     }
 
     if (protocols.empty()) {
-        THROW<InvalidParamsException>("[EdgeInfo::%s] \"protocols\" is empty", __func__);
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>({"empty", "protocols", "non-empty array"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] protocols is empty", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA));
+        return HCCL_E_PARA;
     }
+    return HCCL_SUCCESS;
 }
 
-void EdgeInfo::DeserializeEndpoint(const nlohmann::json& edgeInfoJson)
+HcclResult EdgeInfo::DeserializeEndpoint(const nlohmann::json& edgeInfoJson)
 {
     std::string linkTypeStr;
-    std::string msglinkType
-        = "[EdgeInfo::DeserializeEndpoint] error occurs when parser object of propName \"link_type\"";
-    TRY_CATCH_THROW_REPORT_TOPO(
-        InvalidParamsException, msglinkType, (linkTypeStr = GetJsonProperty(edgeInfoJson, "link_type")), edgeInfoJson,
-        "link_type", "non-empty string");
-    linkType = GetLinkType(linkTypeStr);
+    HcclResult ret = GetJsonProperty(edgeInfoJson, "link_type", true, linkTypeStr);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(edgeInfoJson, "link_type", "non-empty string", RankTableSource::RANKTABLE);
+        return ret;
+    }
+    TRY_CATCH_RETURN(linkType = GetLinkType(linkTypeStr););
 
-    std::string msgLocalA = "[EdgeInfo::DeserializeEndpoint] error occurs when parser object of propName \"local_a\"";
-    TRY_CATCH_THROW_REPORT_TOPO(
-        InvalidParamsException, msgLocalA, (localA = GetJsonPropertyUInt(edgeInfoJson, "local_a")), edgeInfoJson,
-        "local_a", "0 ~ UINT32_MAX");
+    ret = GetJsonPropertyUInt(edgeInfoJson, "local_a", true, 0, localA);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(edgeInfoJson, "local_a", "0 ~ UINT32_MAX", RankTableSource::RANKTABLE);
+        return ret;
+    }
 
-    DeserializePort(edgeInfoJson, "local_a_ports", localAPorts);
+    CHK_RET(DeserializePort(edgeInfoJson, "local_a_ports", localAPorts));
     if (localAPorts.empty()) {
-        THROW<InvalidParamsException>("[EdgeInfo::%s] local_a_ports can not be empty", __func__);
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>({"empty", "local_a_ports", "non-empty array"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] local_a_ports is empty", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA));
+        return HCCL_E_PARA;
     }
 
     if (linkType == LinkType::PEER2PEER) {
-        std::string msgLocalB
-            = "[EdgeInfo::DeserializeEndpoint] error occurs when parser object of propName \"local_b\"";
-        TRY_CATCH_THROW_REPORT_TOPO(
-            InvalidParamsException, msgLocalB, (localB = GetJsonPropertyUInt(edgeInfoJson, "local_b")), edgeInfoJson,
-            "local_b", "0 ~ UINT32_MAX");
-
-        if (localA == localB) { // localA 和 localB 不能是同一个点
-            THROW<InvalidParamsException>(
-                "[EdgeInfo::%s] local_a and local_b can not be the same Endpoint id[%u].", __func__, localA);
+        ret = GetJsonPropertyUInt(edgeInfoJson, "local_b", true, 0, localB);
+        if (ret != HCCL_SUCCESS) {
+            ReportJsonConfigError(edgeInfoJson, "local_b", "0 ~ UINT32_MAX", RankTableSource::RANKTABLE);
+            return ret;
         }
 
-        DeserializePort(edgeInfoJson, "local_b_ports", localBPorts);
+        if (localA == localB) { // localA 和 localB 不能是同一个点
+            RPT_INPUT_ERR(
+                true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+                std::vector<std::string>({std::to_string(localA), "local_a/local_b", "different local_id"}));
+            HCCL_ERROR(
+                "[%s][%s] errNo[0x%016llx] local_a[%u] and local_b[%u] can not be the same",
+                LOG_KEYWORDS_INIT_GROUP.c_str(), LOG_KEYWORDS_RANKTABLE_CHECK.c_str(),
+                HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), localA, localB);
+            return HCCL_E_PARA;
+        }
+
+        CHK_RET(DeserializePort(edgeInfoJson, "local_b_ports", localBPorts));
         if (localBPorts.empty()) {
-            THROW<InvalidParamsException>("[EdgeInfo::%s] local_b_ports can not be empty when PEER2PEER", __func__);
+            RPT_INPUT_ERR(
+                true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+                std::vector<std::string>({"empty", "local_b_ports", "non-empty array for PEER2PEER"}));
+            HCCL_ERROR(
+                "[%s][%s] errNo[0x%016llx] local_b_ports is empty when PEER2PEER", LOG_KEYWORDS_INIT_GROUP.c_str(),
+                LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA));
+            return HCCL_E_PARA;
         }
     } else {
         if (edgeInfoJson.contains("local_b") || edgeInfoJson.contains("local_b_ports")) {
@@ -149,30 +186,38 @@ void EdgeInfo::DeserializeEndpoint(const nlohmann::json& edgeInfoJson)
 
     if (edgeInfoJson.contains("position")) {
         string positionStr;
-        std::string msgPosition
-            = "[EdgeInfo::DeserializeEndpoint] error occurs when parser object of propName \"position\"";
-        TRY_CATCH_THROW_REPORT_TOPO(
-            InvalidParamsException, msgPosition, (positionStr = GetJsonProperty(edgeInfoJson, "position")),
-            edgeInfoJson, "position", "non-empty string");
-        position = GetAddrPosition(positionStr);
+        ret = GetJsonProperty(edgeInfoJson, "position", true, positionStr);
+        if (ret != HCCL_SUCCESS) {
+            ReportJsonConfigError(edgeInfoJson, "position", "non-empty string", RankTableSource::RANKTABLE);
+            return ret;
+        }
+        TRY_CATCH_RETURN(position = GetAddrPosition(positionStr););
     } else {
         HCCL_WARNING("[EdgeInfo::%s] position not found, [default]position=DEVICE", __func__);
         position = AddrPosition::DEVICE;
     }
+    return HCCL_SUCCESS;
 }
 
-void EdgeInfo::DeserializePort(const nlohmann::json& edgeInfoJson, std::string propName, std::set<std::string>& ports)
+HcclResult
+EdgeInfo::DeserializePort(const nlohmann::json& edgeInfoJson, std::string propName, std::set<std::string>& ports) const
 {
     nlohmann::json jsonPorts;
-    std::string msgPort
-        = StringFormat("[EdgeInfo::%s] error occurs when parser object of propName \"%s\"", __func__, propName.c_str());
-    TRY_CATCH_THROW_REPORT_TOPO(
-        InvalidParamsException, msgPort, (GetJsonPropertyList(edgeInfoJson, propName.c_str(), jsonPorts)), edgeInfoJson,
-        propName.c_str(), "array");
+    HcclResult ret = GetJsonPropertyList(edgeInfoJson, propName.c_str(), jsonPorts);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(edgeInfoJson, propName.c_str(), "array", RankTableSource::RANKTABLE);
+        return ret;
+    }
     if (jsonPorts.empty() || jsonPorts.size() > MAX_PORTS_SIZE) {
-        THROW<InvalidParamsException>(
-            "[EdgeInfo::%s] ports[%s].size=[%zu] out of range[1, %u]", __func__, propName.c_str(), jsonPorts.size(),
-            MAX_PORTS_SIZE);
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>(
+                {std::to_string(jsonPorts.size()), propName, "[1, " + std::to_string(MAX_PORTS_SIZE) + "]"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] ports[%s] size[%zu] out of range [1, %u]", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), propName.c_str(),
+            jsonPorts.size(), MAX_PORTS_SIZE);
+        return HCCL_E_PARA;
     }
     for (auto& portEle : jsonPorts) {
         string port = portEle.get<string>();
@@ -183,11 +228,17 @@ void EdgeInfo::DeserializePort(const nlohmann::json& edgeInfoJson, std::string p
                 HCCL_WARNING("[EdgeInfo::%s] Repeat port:[%s]", __func__, port.c_str());
             }
         } else {
-            THROW<InvalidParamsException>(
-                "[EdgeInfo::%s] Invalid port[%s], length[%zu] out of range[1, %u]", __func__, port.c_str(), port.size(),
-                PORT_MAX_LENGTH);
+            RPT_INPUT_ERR(
+                true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+                std::vector<std::string>({port, "port", "length [1, " + std::to_string(PORT_MAX_LENGTH) + "]"}));
+            HCCL_ERROR(
+                "[%s][%s] errNo[0x%016llx] invalid port[%s], length[%zu] out of range [1, %u]",
+                LOG_KEYWORDS_INIT_GROUP.c_str(), LOG_KEYWORDS_RANKTABLE_CHECK.c_str(),
+                HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), port.c_str(), port.size(), PORT_MAX_LENGTH);
+            return HCCL_E_PARA;
         }
     }
+    return HCCL_SUCCESS;
 }
 
 bool EdgeInfo::operator==(const EdgeInfo& other) const
@@ -217,10 +268,10 @@ bool EdgeInfo::CompareEndpoints(const EdgeInfo& other) const
 
 LinkProtocol EdgeInfo::GetLinkProtocol(string str) const
 {
-    if (strToLinkProtocol.count(str) == 0) {
-        THROW<InvalidParamsException>(
-            "[EdgeInfo::%s] string['%s'] is not type of LinkProtocol.", __func__, str.c_str());
-    }
+    CHK_PRT_THROW(
+        strToLinkProtocol.count(str) == 0,
+        HCCL_ERROR("[EdgeInfo::%s] string['%s'] is not type of LinkProtocol.", __func__, str.c_str()),
+        InvalidParamsException, "string is not type of LinkProtocol");
     return strToLinkProtocol.at(str);
 }
 
@@ -229,19 +280,19 @@ TopoType EdgeInfo::GetTopoType(std::string topoTypeStr) const
     if (topoTypeStr.empty()) {
         return TopoType::CLOS; // 不填写时，取默认值
     }
-    if (strToTopoType.count(topoTypeStr) == 0) {
-        THROW<InvalidParamsException>(
-            "[EdgeInfo::%s] string['%s'] is not type of TopoType.", __func__, topoTypeStr.c_str());
-    }
+    CHK_PRT_THROW(
+        strToTopoType.count(topoTypeStr) == 0,
+        HCCL_ERROR("[EdgeInfo::%s] string['%s'] is not type of TopoType.", __func__, topoTypeStr.c_str()),
+        InvalidParamsException, "string is not type of TopoType");
     return strToTopoType.at(topoTypeStr);
 }
 
 LinkType EdgeInfo::GetLinkType(std::string linkTypeStr) const
 {
-    if (strToLinkType.count(linkTypeStr) == 0) {
-        THROW<InvalidParamsException>(
-            "[EdgeInfo::%s] string['%s'] is not type of LinkType.", __func__, linkTypeStr.c_str());
-    }
+    CHK_PRT_THROW(
+        strToLinkType.count(linkTypeStr) == 0,
+        HCCL_ERROR("[EdgeInfo::%s] string['%s'] is not type of LinkType.", __func__, linkTypeStr.c_str()),
+        InvalidParamsException, "string is not type of LinkType");
     return strToLinkType.at(linkTypeStr);
 }
 
@@ -251,9 +302,10 @@ AddrPosition EdgeInfo::GetAddrPosition(string str) const
         HCCL_WARNING("[EdgeInfo::%s] position is null, [default]position=DEVICE", __func__);
         return AddrPosition::DEVICE; //  默认取值为DEVICE
     }
-    if (strToAddrPosition.count(str) == 0) {
-        THROW<InvalidParamsException>(StringFormat("string ['%s'] is not type of AddrPosition.", str.c_str()));
-    }
+    CHK_PRT_THROW(
+        strToAddrPosition.count(str) == 0,
+        HCCL_ERROR("[EdgeInfo::%s] string['%s'] is not type of AddrPosition.", __func__, str.c_str()),
+        InvalidParamsException, "string is not type of AddrPosition");
     return strToAddrPosition.at(str);
 }
 

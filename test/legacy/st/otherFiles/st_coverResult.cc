@@ -242,14 +242,14 @@ TEST(ST_WhiteListTest, st_get_host_whitelist)
 TEST(ST_WhiteListTest, st_whitelist_load_config_file)
 {
     std::string name;
-    EXPECT_THROW(Whitelist::GetInstance().LoadConfigFile(name), InvalidParamsException);
+    EXPECT_EQ(Whitelist::GetInstance().LoadConfigFile(name), HcclResult::HCCL_E_PARA);
 
     name = "whitelist";
-    EXPECT_THROW(Whitelist::GetInstance().LoadConfigFile(name), InternalException);
+    EXPECT_EQ(Whitelist::GetInstance().LoadConfigFile(name), HcclResult::HCCL_E_INTERNAL);
 
     name = "whitelist.json";
     GenWhiteListFile();
-    Whitelist::GetInstance().LoadConfigFile(name);
+    EXPECT_EQ(Whitelist::GetInstance().LoadConfigFile(name), HcclResult::HCCL_SUCCESS);
 
     IpAddress ipAddress("1.0.0.0");
     std::vector<IpAddress> whiteList;
@@ -397,19 +397,6 @@ TEST(ST_AdapterHccpTest, st_HrtRaUbPostNops_exception)
     EXPECT_THROW(HrtRaUbPostNops(0, 0, 1), NetworkApiException);
 }
 
-TEST(AdapterHccpTest, RaUbUpdateCi_ok)
-{
-    JettyHandle jettyHandle = 0;
-    RaUbUpdateCi(jettyHandle, 100);
-}
-
-TEST(AdapterHccpTest, RaUbUpdateCi_exception)
-{
-    JettyHandle jettyHandle = 0;
-    MOCKER(RaCtxUpdateCi).stubs().will(returnValue(1));
-    EXPECT_THROW(RaUbUpdateCi(jettyHandle, 100), NetworkApiException);
-}
-
 TEST(AdapterHccpTest, HrtRaSocketWhiteListAdd_nok)
 {
     // Given
@@ -514,7 +501,7 @@ TEST(LocalNotifyTest, ipc_local_notify_test)
     MOCKER(HrtGetNotifyID).stubs().will(returnValue(fakeNotifyId));
     MOCKER(HrtNotifyGetAddr).stubs().with(mockcpp::any()).will(returnValue(fakeAddress));
     MOCKER(HrtNotifyGetOffset).stubs().will(returnValue(fakeOffset));
-    MOCKER(HrtDeviceGetBareTgid).stubs().will(returnValue(fakePid));
+    MOCKER(HrtDeviceGetBareTgid).stubs().will(returnValue(static_cast<s32>(fakePid)));
 };
 
 TEST(LocalRmaBufferTest, localubrmabuffer_construct_error)
@@ -1368,7 +1355,7 @@ TEST(LocalRmaBufferTest, getExchangeDto_ipc_test)
     localIpcRmaBuffer.GetExchangeDto();
 
     u32 pid = 1;
-    MOCKER(HrtDeviceGetBareTgid).stubs().will(returnValue(pid));
+    MOCKER(HrtDeviceGetBareTgid).stubs().will(returnValue(static_cast<s32>(pid)));
     localIpcRmaBuffer.Grant(pid);
 };
 

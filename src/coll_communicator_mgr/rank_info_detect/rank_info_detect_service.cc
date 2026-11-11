@@ -20,7 +20,7 @@
 #include "preempt_port_manager_v2.h"
 #include "host_socket_handle_manager.h"
 #include "adapter_error_manager_pub.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 
 namespace Hccl {
 
@@ -29,19 +29,20 @@ const u32 SOCKET_ACCEPT_TIMEOUT = 60; // Server调用Accept等待的最大超时
 const u32 SOCKET_PRINT_COUNT = 3;     // 未建链打印的数量
 const u32 MAX_AGENT_BUF_SIZE = 256;
 
-void RankInfoDetectService::Setup()
+HcclResult RankInfoDetectService::Setup()
 {
     // 1. 连接所有rank
-    GetConnections();
+    CHK_RET(GetConnections());
 
     // 2. 接收所有rank发来的localRankTable并整合为全局RankTable
-    GetRankTable();
+    CHK_RET(GetRankTable());
 
     // 3. 将完整RankTable广播给所有rank
-    BroadcastRankTable();
+    CHK_RET(BroadcastRankTable());
+    return HCCL_SUCCESS;
 }
 
-void RankInfoDetectService::GetConnections()
+HcclResult RankInfoDetectService::GetConnections()
 {
     HCCL_INFO("[RankInfoDetectService::%s] start.", __func__);
 
@@ -59,10 +60,9 @@ void RankInfoDetectService::GetConnections()
     // 获取server端socket信息
     u32 hostPort = serverSocket_->GetListenPort();
     auto hccpHostSocketHandle = HostSocketHandleManager::GetInstance().Get(devPhyId_, hostIp_);
-    CHK_PRT_THROW(
+    CHK_PRT_RET(
         hccpHostSocketHandle == nullptr,
-        HCCL_ERROR("[RankInfoDetectService::%s] Get hccpHostSocketHandle fail.", __func__), InternalException,
-        "get socket handle error");
+        HCCL_ERROR("[RankInfoDetectService::%s] Get hccpHostSocketHandle fail.", __func__), HCCL_E_INTERNAL);
     std::string connSocketTag = RANK_INFO_DETECT_TAG + "_" + identifier_ + "_" + std::to_string(hostPort);
     SocketStatus status = SocketStatus::INVALID;
 
@@ -73,9 +73,9 @@ void RankInfoDetectService::GetConnections()
             RPT_INPUT_ERR(
                 true, "EI0015", std::vector<std::string>({"error_reason"}),
                 std::vector<std::string>({StringFormat(
-                    "Receiving message from the root node timed out. "
-                    "Timeout was set to %lld seconds. expected %u nodes, received %u nodes. "
-                    "Check whether worker nodes are reachable and report errors.",
+                    "Waiting for worker node connections timed out. "
+                    "Timeout was set to %lld seconds. Expected %u nodes, received %u nodes. "
+                    "Check whether worker nodes are reachable and report errors",
                     static_cast<long long>(timeout.count()), expectedSocketNum + previousRankNum, previousRankNum)}));
             HCCL_ERROR(
                 "[%s][%s] errNo[0x%016llx] topo exchange server get socket timeout[%lld s], "
@@ -91,7 +91,9 @@ void RankInfoDetectService::GetConnections()
         auto topoExResTime = timeout - topoExUsedTime;
         u32 topoExRes_i = std::chrono::duration_cast<std::chrono::seconds>(topoExResTime).count();
         if (topoExRes_i == 0) {
-            HCCL_ERROR("[RankInfoDetectService::%s] timeout[%lld s] is exhausted", __func__, timeout);
+            HCCL_ERROR(
+                "[RankInfoDetectService::%s] timeout[%lld s] is exhausted", __func__,
+                static_cast<long long>(timeout.count()));
             break;
         }
         bool whiteListDisable = EnvConfig::GetInstance().GetHostNicConfig().GetWhitelistDisable();
@@ -107,6 +109,14 @@ void RankInfoDetectService::GetConnections()
             HCCL_ERROR("[RankInfoDetectService::%s] server get socket fail", __func__);
         });
         if (status == SocketStatus::OK) {
+            // 白名单校验：非白名单连接直接丢弃并继续等待其它连接
+            if (!IsRemoteIpInWhiteList(connSocket->GetRemoteIp())) {
+                HCCL_WARNING(
+                    "[RankInfoDetectService::%s] remoteIp[%s] is not in white list, discard the connection.", __func__,
+                    connSocket->GetRemoteIp().GetIpStr().c_str());
+                connSocket->Close();
+                continue;
+            }
             if (!RecvAndVerifyRemoteAgentIdAndRankSize(connSocket, expectedSocketNum, previousRankNum)) {
                 break;
             }
@@ -132,9 +142,9 @@ void RankInfoDetectService::GetConnections()
     }
 
     // 如果没有连接成功的rank则退出
-    CHK_PRT_THROW(
+    CHK_PRT_RET(
         connSockets_.size() == 0, HCCL_ERROR("[RankInfoDetectService::%s] no rank connection success.", __func__),
-        InternalException, "no rank connection success");
+        HCCL_E_INTERNAL);
 
     // 处理异常流程
     if (expectedSocketNum > 0) {
@@ -145,9 +155,10 @@ void RankInfoDetectService::GetConnections()
     } else {
         HCCL_INFO("[RankInfoDetectService::%s] end, all agentId get connection socket success.", __func__);
     }
+    return HCCL_SUCCESS;
 }
 
-void RankInfoDetectService::GetRankTable()
+HcclResult RankInfoDetectService::GetRankTable()
 {
     HCCL_INFO("[RankInfoDetectService::%s] start.", __func__);
 
@@ -156,8 +167,8 @@ void RankInfoDetectService::GetRankTable()
     for (auto& iter : connSockets_) {
         vector<char> rankInfoMsg{};
         SocketAgent socketAgent(iter.second.get());
-        RecvRankInfoMsg(socketAgent, rankInfoMsg);
-        ParseRankTable(rankInfoMsg);
+        CHK_RET(RecvRankInfoMsg(socketAgent, rankInfoMsg));
+        CHK_RET(ParseRankTable(rankInfoMsg));
     }
 
     // 按照rankid排序
@@ -167,17 +178,19 @@ void RankInfoDetectService::GetRankTable()
     currentStep_++;
 
     HCCL_INFO("[RankInfoDetectService::%s] end.", __func__);
+    return HCCL_SUCCESS;
 }
 
-void RankInfoDetectService::BroadcastRankTable()
+HcclResult RankInfoDetectService::BroadcastRankTable()
 {
     HCCL_INFO("[RankInfoDetectService::%s] start.", __func__);
 
     // 广播全局ranktable
     std::shared_ptr<RankInfoDispatcher> dispatcher = std::make_shared<RankInfoDispatcher>(this);
-    dispatcher->BroadcastRankTable(connSockets_, rankTable_, failedAgentIdList_, currentStep_);
+    CHK_RET(dispatcher->BroadcastRankTable(connSockets_, rankTable_, failedAgentIdList_, currentStep_));
 
     HCCL_INFO("[RankInfoDetectService::%s] end.", __func__);
+    return HCCL_SUCCESS;
 }
 
 void RankInfoDetectService::Disconnect()
@@ -223,27 +236,29 @@ bool RankInfoDetectService::RecvRemoteRankSize(SocketAgent& connSocketAgent, u32
 }
 
 // 接收客户端发送的字节流形式的rankinfo消息
-void RankInfoDetectService::RecvRankInfoMsg(SocketAgent& connSocketAgent, vector<char>& rankInfoMsg)
+HcclResult RankInfoDetectService::RecvRankInfoMsg(SocketAgent& connSocketAgent, vector<char>& rankInfoMsg) const
 {
     HCCL_INFO("[RankInfoDetectService::%s] start.", __func__);
 
     u64 revMsgLen = 0;
     std::unique_ptr<HostBuffer> msg = std::make_unique<HostBuffer>(MAX_BUFFER_LEN);
     char* msgAddr = reinterpret_cast<char*>(msg->GetAddr());
-    CHK_PRT_THROW(
-        !connSocketAgent.RecvMsg(msgAddr, revMsgLen),
-        HCCL_ERROR("[RankInfoDetectService::%s] RecvMsg fail, revMsgLen[%llu]", __func__, revMsgLen),
-        InvalidParamsException, "RecvMsg fail");
+    bool recvOk = false;
+    TRY_CATCH_RETURN(recvOk = connSocketAgent.RecvMsg(msgAddr, revMsgLen););
+    CHK_PRT_RET(
+        !recvOk, HCCL_ERROR("[RankInfoDetectService::%s] RecvMsg fail, revMsgLen[%llu]", __func__, revMsgLen),
+        HCCL_E_NETWORK);
 
     // 以vector<char>格式保存
     rankInfoMsg.resize(revMsgLen);
     rankInfoMsg.assign(msgAddr, msgAddr + revMsgLen);
 
     HCCL_INFO("[RankInfoDetectService::%s] end.", __func__);
+    return HCCL_SUCCESS;
 }
 
 // 解析接收到的rank table信息
-void RankInfoDetectService::ParseRankTable(vector<char>& rankInfoMsg)
+HcclResult RankInfoDetectService::ParseRankTable(vector<char>& rankInfoMsg)
 {
     HCCL_INFO("[RankInfoDetectService::%s] start.", __func__);
 
@@ -251,25 +266,30 @@ void RankInfoDetectService::ParseRankTable(vector<char>& rankInfoMsg)
     BinaryStream binStream(rankInfoMsg);
 
     // 解析localRankInfo
-    RankTableInfo localRankInfo(binStream);
+    RankTableInfo localRankInfo;
+    TRY_CATCH_RETURN(localRankInfo = RankTableInfo(binStream););
     localRankInfo.Dump();
 
     // 解析step
     u32 receivedStep;
-    binStream >> receivedStep;
+    TRY_CATCH_RETURN(binStream >> receivedStep;);
 
     // 校验step是否匹配
-    CHK_PRT_THROW(
+    RPT_INPUT_ERR(
+        receivedStep != currentStep_, "EI0016", std::vector<std::string>({"value", "variable", "expect"}),
+        std::vector<std::string>({std::to_string(receivedStep), "step", std::to_string(currentStep_)}));
+    CHK_PRT_RET(
         receivedStep != currentStep_,
         HCCL_ERROR(
-            "[RankInfoDetectService::%s] Step mismatch: received %u, expected %u", __func__, receivedStep,
-            currentStep_),
-        InvalidParamsException, "Step mismatch");
+            "[%s][%s] errNo[0x%016llx] Step mismatch: received %u, expected %u", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), receivedStep, currentStep_),
+        HCCL_E_PARA);
 
     // 添加到rankTable_
-    rankTable_.UpdateRankTable(localRankInfo);
+    CHK_RET(rankTable_.UpdateRankTable(localRankInfo));
 
     HCCL_INFO("[RankInfoDetectService::%s] end.", __func__);
+    return HCCL_SUCCESS;
 }
 
 bool RankIdCompare(const NewRankInfo& i, const NewRankInfo& j) { return (i.rankId < j.rankId); }
@@ -306,6 +326,26 @@ void RankInfoDetectService::FailedConnectionAgentIdString(u32 rankSize)
     }
 
     HCCL_INFO("[RankInfoDetectService::%s] end.", __func__);
+}
+
+// 白名单开启时校验远端IP是否在拓扑探测白名单内：仅校验remoteIp(tag 由驱动层白名单校验)
+bool RankInfoDetectService::IsRemoteIpInWhiteList(const IpAddress& remoteIp) const
+{
+    bool whiteListDisable = EnvConfig::GetInstance().GetHostNicConfig().GetWhitelistDisable();
+    if (whiteListDisable) {
+        HCCL_DEBUG("[RankInfoDetectService::%s] whitelist is disabled, skip remote ip check.", __func__);
+        return true;
+    }
+
+    for (const auto& wlistEntry : wlistInfo_) {
+        if (remoteIp == wlistEntry.remoteIp) {
+            HCCL_DEBUG(
+                "[RankInfoDetectService::%s] remoteIp[%s] is in white list.", __func__, remoteIp.GetIpStr().c_str());
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // 校验相关方法

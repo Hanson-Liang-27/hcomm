@@ -17,10 +17,6 @@
 #include <string>
 #include "log.h"
 
-void RegisterTaskExpDevMem(const std::string& commId, void* taskExpDevMem);
-void* FindTaskExpDevMem(const std::string& commId);
-void EraseTaskExpDevMem(const std::string& commId);
-void ClearTaskExpDevMem();
 extern "C" {
 __attribute__((visibility("default"))) uint32_t HcclKernelEntrance(void* args);
 

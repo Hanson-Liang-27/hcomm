@@ -23,10 +23,12 @@
 
 namespace Hccl {
 
-std::string GetJsonProperty(const nlohmann::json& obj, const char* propName, bool required = true);
-u32 GetJsonPropertyUInt(const nlohmann::json& obj, const char* propName, bool required = true, u32 defaultValue = 0);
-s32 GetJsonPropertySInt(const nlohmann::json& obj, const char* propName, bool required = true, s32 defaultValue = 0);
-void GetJsonPropertyList(const nlohmann::json& obj, const char* propName, nlohmann::json& listObj);
+HcclResult GetJsonProperty(const nlohmann::json& obj, const char* propName, bool required, std::string& value);
+HcclResult
+GetJsonPropertyUInt(const nlohmann::json& obj, const char* propName, bool required, u32 defaultValue, u32& value);
+HcclResult
+GetJsonPropertySInt(const nlohmann::json& obj, const char* propName, bool required, s32 defaultValue, s32& value);
+HcclResult GetJsonPropertyList(const nlohmann::json& obj, const char* propName, nlohmann::json& listObj);
 
 class JsonParser {
 public:
@@ -36,14 +38,16 @@ public:
     void ParseFile(const std::string& filePath, T& info) const;
     template <typename T>
     void GetString(const T& info, std::string& infoStr) const;
-    void ParseFileToJson(const std::string& filePath, nlohmann::json& parseInformation) const;
+    HcclResult ParseFileToJson(const std::string& filePath, nlohmann::json& parseInformation) const;
 
 private:
     void ReportRanktableFileError(
         const std::string& filePath, const std::string& errorReason, HcclResult errorCode,
         const std::string& plogReason = "") const;
+    void ReportFileParseError(const std::string& filePath) const;
+    // An empty path means the JSON input is a string rather than a file.
     template <typename T>
-    void ParseInformation(nlohmann::json& parseInformation, T& information) const;
+    void ParseInformation(nlohmann::json& parseInformation, T& information, const std::string& path = "") const;
 };
 
 template <typename T>
@@ -90,12 +94,7 @@ void JsonParser::ParseFile(const std::string& filePath, T& info) const
     }
 
     nlohmann::json json;
-    try {
-        ParseInformation(json, infoFile);
-    } catch (const InvalidParamsException&) {
-        ReportRanktableFileError(filePath, "The JSON format is incorrect.", HcclResult::HCCL_E_PARA);
-        throw;
-    }
+    ParseInformation(json, infoFile, filePath);
     infoFile.close();
 
     try {
@@ -115,12 +114,13 @@ void JsonParser::GetString(const T& info, std::string& infoStr) const
 }
 
 template <typename T>
-void JsonParser::ParseInformation(nlohmann::json& parseInformation, T& information) const
+void JsonParser::ParseInformation(nlohmann::json& parseInformation, T& information, const std::string& path) const
 {
     try {
         parseInformation = nlohmann::json::parse(information);
     } catch (const nlohmann::json::parse_error& e) {
         HCCL_ERROR("JSON parse error: %s at byte %d", e.what(), e.byte);
+        ReportFileParseError(path);
         THROW<InvalidParamsException>(StringFormat(
             "[Parse][Information] errNo[0x%016llx] load allocated resource to "
             "json fail. JSON parse error: %s at byte %d"
@@ -128,11 +128,13 @@ void JsonParser::ParseInformation(nlohmann::json& parseInformation, T& informati
             HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), e.what(), e.byte));
     } catch (const nlohmann::json::exception& e) {
         HCCL_ERROR("JSON parse error: %s", e.what());
+        ReportFileParseError(path);
         THROW<InvalidParamsException>(StringFormat(
             "[Parse][Information] errNo[0x%016llx] load allocated resource to json fail. JSON parse error: %s"
             "please check json input!",
             HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), e.what()));
     } catch (...) {
+        ReportFileParseError(path);
         THROW<InvalidParamsException>(StringFormat(
             "[Parse][Information] errNo[0x%016llx] load allocated resource to json fail. "
             "please check json input!",

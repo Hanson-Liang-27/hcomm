@@ -13,14 +13,25 @@
 # 功能：
 #   a. 解析集群YAML文件，在输出目录下创建所有超节点组网目录
 #   b. 支持两种集群配置格式：
-#      - 新格式(扁平)：集群YAML直接包含server_list，每个server通过super_pod_id归属超节点
+#      - 新格式(扁平)：集群YAML直接包含server_list，每个server通过super_pod_id归属超节点；
+#        super_pod_id_range支持闭区间[start, end]或id列表展开，与id/id_range组合为笛卡尔积
+#        (每个超节点各自分配一份完整的server id列表，如 super_pod_id_range: [0, 15] +
+#        id_range: [0, 127] 表示16个超节点、每超节点128个server，共2048个server)
 #      - 旧格式(三层)：集群YAML通过super_node_list引用超节点YAML，超节点YAML中定义server_list
 #   c. 支持两种方式获取server拓扑文件：
-#      - 如果server_topo是yaml文件，调用generate_topo_rootinfo.sh生成topo.json和rootinfo.json
-#      - 如果server_topo是目录名，从topo_bank/server_topo_bank目录拷贝
+#      - 如果server_topo是yaml文件，调用generate_server_topo.sh生成topo.json和rootinfo.json
+#        (POD形态即yaml中board_num>1时，topo.json为POD级单份放在server目录下
+#        (local_id为POD全局id = board_id*每board卡数 + board内物理id)，
+#        并在server目录下生成board{b}/子目录，每board一份hccl_rootinfo.json)
+#      - 如果server_topo是目录名，从topo_bank/server_topo_bank目录拷贝(递归拷贝，含board子目录)
 #   d. 支持id_range扩展：集群配置中super_node_list的id_range，server_list的id_range
-#   e. 调用allocate_eid.sh脚本，统一分配server和device ports的IP地址/EID
-#   f. 生成servers_info.json文件，记录所有server的host IP和soc_version信息
+#   e. 调用allocate_eid.sh脚本，统一分配叶子节点host和device ports的IP地址/EID
+#      (IP按集群规模动态分配: 默认模式S<=255且N<=255时AA=sp+1/BB=srv+1;
+#       超出时按动态模式计算AA.BB联合位宽, 详见设计文档IPV4_address_dynamic_allocation_design.md;
+#       POD形态下CC段为board_id、DD段为board内endPoint计数, host IP为AA.BB.{board_id}.0)
+#   f. 生成servers_info.json文件，记录所有叶子节点的host IP和soc_version信息
+#      (每叶子节点一条: server形态=每server一条; POD形态=每board一条;
+#       并写入显式super_pod_id/server_id/board_id, 供C++解析器按id匹配而非按位置序匹配)
 
 set -e
 
@@ -30,29 +41,78 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# 脚本日志级别定义与C++日志一致: 0-trace 1-debug 2-info 3-warn 4-error 5-critical 6-off
+# 级别来源优先级: 环境变量SCRIPT_LOG_LEVEL > config/log_config.yaml中script段console_level > 默认info(2)
 error_exit() {
-    echo -e "${RED}[错误] $1${NC}" >&2
+    if [[ "$SCRIPT_LOG_LEVEL" -le 4 ]]; then
+        echo -e "${RED}[错误] $1${NC}" >&2
+    fi
     exit 1
 }
 
 success_msg() {
-    echo -e "${GREEN}[成功] $1${NC}"
+    if [[ "$SCRIPT_LOG_LEVEL" -le 2 ]]; then
+        echo -e "${GREEN}[成功] $1${NC}"
+    fi
 }
 
 info_msg() {
-    echo -e "${BLUE}[信息] $1${NC}"
+    if [[ "$SCRIPT_LOG_LEVEL" -le 2 ]]; then
+        echo -e "${BLUE}[信息] $1${NC}"
+    fi
 }
 
 warn_msg() {
-    echo -e "${YELLOW}[警告] $1${NC}"
+    if [[ "$SCRIPT_LOG_LEVEL" -le 3 ]]; then
+        echo -e "${YELLOW}[警告] $1${NC}"
+    fi
+}
+
+debug_msg() {
+    if [[ "$SCRIPT_LOG_LEVEL" -le 1 ]]; then
+        echo -e "$1"
+    fi
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(dirname "${SCRIPT_DIR}")"
 
-CLUSTER_CONFIG_DIR="${BASE_DIR}/config/cluster"
-SUPERPOD_CONFIG_DIR="${BASE_DIR}/config/super_pod"
-SERVER_CONFIG_DIR="${BASE_DIR}/config/server_or_pod"
+# 从config/log_config.yaml的script段读取console_level作为脚本日志级别;
+# 环境变量SCRIPT_LOG_LEVEL已设置合法值时优先使用(支持父脚本/用户注入), 配置缺失时默认info(2)
+load_log_level() {
+    if [[ "${SCRIPT_LOG_LEVEL:-}" =~ ^[0-6]$ ]]; then
+        return
+    fi
+    local lvl=""
+    local cfg="${BASE_DIR}/config/log_config.yaml"
+    if [[ -f "$cfg" ]]; then
+        lvl=$(awk '/^script:[[:space:]]*(#.*)?$/ {in_script=1; next}
+                   in_script && /^[^[:space:]#]/ {exit}
+                   in_script && /^[[:space:]]*console_level:/ {
+                       sub(/.*console_level:[[:space:]]*/, "")
+                       sub(/[[:space:]]*#.*$/, "")
+                       gsub(/[[:space:]]/, "")
+                       print; exit}' "$cfg")
+    fi
+    if [[ "$lvl" =~ ^[0-6]$ ]]; then
+        SCRIPT_LOG_LEVEL="$lvl"
+    else
+        SCRIPT_LOG_LEVEL=2
+    fi
+}
+load_log_level
+export SCRIPT_LOG_LEVEL
+
+# 拓扑配置目录: 优先使用asset/cluster_model布局(本仓库实际路径), 兼容旧config布局
+if [[ -d "${SCRIPT_DIR}/cluster_model/config/cluster" ]]; then
+    CLUSTER_CONFIG_DIR="${SCRIPT_DIR}/cluster_model/config/cluster"
+    SUPERPOD_CONFIG_DIR="${SCRIPT_DIR}/cluster_model/config/super_pod"
+    SERVER_CONFIG_DIR="${SCRIPT_DIR}/cluster_model/config/server_or_pod"
+else
+    CLUSTER_CONFIG_DIR="${BASE_DIR}/config/cluster"
+    SUPERPOD_CONFIG_DIR="${BASE_DIR}/config/super_pod"
+    SERVER_CONFIG_DIR="${BASE_DIR}/config/server_or_pod"
+fi
 SERVER_TOPO_BANK_DIR="${BASE_DIR}/topo_bank/server_topo_bank"
 GENERATE_TOPO_SCRIPT="${SCRIPT_DIR}/generate_server_topo.sh"
 ALLOCATE_EID_SCRIPT="${SCRIPT_DIR}/allocate_eid.sh"
@@ -95,7 +155,9 @@ show_usage() {
 
 说明:
     1. 解析集群YAML文件，自动检测配置格式（新格式/旧格式）
-    2. 新格式：server_list直接在集群YAML中，通过super_pod_id归属超节点
+    2. 新格式：server_list直接在集群YAML中，通过super_pod_id归属超节点；
+       super_pod_id_range支持闭区间[start, end]或id列表展开，与id/id_range组合为
+       笛卡尔积(每个超节点各自分配一份完整的server id列表)
     3. 旧格式：通过super_node_list引用超节点YAML，超节点YAML中定义server_list
     4. 在输出目录下为每个超节点创建目录
     5. 在超节点目录下为每个server创建目录
@@ -136,20 +198,23 @@ if [[ -z "$OUTPUT_DIR" ]]; then
     OUTPUT_DIR="${DEFAULT_OUTPUT_DIR}"
 fi
 
-echo "=========================================="
-echo "  昇腾集群组网拓扑生成工具"
-echo "=========================================="
-echo ""
-echo "集群配置文件: $CLUSTER_YAML_PATH"
-echo "输出根目录: $OUTPUT_DIR"
-echo ""
+if [[ "$SCRIPT_LOG_LEVEL" -le 2 ]]; then
+    debug_msg "=========================================="
+    debug_msg "  昇腾集群组网拓扑生成工具"
+    debug_msg "=========================================="
+    debug_msg ""
+    debug_msg "集群配置文件: $CLUSTER_YAML_PATH"
+    debug_msg "输出根目录: $OUTPUT_DIR"
+    debug_msg ""
+fi
 
 CLUSTER_BASENAME=$(basename "$CLUSTER_YAML_PATH" .yaml)
 
 OUTPUT_DIR="${OUTPUT_DIR}/${CLUSTER_BASENAME}"
 
-echo "集群输出目录: $OUTPUT_DIR"
-echo ""
+if [[ "$SCRIPT_LOG_LEVEL" -le 2 ]]; then
+    echo "集群输出目录: $OUTPUT_DIR"
+fi
 
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
@@ -172,10 +237,33 @@ import subprocess
 import sys
 import socket
 
+# 脚本日志级别(与C++日志一致: 0-trace 1-debug 2-info 3-warn 4-error 5-critical 6-off):
+# bash侧从config/log_config.yaml的script段读取console_level后经SCRIPT_LOG_LEVEL环境变量传入
+try:
+    LOG_LEVEL = max(0, min(6, int(os.environ.get('SCRIPT_LOG_LEVEL', '2'))))
+except ValueError:
+    LOG_LEVEL = 2
+
+def log_error(msg):
+    if LOG_LEVEL <= 4:
+        print(msg)
+
+def log_warn(msg):
+    if LOG_LEVEL <= 3:
+        print(msg)
+
+def log_info(msg):
+    if LOG_LEVEL <= 2:
+        print(msg)
+
+def log_debug(msg):
+    if LOG_LEVEL <= 1:
+        print(msg)
+
 try:
     import yaml
 except ImportError:
-    print("[错误] 需要PyYAML库，请安装: pip install pyyaml")
+    log_error("[错误] 需要PyYAML库，请安装: pip install pyyaml")
     sys.exit(1)
 
 CLUSTER_YAML_PATH = os.environ.get('CLUSTER_YAML_PATH', '')
@@ -188,17 +276,22 @@ ALLOCATE_EID_SCRIPT = os.environ.get('ALLOCATE_EID_SCRIPT', '')
 
 URMA_EID_LEN = 16
 
-def ip_to_eid_string(ip, family=socket.AF_INET):
-    if family == socket.AF_INET:
-        ip_bytes = socket.inet_pton(socket.AF_INET, ip)
-        eid = bytearray(URMA_EID_LEN)
-        eid[12:16] = ip_bytes
-    elif family == socket.AF_INET6:
-        ip_bytes = socket.inet_pton(socket.AF_INET6, ip)
-        eid = bytearray(URMA_EID_LEN)
-        eid[0:16] = ip_bytes
-    else:
-        raise ValueError(f"不支持的地址族: {family}")
+# PG端口(portgroup端口)的固定端口号
+EID_PG_PORT_NUM = 0x3F
+
+def build_eid_string(ip, superpod_id=0, die_id=0, port_num=0):
+    """按EID地址分配规则构造128bit EID字符串 (与allocate_eid.sh保持一致):
+      127~92: 保留位, 固定全0
+      91~88:  super pod id[8:5] (super pod id的第8~5位, 低5位由IPV4的superpod段承载)
+      87~86:  die id
+      85~80:  端口号 (普通物理端口0-62; PG端口固定0x3F)
+      79~32:  保留位, 固定全0
+      31~0:   IPV4地址 (AA.BB.CC.DD)"""
+    ip_bytes = socket.inet_pton(socket.AF_INET, ip)
+    eid = bytearray(URMA_EID_LEN)
+    eid[4] = (superpod_id >> 5) & 0xF                      # 91~88: super pod id[8:5]
+    eid[5] = ((die_id & 0x3) << 6) | (port_num & 0x3F)     # 87~86: die id; 85~80: 端口号
+    eid[12:16] = ip_bytes                                  # 31~0: IPV4地址
     hex_str = ''.join(f'{b:02x}' for b in eid)
     return f'0x{hex_str}'
 
@@ -217,6 +310,29 @@ def expand_id_range(entry):
         elif isinstance(rng, list):
             ids.extend([int(x) for x in rng])
     return ids
+
+def expand_super_pod_ids(entry):
+    """展开server_list条目的超节点归属, 返回超节点id列表。
+    支持的字段(与expand_id_range的id/id_range约定一致):
+      - super_pod_id_range: 闭区间[start, end]或超节点id列表, 与条目内id/id_range
+        组合为笛卡尔积——每个超节点各自分配一份完整的server id列表
+      - super_pod_id: 单个超节点id(或id列表)
+    未指定时默认归属超节点0(兼容旧配置);
+    同时指定super_pod_id_range与super_pod_id时, 以super_pod_id_range为准
+    """
+    if 'super_pod_id_range' in entry:
+        rng = entry['super_pod_id_range']
+        if isinstance(rng, list):
+            if len(rng) == 2:
+                return list(range(int(rng[0]), int(rng[1]) + 1))
+            return [int(x) for x in rng]
+        return [int(rng)]
+    if 'super_pod_id' in entry:
+        raw = entry['super_pod_id']
+        if isinstance(raw, list):
+            return [int(x) for x in raw]
+        return [int(raw)]
+    return [0]
 
 def find_superpod_yaml(topo_name):
     if not topo_name:
@@ -255,24 +371,80 @@ def generate_server_topo(yaml_path, output_dir):
     cmd = ['bash', GENERATE_TOPO_SCRIPT, yaml_path, '-o', output_dir, '-b']
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"  [错误] 生成server拓扑失败: {result.stderr}")
+        log_error(f"  [错误] 生成server拓扑失败: {result.stderr}")
         return False
     return True
 
-def copy_server_topo_from_bank(bank_dir, output_dir):
+def list_leaf_dirs(node_dir):
+    """列出一个server目录下的所有"叶子节点"目录(即含topo/rootinfo的目录):
+      - POD形态: server目录下有 board{b}/ 子目录, 每个board为一个叶子节点(按board序号数值排序)
+      - server形态: server目录自身即叶子节点(返回[node_dir])
+    叶子节点是host IP/EID分配与servers_info.json条目的基本单位"""
+    if not os.path.isdir(node_dir):
+        return [node_dir]
+    board_dirs = []
+    for name in os.listdir(node_dir):
+        full = os.path.join(node_dir, name)
+        if os.path.isdir(full) and re.match(r'^board\d+$', name):
+            board_dirs.append((int(name[len('board'):]), full))
+    if not board_dirs:
+        return [node_dir]
+    return [d for _, d in sorted(board_dirs)]
+
+def rewrite_leaf_topo_file_path(leaf_dir):
+    """把叶子节点目录内rootinfo的topo_file_path改写为该叶子节点实际使用的topo.json路径。
+    rootinfo中的topo_file_path为生成时输出目录的绝对路径, 拷贝/复用缓存后须改写,
+    保持与逐台生成一致:
+      - server形态: 叶子节点即server目录, topo.json在本目录;
+      - POD形态: 叶子节点为board{b}/目录, topo.json为POD级单份, 位于server目录(上级目录)"""
+    topo_path = os.path.join(leaf_dir, 'topo.json')
+    if not os.path.isfile(topo_path):
+        parent_topo_path = os.path.join(os.path.dirname(os.path.abspath(leaf_dir)), 'topo.json')
+        if os.path.isfile(parent_topo_path):
+            topo_path = parent_topo_path
+    for name in os.listdir(leaf_dir):
+        if 'rootinfo' in name and name.endswith('.json'):
+            rootinfo_path = os.path.join(leaf_dir, name)
+            try:
+                with open(rootinfo_path, 'r') as f:
+                    rootinfo = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if 'topo_file_path' in rootinfo:
+                rootinfo['topo_file_path'] = topo_path
+                with open(rootinfo_path, 'w') as f:
+                    json.dump(rootinfo, f, indent=4, ensure_ascii=False)
+
+def copy_tree_with_dirs(src_dir, output_dir):
+    """递归拷贝目录内容(含子目录)。
+    注意: 不能只拷贝文件 —— POD形态下hccl_rootinfo.json位于 board{b}/ 子目录中
+    (topo.json为POD级单份, 位于server目录), 仅遍历文件会整棵丢失board目录
+    (同一server_topo复用缓存时会导致大部分server没有board)"""
     os.makedirs(output_dir, exist_ok=True)
-    copied_files = []
-    for f in os.listdir(bank_dir):
-        src = os.path.join(bank_dir, f)
-        if os.path.isfile(src):
-            shutil.copy2(src, output_dir)
-            copied_files.append(f)
+    copied = 0
+    for root, dirs, files in os.walk(src_dir):
+        rel = os.path.relpath(root, src_dir)
+        dst_root = output_dir if rel == '.' else os.path.join(output_dir, rel)
+        os.makedirs(dst_root, exist_ok=True)
+        for f in files:
+            shutil.copy2(os.path.join(root, f), os.path.join(dst_root, f))
+            copied += 1
+    return copied
+
+def copy_server_topo_from_dir(src_dir, output_dir):
+    copied_files = copy_tree_with_dirs(src_dir, output_dir)
+    # 逐叶子节点(server形态=server目录本身; POD形态=各board目录)改写topo_file_path
+    for leaf_dir in list_leaf_dirs(output_dir):
+        rewrite_leaf_topo_file_path(leaf_dir)
     return copied_files
+
+def copy_server_topo_from_bank(bank_dir, output_dir):
+    return copy_tree_with_dirs(bank_dir, output_dir)
 
 # ============================================================
 # Step A: 解析集群YAML文件，自动检测格式
 # ============================================================
-print("[信息] Step A: 解析集群配置文件...")
+log_debug("[信息] Step A: 解析集群配置文件...")
 
 with open(CLUSTER_YAML_PATH, 'r') as f:
     cluster_config = yaml.safe_load(f)
@@ -284,12 +456,12 @@ super_node_list_raw = cluster_config.get('super_node_list', [])
 
 is_new_format = bool(server_list_raw and not super_node_list_raw)
 
-print(f"  集群名称: {cluster_name}")
-print(f"  超节点数量: {super_node_num}")
-print(f"  配置格式: {'新格式(扁平)' if is_new_format else '旧格式(三层)'}")
+log_debug(f"  集群名称: {cluster_name}")
+log_debug(f"  超节点数量: {super_node_num}")
+log_debug(f"  配置格式: {'新格式(扁平)' if is_new_format else '旧格式(三层)'}")
 
 if super_node_num == 0 and not is_new_format:
-    print("[错误] 集群配置文件中未定义超节点 (super_node_num=0)")
+    log_error("[错误] 集群配置文件中未定义超节点 (super_node_num=0)")
     sys.exit(1)
 
 # ============================================================
@@ -301,32 +473,35 @@ sp_servers = {}
 if is_new_format:
     # 新格式：server_list直接在集群YAML中，通过super_pod_id归属超节点
     server_num = cluster_config.get('server_num', 0)
-    print(f"  Server数量: {server_num}")
+    log_debug(f"  Server数量: {server_num}")
 
     for entry in server_list_raw:
-        sp_id = entry.get('super_pod_id', 0)
+        # 超节点归属展开: super_pod_id_range与id/id_range组合为笛卡尔积,
+        # 每个超节点各自分配一份完整的server id列表
+        sp_ids = expand_super_pod_ids(entry)
         ids = expand_id_range(entry)
         srv_topo = entry.get('server_topo', '')
         soc_version = entry.get('soc_version', '')
-        for sid in ids:
-            if sp_id not in sp_servers:
-                sp_servers[sp_id] = []
-            sp_servers[sp_id].append({
-                'id': sid,
-                'server_topo': srv_topo,
-                'soc_version': soc_version
-            })
+        for sp_id in sp_ids:
+            for sid in ids:
+                if sp_id not in sp_servers:
+                    sp_servers[sp_id] = []
+                sp_servers[sp_id].append({
+                    'id': sid,
+                    'server_topo': srv_topo,
+                    'soc_version': soc_version
+                })
 
     actual_server_count = sum(len(v) for v in sp_servers.values())
     actual_super_node_count = len(sp_servers)
-    print(f"  展开后: {actual_super_node_count} 个超节点, {actual_server_count} 个server")
+    log_debug(f"  展开后: {actual_super_node_count} 个超节点, {actual_server_count} 个server")
 
     if server_num > 0 and actual_server_count != server_num:
-        print(f"[错误] server_num({server_num})与server_list展开后的实际server数量({actual_server_count})不一致")
+        log_error(f"[错误] server_num({server_num})与server_list展开后的实际server数量({actual_server_count})不一致")
         sys.exit(1)
 
     if super_node_num > 0 and actual_super_node_count != super_node_num:
-        print(f"[错误] super_node_num({super_node_num})与server_list中实际超节点数量({actual_super_node_count})不一致")
+        log_error(f"[错误] super_node_num({super_node_num})与server_list中实际超节点数量({actual_super_node_count})不一致")
         sys.exit(1)
 else:
     # 旧格式：通过super_node_list引用超节点YAML
@@ -337,10 +512,10 @@ else:
         for sid in ids:
             expanded_super_nodes.append({'id': sid, 'superpod_topo': topo})
 
-    print(f"  展开后超节点数: {len(expanded_super_nodes)}")
+    log_info(f"  展开后超节点数: {len(expanded_super_nodes)}")
 
     if super_node_num > 0 and len(expanded_super_nodes) != super_node_num:
-        print(f"[错误] super_node_num({super_node_num})与super_node_list展开后的实际超节点数量({len(expanded_super_nodes)})不一致")
+        log_error(f"[错误] super_node_num({super_node_num})与super_node_list展开后的实际超节点数量({len(expanded_super_nodes)})不一致")
         sys.exit(1)
 
     for sp_entry in expanded_super_nodes:
@@ -349,7 +524,7 @@ else:
 
         sp_yaml_path = find_superpod_yaml(sp_topo_name)
         if not sp_yaml_path:
-            print(f"  [错误] 超节点拓扑配置文件不存在: {sp_topo_name}")
+            log_error(f"  [错误] 超节点拓扑配置文件不存在: {sp_topo_name}")
             continue
 
         with open(sp_yaml_path, 'r') as f:
@@ -360,7 +535,7 @@ else:
         server_num = sp_config.get('server_num', 0)
         sp_server_list_raw = sp_config.get('server_list', [])
 
-        print(f"  [信息] 超节点{sp_id}: {sp_name}, 形态: {sp_form_type}, Server数量: {server_num}")
+        log_debug(f"  [信息] 超节点{sp_id}: {sp_name}, 形态: {sp_form_type}, Server数量: {server_num}")
 
         expanded_servers = []
         for srv_entry in sp_server_list_raw:
@@ -375,21 +550,30 @@ else:
                 })
 
         sp_servers[sp_id] = expanded_servers
-        print(f"  [信息] 展开后Server数: {len(expanded_servers)}")
+        log_debug(f"  [信息] 展开后Server数: {len(expanded_servers)}")
 
         if server_num > 0 and len(expanded_servers) != server_num:
-            print(f"[错误] 超节点{sp_id}的server_num({server_num})与server_list展开后的实际server数量({len(expanded_servers)})不一致")
+            log_error(f"[错误] 超节点{sp_id}的server_num({server_num})与server_list展开后的实际server数量({len(expanded_servers)})不一致")
             sys.exit(1)
 
-print("")
+log_debug("")
 
 # ============================================================
 # Step C: 创建目录结构，生成/拷贝server拓扑文件
+# 相同server_topo的server只调用一次generate_server_topo.sh生成,
+# 其余server直接拷贝首次生成结果: generate_server_topo.sh的输出与
+# server序号无关(topo/rootinfo中IP为占位值), server间EID差异由Step D
+# 的allocate_eid.sh按superpod/server(/board)路径统一重分配
+# POD形态(server_topo中board_num>1)下, generate_server_topo.sh生成POD级单份topo.json
+# (server目录, local_id为POD全局id), 并在server目录内生成 board{b}/ 子目录
+# (每board一份hccl_rootinfo.json), 拷贝时必须递归
 # ============================================================
+topo_gen_cache = {}  # server_topo名 -> 首次生成成功的server目录
+
 for sp_id in sorted(sp_servers.keys()):
     sp_dir = os.path.join(OUTPUT_DIR, f'superpod{sp_id}')
     os.makedirs(sp_dir, exist_ok=True)
-    print(f"[成功] 创建超节点目录: superpod{sp_id}")
+    log_debug(f"[成功] 创建超节点目录: superpod{sp_id}")
 
     for srv in sp_servers[sp_id]:
         srv_id = srv['id']
@@ -398,39 +582,57 @@ for sp_id in sorted(sp_servers.keys()):
 
         srv_dir = os.path.join(sp_dir, f'server{srv_id}')
 
+        if srv_topo_name in topo_gen_cache:
+            copied = copy_server_topo_from_dir(topo_gen_cache[srv_topo_name], srv_dir)
+            log_debug(f"  [成功] server{srv_id}: 复用拓扑缓存, 拷贝 {copied} 个文件 ({srv_topo_name})")
+            continue
+
         topo_type, topo_path = find_server_topo(srv_topo_name)
 
         if topo_type == 'yaml':
             if generate_server_topo(topo_path, srv_dir):
-                print(f"  [成功] server{srv_id}: 生成拓扑 ({srv_topo_name})")
+                leaf_num = len(list_leaf_dirs(srv_dir))
+                log_debug(f"  [成功] server{srv_id}: 生成拓扑 ({srv_topo_name})"
+                          + (f", {leaf_num}个board" if leaf_num > 1 else ""))
+                topo_gen_cache[srv_topo_name] = srv_dir
             else:
-                print(f"  [错误] server{srv_id}: 生成拓扑失败 ({srv_topo_name})")
+                log_error(f"  [错误] server{srv_id}: 生成拓扑失败 ({srv_topo_name})")
         elif topo_type == 'bank':
             copied = copy_server_topo_from_bank(topo_path, srv_dir)
-            print(f"  [成功] server{srv_id}: 拷贝 {len(copied)} 个文件 ({srv_topo_name})")
+            log_debug(f"  [成功] server{srv_id}: 拷贝 {copied} 个文件 ({srv_topo_name})")
         else:
-            print(f"  [错误] server{srv_id}: 找不到拓扑配置 ({srv_topo_name})")
+            log_error(f"  [错误] server{srv_id}: 找不到拓扑配置 ({srv_topo_name})")
 
-    print("")
+    log_debug("")
+
+TOTAL_LEAF_NODES = 0
+for sp_id in sorted(sp_servers.keys()):
+    for srv in sp_servers[sp_id]:
+        srv_dir = os.path.join(OUTPUT_DIR, f'superpod{sp_id}', f'server{srv["id"]}')
+        TOTAL_LEAF_NODES += len(list_leaf_dirs(srv_dir))
+log_debug(f"  [成功] 共生成/拷贝 {sum(len(v) for v in sp_servers.values())} 个server/POD拓扑目录, "
+          f"{TOTAL_LEAF_NODES} 个叶子节点(host节点)")
 
 # ============================================================
 # Step D: 调用allocate_eid.sh分配EID/IP地址
 # ============================================================
-print("[信息] Step D: 调用allocate_eid.sh分配EID/IP地址...")
+log_debug("[信息] Step D: 调用allocate_eid.sh分配EID/IP地址...")
 
 if os.path.isfile(ALLOCATE_EID_SCRIPT):
     result = subprocess.run(['bash', ALLOCATE_EID_SCRIPT, '-d', OUTPUT_DIR], capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"  [警告] EID分配失败: {result.stderr}")
+        log_warn(f"  [警告] EID分配失败: {result.stderr}")
     else:
-        print(result.stdout)
+        # allocate_eid.sh按同一日志级别过滤输出, 此处原样透传
+        if result.stdout:
+            print(result.stdout, end='')
 else:
-    print(f"  [警告] allocate_eid.sh脚本不存在: {ALLOCATE_EID_SCRIPT}")
+    log_warn(f"  [警告] allocate_eid.sh脚本不存在: {ALLOCATE_EID_SCRIPT}")
 
 # ============================================================
 # Step E: 生成servers_info.json
 # ============================================================
-print("[信息] Step E: 生成servers_info.json...")
+log_debug("[信息] Step E: 生成servers_info.json...")
 
 def extract_soc_version(filename):
     match = re.match(r'(ascend\d+)', filename)
@@ -438,45 +640,137 @@ def extract_soc_version(filename):
         return match.group(1)
     return 'unknown'
 
+# IP分配模式判断与位宽计算 (与allocate_eid.sh保持一致, 按设计文档规则:
+#   IPV4_address_dynamic_allocation_design.md 3.2/3.3节)
+#   默认模式 (S<=255且N<=255): AA = sp_id + 1, BB = srv_id + 1
+#   动态模式 (S>255或N>255):   W_bb = ceil(log2(N+1)), W_aa = 16 - W_bb,
+#     V = ((sp_id+1)<<W_bb) + (srv_id+1), AA = V>>8, BB = V&0xFF
+def compute_ip_layout(s_num, n_num):
+    """计算IP分配模式与AA.BB联合16bit位宽划分, 返回 (mode, w_aa, w_bb)"""
+    if s_num <= 255 and n_num <= 255:
+        return 'default', 8, 8
+    w_bb = max(1, n_num.bit_length())
+    w_aa = 16 - w_bb
+    if w_aa < 1 or s_num > (1 << w_aa) - 1:
+        log_error(f"[错误] 集群规模超出AA.BB段总容量: S={s_num}, N={n_num} "
+                  f"(W_aa={w_aa}), 请缩减超节点数或增加每超节点server数")
+        sys.exit(1)
+    return 'dynamic', w_aa, w_bb
+
+def compute_host_aa_bb(sp_idx, srv_idx, mode, w_bb):
+    """按分配模式计算server的host IP地址段AA/BB (host IP = AA.BB.0.0)"""
+    if mode == 'default':
+        return sp_idx + 1, srv_idx + 1
+    v = ((sp_idx + 1) << w_bb) + (srv_idx + 1)
+    return (v >> 8) & 0xFF, v & 0xFF
+
+# 集群规模: S = 超节点数(max sp_id + 1), N = 单超节点server数(取各超节点最大值)
+S_NUM = (max(sp_servers.keys()) + 1) if sp_servers else 0
+N_NUM = (max((srv['id'] for srvs in sp_servers.values() for srv in srvs), default=-1)) + 1
+IP_MODE, W_AA, W_BB = compute_ip_layout(S_NUM, N_NUM)
+log_debug(f"  [信息] IP分配模式: {IP_MODE} (S={S_NUM}, N={N_NUM}"
+          + (f", W_aa={W_AA}, W_bb={W_BB}" if IP_MODE == 'dynamic' else "") + ")")
+
+# port_type解析: 从server/pod拓扑配置yaml读取port_type字段(x2/x4, 不区分大小写,
+# 未配置默认x4, 非法值报错), 写入servers_info.json各server条目。servers_info.json
+# 为hccl-vm工具专属文件(仅C++集群解析器消费), 由解析器入库到Server.port_type,
+# 供light_performance性能仿真计算端口带宽(x2端口带宽减半); 不写入topo.json/
+# rootinfo/ranktable等hccl业务原生格式文件。bank等无yaml来源的拓扑按缺省x4处理
+port_type_cache = {}
+
+def resolve_port_type(topo_name):
+    if topo_name in port_type_cache:
+        return port_type_cache[topo_name]
+    port_type = 'x4'
+    topo_type, topo_path = find_server_topo(topo_name)
+    if topo_type == 'yaml':
+        with open(topo_path, 'r') as f:
+            srv_config = yaml.safe_load(f) or {}
+        raw = srv_config.get('port_type', None)
+        if raw is not None:
+            norm = str(raw).strip().lower()
+            if norm not in ('x2', 'x4'):
+                log_error(f"[错误] {topo_name}: port_type字段值非法: {raw} (只支持x2/x4, 不区分大小写)")
+                sys.exit(1)
+            port_type = norm
+    port_type_cache[topo_name] = port_type
+    return port_type
+
 server_ip_list = []
+
+def resolve_soc_version(srv_dir, leaf_dirs, srv_soc_version):
+    """解析叶子节点的soc_version: 优先取集群配置中声明的值;
+    未声明时从该叶子节点目录内的rootinfo文件名或topo.json回退提取。
+    POD形态下rootinfo位于 board{b}/ 子目录、topo.json为POD级单份位于server目录,
+    故rootinfo按叶子节点目录查找、topo.json优先查server目录"""
+    if srv_soc_version:
+        return srv_soc_version
+    soc_version = 'unknown'
+    for leaf_dir in leaf_dirs:
+        if not os.path.isdir(leaf_dir):
+            continue
+        for f in os.listdir(leaf_dir):
+            if 'rootinfo' in f and f.endswith('.json'):
+                soc_version = extract_soc_version(f)
+                break
+        if soc_version != 'unknown':
+            break
+    if soc_version == 'unknown':
+        topo_candidates = [os.path.join(srv_dir, 'topo.json')]
+        topo_candidates += [os.path.join(leaf_dir, 'topo.json') for leaf_dir in leaf_dirs]
+        for topo_json_path in topo_candidates:
+            if os.path.isfile(topo_json_path):
+                try:
+                    with open(topo_json_path) as tf:
+                        topo_data = json.load(tf)
+                    soc_version = topo_data.get('soc_version', 'unknown')
+                except Exception:
+                    pass
+            if soc_version != 'unknown':
+                break
+    return soc_version
 
 for sp_id in sorted(sp_servers.keys()):
     sp_idx = sp_id
     for srv in sp_servers[sp_id]:
         srv_idx = srv['id']
-        srv_soc_version = srv['soc_version']
+        srv_dir = os.path.join(OUTPUT_DIR, f'superpod{sp_id}', f'server{srv_idx}')
+        # 叶子节点: server形态=[server目录]; POD形态=[board0, board1, ...](按序号升序)
+        leaf_dirs = list_leaf_dirs(srv_dir)
+        soc_version = resolve_soc_version(srv_dir, leaf_dirs, srv['soc_version'])
+        port_type = resolve_port_type(srv['server_topo'])
 
-        if not srv_soc_version:
-            srv_dir = os.path.join(OUTPUT_DIR, f'superpod{sp_id}', f'server{srv_idx}')
-            soc_version = 'unknown'
-            if os.path.isdir(srv_dir):
-                for f in os.listdir(srv_dir):
-                    if 'rootinfo' in f and f.endswith('.json'):
-                        soc_version = extract_soc_version(f)
-                        break
-            if soc_version == 'unknown':
-                topo_json_path = os.path.join(srv_dir, 'topo.json')
-                if os.path.isfile(topo_json_path):
-                    try:
-                        with open(topo_json_path, 'r') as tf:
-                            topo_data = json.load(tf)
-                        soc_version = topo_data.get('soc_version', 'unknown')
-                    except Exception:
-                        pass
-            srv_soc_version = soc_version
+        aa, bb = compute_host_aa_bb(sp_idx, srv_idx, IP_MODE, W_BB)
 
-        aa = 192 + sp_idx
-        bb = srv_idx + 1
-        host_ip = f"{aa}.{bb}.0.0"
-        host_eid = ip_to_eid_string(host_ip)
+        for leaf_idx, leaf_dir in enumerate(leaf_dirs):
+            # board_id: POD形态为board序号(从目录名解析); server形态恒为0
+            board_id = 0
+            leaf_name = os.path.basename(leaf_dir)
+            m = re.match(r'^board(\d+)$', leaf_name)
+            if m:
+                board_id = int(m.group(1))
+            # host IP: server形态 AA.BB.0.0 (每server一个, 与既有规则逐字节一致);
+            #          POD形态   AA.BB.{board_id}.0 (每board一个独立host节点)
+            cc = board_id
+            host_ip = f"{aa}.{bb}.{cc}.0"
+            # host EID按EID地址分配规则: die id=0, 端口号=0 (host非端口, 高位字段填0)
+            host_eid = build_eid_string(host_ip, sp_idx, 0, 0)
 
-        server_ip_list.append({
-            "soc_version": srv_soc_version,
-            "addr": host_eid
-        })
+            entry = {
+                # 显式三元id: C++集群解析器按id匹配(而非按条目位置序), 避免目录字典序
+                # 遍历(server10 < server2)导致的 id/host IP 错位
+                "super_pod_id": sp_idx,
+                "server_id": srv_idx,
+                "board_id": board_id,
+                "soc_version": soc_version,
+                "addr": host_eid,
+                "port_type": port_type
+            }
+            server_ip_list.append(entry)
 
 servers_info = {
     "version": "2.0",
+    # server_count语义: 叶子节点(host节点)总数。server形态=server数; POD形态=POD数×board数
     "server_count": len(server_ip_list),
     "server_ip_list": server_ip_list
 }
@@ -485,41 +779,52 @@ output_path = os.path.join(OUTPUT_DIR, 'servers_info.json')
 with open(output_path, 'w') as f:
     json.dump(servers_info, f, indent=4, ensure_ascii=False)
 
-print(f"  [成功] 生成servers_info.json: {output_path}")
-print(f"         服务器数量: {len(server_ip_list)}")
+log_debug(f"  [成功] 生成servers_info.json: {output_path}")
+log_debug(f"         叶子节点(host节点)数量: {len(server_ip_list)}")
 for i, entry in enumerate(server_ip_list):
-    print(f"         [{i}] {entry['soc_version']}: {entry['addr']}")
+    log_debug(f"         [{i}] sp{entry['super_pod_id']}/srv{entry['server_id']}"
+              f"/board{entry['board_id']} {entry['soc_version']}: {entry['addr']}")
 
 PYTHON_SCRIPT
 
-echo ""
-echo "=========================================="
-echo "  生成完成"
-echo "=========================================="
-echo ""
-echo "输出目录: $OUTPUT_DIR"
-echo ""
-
 TOTAL_SUPERPODS=$(find "$OUTPUT_DIR" -maxdepth 1 -type d -name "superpod*" | wc -l | tr -d ' ')
 TOTAL_SERVERS=$(find "$OUTPUT_DIR" -mindepth 2 -maxdepth 2 -type d -name "server*" | wc -l | tr -d ' ')
+TOTAL_BOARDS=$(find "$OUTPUT_DIR" -mindepth 3 -maxdepth 3 -type d -name "board*" | wc -l | tr -d ' ')
 TOTAL_FILES=$(find "$OUTPUT_DIR" -type f | wc -l | tr -d ' ')
 
-echo "超节点目录数: $TOTAL_SUPERPODS"
-echo "Server目录数: $TOTAL_SERVERS"
-echo "文件总数: $TOTAL_FILES"
+debug_msg ""
+debug_msg "=========================================="
+debug_msg "  生成完成"
+debug_msg "=========================================="
+debug_msg "输出目录: ${OUTPUT_DIR}"
+debug_msg ""
+
+debug_msg "超节点目录数: ${TOTAL_SUPERPODS}"
+debug_msg "Server/POD目录数: ${TOTAL_SERVERS}"
+if [[ "${TOTAL_BOARDS}" -gt 0 ]]; then
+    debug_msg "Board目录数: ${TOTAL_BOARDS} (POD形态: 每board一个叶子节点/host节点)"
+    debug_msg "叶子节点总数: ${TOTAL_BOARDS}"
+else
+    debug_msg "叶子节点总数: ${TOTAL_SERVERS} (server形态: 每server一个叶子节点)"
+fi
+debug_msg "文件总数: ${TOTAL_FILES}"
 
 if [[ -f "${OUTPUT_DIR}/servers_info.json" ]]; then
-    echo "servers_info.json: 已生成"
+    debug_msg "servers_info.json: 已生成"
 fi
 
-echo ""
+debug_msg ""
+debug_msg "目录结构:"
 
-echo "目录结构:"
-if command -v tree &>/dev/null; then
-    tree -L 3 "$OUTPUT_DIR" 2>/dev/null || find "$OUTPUT_DIR" -type f | head -30
-else
-    find "$OUTPUT_DIR" -type f | head -30
+if [[ "$SCRIPT_LOG_LEVEL" -le 1 ]]; then
+    if command -v tree &>/dev/null; then
+        tree -L 3 "$OUTPUT_DIR" 2>/dev/null || find "$OUTPUT_DIR" -type f | head -30
+    else
+        find "$OUTPUT_DIR" -type f | head -30
+    fi
 fi
 
-echo ""
+if [[ "$SCRIPT_LOG_LEVEL" -le 2 ]]; then
+    debug_msg ""
+fi
 success_msg "集群拓扑目录生成完成！"

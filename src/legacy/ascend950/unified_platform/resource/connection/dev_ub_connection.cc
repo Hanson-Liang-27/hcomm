@@ -81,7 +81,8 @@ DevUbConnection::DevUbConnection(
         }
         isExclusiveJfc = true;
         HCCL_INFO(
-            "[DevUbConnection][Constructor] exclusive JFC created, scqDepth[%u], jfcHandle[%p].", scqDepth, jfcHandle);
+            "[DevUbConnection][Constructor] exclusive JFC created, scqDepth[%u], jfcHandle[%llu].", scqDepth,
+            static_cast<unsigned long long>(jfcHandle));
     } else if (engine_ == COMM_ENGINE_AIV) {
         CreateAivUrmaJfc();
     } else if (jfcMode == HrtUbJfcMode::USER_CTL) {
@@ -219,6 +220,14 @@ void DevUbConnection::SetSqContextInfo(SqContext& sq)
     sq.contextInfo.ubJfs.sqVa = sqBuffVa;
     sq.contextInfo.ubJfs.sqDepth = sqDepth * WQE_NUM_PER_SQE;
     sq.contextInfo.ubJfs.tpID = tpn;
+    sq.contextInfo.ubJfs.sqHead = 0;
+    sq.contextInfo.ubJfs.sqTail = 0;
+    sq.contextInfo.ubJfs.maxReadSize = maxReadSize;
+    sq.contextInfo.ubJfs.maxWriteSize = maxWriteSize;
+    sq.fence = 0;
+    sq.reserve[0] = 0;
+    sq.reserve[1] = 0;
+    sq.reserve[2] = 0;
     errno_t ret = memcpy_s(
         sq.contextInfo.ubJfs.remoteEID, sizeof(sq.contextInfo.ubJfs.remoteEID), rmtReverseEid.raw,
         sizeof(sq.contextInfo.ubJfs.remoteEID));
@@ -320,7 +329,9 @@ void DevUbConnection::AdvanceUbConnFromJettyImportWaiting()
         HCCL_ERROR(
             "[DevUbConnection][%s] JETTY_IMPORT_WAITING timeout[%us], remote jetty not published.", __func__,
             static_cast<uint32_t>(elapsedSec.count()));
-        THROW<InternalException>("[DevUbConnection][%s] wait shared remote jetty publish timeout.");
+        // 格式串含 %s 必须传 __func__：THROW 的可变参重载以精确匹配胜出，
+        // 缺参会令 StringFormat 按 ABI 读不存在的可变参（UB）
+        THROW<InternalException>("[DevUbConnection][%s] wait shared remote jetty publish timeout.", __func__);
     }
 
     // 退避：每 8 次 GetStatus 轮询才真正调 acquireRemoteCb_ 一次，减少 JettyContext 锁竞争。
@@ -429,18 +440,27 @@ std::unique_ptr<Serializable> DevUbConnection::GetExchangeDto()
     return std::unique_ptr<Serializable>(dto.release());
 }
 
-void DevUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto)
+HcclResult DevUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto)
 {
     auto dto = dynamic_cast<const ExchangeUbConnDto&>(rmtDto);
     HCCL_INFO("[DevUbConnection][%s] remoteConnDto[%s]", __func__, dto.Describe().c_str());
     if (dto.qpKeySize == 0 || dto.qpKeySize > HRT_UB_QP_KEY_MAX_LEN) {
-        THROW<InvalidParamsException>(
+        HCCL_ERROR(
             "[DevUbConnection][%s] invalid remote qpKeySize[%u], max[%u].", __func__, dto.qpKeySize,
             HRT_UB_QP_KEY_MAX_LEN);
+        status = RmaConnStatus::CONN_INVALID;
+        ubConnStatus = UbConnStatus::CONN_INVALID;
+        return HCCL_E_PARA;
     }
     remoteTokenValue = dto.tokenValue;
     remoteKeySize = dto.qpKeySize;
-    (void)memcpy_s(remoteQpKey, HRT_UB_QP_KEY_MAX_LEN, dto.qpKey, remoteKeySize);
+    errno_t ret = memcpy_s(remoteQpKey, HRT_UB_QP_KEY_MAX_LEN, dto.qpKey, remoteKeySize);
+    if (ret != EOK) {
+        HCCL_ERROR("[DevUbConnection][%s] memcpy_s failed, ret=%d", __func__, ret);
+        status = RmaConnStatus::CONN_INVALID;
+        ubConnStatus = UbConnStatus::CONN_INVALID;
+        return HCCL_E_INTERNAL;
+    }
 
     if (tpProtocol != TpProtocol::INVALID) {
         jettyImportCfg.remoteTpHandle = dto.tpHandle;
@@ -449,29 +469,33 @@ void DevUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto)
             "[DevUbConnection][%s] tpEnable, remoteTpHandle[0x%llx], remotePsn[%u].", __func__,
             jettyImportCfg.remoteTpHandle, jettyImportCfg.remotePsn);
     }
+    return HCCL_SUCCESS;
 }
 
-void DevUbConnection::ImportRmtDto()
+HcclResult DevUbConnection::ImportRmtDto()
 {
     if (ubConnStatus == UbConnStatus::READY) {
         HCCL_WARNING("[DevUbConnection][%s] import jetty already, %s.", __func__, Describe().c_str());
-        return;
+        return HCCL_SUCCESS;
     }
 
     if (ubConnStatus != UbConnStatus::JETTY_CREATED) {
         HCCL_ERROR(
             "[DevUbConnection][%s] failed, ubConnStatus[%s] is not expected.", __func__,
             ubConnStatus.Describe().c_str());
-        ThrowAbnormalStatus(std::string(__func__));
+        status = RmaConnStatus::CONN_INVALID;
+        ubConnStatus = UbConnStatus::CONN_INVALID;
+        return HCCL_E_INTERNAL;
     }
 
     if (jettyMode_ == JettyMode::EXTERNAL_INJECT) {
-        AcquireOrWaitSharedRemoteJetty();
-        return;
+        TRY_CATCH_RETURN(AcquireOrWaitSharedRemoteJetty(););
+        return HCCL_SUCCESS;
     }
 
-    ImportJetty();
+    TRY_CATCH_RETURN(ImportJetty(););
     ubConnStatus = UbConnStatus::JETTY_IMPORTING;
+    return HCCL_SUCCESS;
 }
 
 void DevUbConnection::ThrowAbnormalStatus(std::string funcName)
@@ -606,15 +630,51 @@ HcclResult DevUbConnection::SetSharedJettyFields(
 void DevUbConnection::DetachJetty()
 {
     // SELF_CREATE 模式建好 jetty 后调用：分离 jetty 所有权，析构不销毁 jetty，交由 JettyContext 管理。
-    // 注意：不置 releaseTpOnDestroy_=false——临时 connection 自己申请的 TP 引用仍需在析构时
-    // ReleaseTp 释放（TpManager 引用计数 -1），否则 useCnt 泄漏。
+    // 注意：不置 releaseTpOnDestroy_=false——TP 引用所有权经 DetachTpOwnership 单独移交；
+    // 未调 DetachTpOwnership 时（含非共享 jetty 路径），TP 引用仍随析构 ReleaseTp 释放。
     // 共享 jetty 模式下主 connection 不复用临时 connection 的 tpHandle：一对多场景各主 connection
     // 到不同对端需各自向 TpManager 申请本 pair 的 tpHandle，否则对端 import 时 peerTpHandle 路由不匹配。
-    // 临时 connection 的 tpHandle 引用随析构释放，不影响主 connection 各自申请的 tpHandle。
     jettyDetached_ = true;
     HCCL_INFO(
         "[DevUbConnection][%s] jetty ownership detached, handle[0x%llx].", __func__,
         static_cast<unsigned long long>(jettyHandle));
+}
+
+HcclResult DevUbConnection::DetachTpOwnership(TpOwnership& outOwnership)
+{
+    outOwnership = TpOwnership{};
+    if (!releaseTpOnDestroy_) {
+        // 幂等防御：已移交过（releaseTpOnDestroy_=false）的 connection 重复调用时不再产出第二个
+        // 释放回调，避免同一 TP 引用在 TpManager 侧被 useCnt 重复扣减、缓存条目被提前 erase
+        HCCL_WARNING("[DevUbConnection][%s] tp ownership already detached, skip.", __func__);
+        return HCCL_E_NOT_FOUND;
+    }
+    outOwnership.devLogicId = devLogicId;
+    outOwnership.locAddr = locAddr;
+    outOwnership.rmtAddr = rmtAddr;
+    outOwnership.tpProtocol = tpProtocol;
+    outOwnership.qos = static_cast<u32>(qos_);
+    outOwnership.tpInfo = tpInfo;
+    if (tpInfo.tpHandle == 0) {
+        // 无有效 TP 引用（建链未走到 GetTpInfo 完成或查询失败）：无需接管，
+        // 析构路径 ReleaseUbConnectionTp 对 tpHandle=0 本就跳过释放，releaseTpOnDestroy_ 保持不变。
+        return HCCL_E_NOT_FOUND;
+    }
+    releaseTpOnDestroy_ = false;
+    HCCL_INFO(
+        "[DevUbConnection][%s] tp ownership detached, tpHandle[0x%llx], devLogicId[%d], qos[%u].", __func__,
+        static_cast<unsigned long long>(tpInfo.tpHandle), devLogicId, outOwnership.qos);
+    return HCCL_SUCCESS;
+}
+
+void DevUbConnection::RestoreTpOwnershipOnDestroy()
+{
+    // DetachTpOwnership 成功后、调用方构造释放回调失败时的回滚：还原析构释放，
+    // 避免标志已翻转但回调未产出导致 TP 引用无主（useCnt 永久漏扣）
+    releaseTpOnDestroy_ = true;
+    HCCL_WARNING(
+        "[DevUbConnection][%s] tp ownership restored to release-on-destroy, tpHandle[0x%llx].", __func__,
+        static_cast<unsigned long long>(tpInfo.tpHandle));
 }
 
 HcclResult DevUbConnection::GetJettyInfo(JettyInfo& info) const
@@ -790,7 +850,14 @@ void DevUbConnection::AcquireOrWaitSharedRemoteJetty()
 
 void DevUbConnection::ReleaseTp()
 {
-    ReleaseUbConnectionTp(devLogicId, locAddr, rmtAddr, tpProtocol, tpInfo, static_cast<uint32_t>(qos_));
+    HcclResult ret
+        = ReleaseUbConnectionTp(devLogicId, locAddr, rmtAddr, tpProtocol, tpInfo, static_cast<uint32_t>(qos_));
+    if (ret != HCCL_SUCCESS) {
+        // 审计路径：释放失败（如缓存键漂移导致 NOT_FOUND）时 useCnt 不回减，TP 条目可能常驻，
+        // 记 ERROR 供定位，不阻断析构
+        HCCL_ERROR(
+            "[DevUbConnection][%s] release tp failed, ret[%d], tpHandle may leak in TpManager cache.", __func__, ret);
+    }
 }
 
 void DevUbConnection::ReleaseRemoteJettyIfImported(bool ctxValid)
@@ -1292,10 +1359,11 @@ unique_ptr<BaseTask> DevUbConnection::PrepareWriteReduceWithNotify(
 string DevUbConnection::Describe() const
 {
     return StringFormat(
-        "DevUbConnection[locAddr=%s, rmtAddr=%s, status=%s, dieId=%u, funcId=%u, jettyId=%u, sqBuffVa=%llx, "
-        "sqDepth=%u, maxReadSize=%u, maxWriteSize=%u, tpn=%u, dbAddr=0x%llx]",
-        locAddr.Describe().c_str(), rmtAddr.Describe().c_str(), status.Describe().c_str(), dieId, funcId, jettyId,
-        sqBuffVa, sqDepth, maxReadSize, maxWriteSize, tpn, dbAddr);
+        "DevUbConnection[locAddr=%s, rmtAddr=%s, status=%s, ubStage=%s, dieId=%u, funcId=%u, jettyId=%u, "
+        "sqBuffVa=%llx, sqDepth=%u, maxReadSize=%u, maxWriteSize=%u, tpn=%u, dbAddr=0x%llx]",
+        locAddr.Describe().c_str(), rmtAddr.Describe().c_str(), status.Describe().c_str(),
+        ubConnStatus.Describe().c_str(), dieId, funcId, jettyId, sqBuffVa, sqDepth, maxReadSize, maxWriteSize, tpn,
+        dbAddr);
 }
 
 HcclResult DevUbConnection::Describe(std::string& dfxMsg)
@@ -1359,52 +1427,11 @@ void DevUbConnection::AddNop(const Stream& stream)
     piVal = sqDepth;
 }
 
-HrtUbJfcMode DevUbConnection::GetUbJfcMode() const { return jfcMode; }
-
 JettyHandle& DevUbConnection::GetJettyHandle() { return jettyHandle; }
 
 JettyHandle& DevUbConnection::GetRemoteJettyHandle() { return remoteJettyHandle; }
 
 RdmaHandle& DevUbConnection::GetRdmaHandle() { return rdmaHandle; }
-
-u32 DevUbConnection::GetPiVal() const { return piVal; }
-
-u32 DevUbConnection::GetCiVal() const { return ciVal; }
-
-u32 DevUbConnection::GetSqDepth() const { return sqDepth; }
-
-void DevUbConnection::UpdateCiVal(u32 ci) { ciVal = ci; }
-
-std::vector<DevUbConnection*> GetStarsPollUbConns(const std::vector<RmaConnection*>& rmaConns)
-{
-    std::vector<DevUbConnection*> ubConns;
-    for (auto& rmaConn : rmaConns) {
-        if (rmaConn->GetRmaConnType() == RmaConnType::UB) {
-            if (dynamic_cast<DevUbConnection*>(rmaConn)->GetUbJfcMode() == HrtUbJfcMode::STARS_POLL) {
-                ubConns.emplace_back(dynamic_cast<DevUbConnection*>(rmaConn));
-            }
-        }
-    }
-    return ubConns;
-}
-
-bool IfNeedUpdatingUbCi(const std::vector<DevUbConnection*>& ubConns)
-{
-    for (auto& ubConn : ubConns) {
-        u32 pi = ubConn->GetPiVal();
-        u32 ci = ubConn->GetCiVal();
-        u32 sqDepth = ubConn->GetSqDepth();
-        // 考虑pi翻转场景
-        u32 extra = pi >= ci ? 0 : sqDepth;
-        constexpr u32 thresholdDivisor = 2;
-
-        if (static_cast<double>(pi + extra - ci)
-            >= static_cast<double>(sqDepth) / thresholdDivisor) { // 当pi和ci差距大于sqDepth/2时，更新ci
-            return true;
-        }
-    }
-    return false;
-}
 
 void DevUbConnection::SetMaxReadSize(u32 value) { maxReadSize = value; }
 

@@ -14,11 +14,12 @@
 #include "socket_mgr.h"
 #include "hcomm_adapter_runtime.h"
 #include "../channels/channel.h"
-#include "orion_adpt_utils.h"
+#include "common/orion_adpt_utils_pub.h"
 #include "host_socket_handle_manager.h"
 #include "exception_handler.h"
 #include "adapter_rts.h"
 #include "env_config/env_config_v2.h"
+#include "base_comm_node_accessors.h"
 
 namespace hcomm {
 
@@ -31,19 +32,6 @@ inline s32 EnvLinkTimeoutGet()
     g_linkTimeout
         = g_linkTimeout != 0 ? g_linkTimeout : Hccl::EnvConfig::GetInstance().GetSocketConfig().GetLinkTimeOut();
     return g_linkTimeout;
-}
-
-SocketMgr& SocketMgr::GetInstance(s32 phyId)
-{
-    static SocketMgr instances[MAX_MODULE_DEVICE_NUM]; // C++11 保证线程安全
-    if (static_cast<u32>(phyId) >= MAX_MODULE_DEVICE_NUM) {
-        HCCL_WARNING(
-            "[SocketMgr] devicePhyId >= MAX_MODULE_DEVICE_NUM, devicePhyId=%d, MAX_MODULE_DEVICE_NUM=%d", phyId,
-            MAX_MODULE_DEVICE_NUM);
-        return instances[0];
-    }
-    instances[phyId].devicePhyId_ = phyId;
-    return instances[phyId];
 }
 
 HcclResult SocketMgr::Init()
@@ -133,10 +121,10 @@ HcclResult SocketMgr::CreateSocket(const Hccl::SocketConfig& socketConfig, const
     std::string hccpSocketTag = socketConfig.GetHccpTag();
     serverListenPort_ = socketConfig.listeningPort; // serverListenPort_这个变量似乎没用
 
-    std::unique_ptr<Hccl::Socket> tmpSocket = nullptr;
+    std::shared_ptr<Hccl::Socket> tmpSocket = nullptr;
     if (socketConfig.link.GetType() == Hccl::PortDeploymentType::DEV_NET) {
         EXCEPTION_CATCH(
-            tmpSocket = std::make_unique<Hccl::Socket>(
+            tmpSocket = std::make_shared<Hccl::Socket>(
                 socketHandle, localIpAddress, socketConfig.listeningPort, remoteIpAddress, hccpSocketTag, socketRole,
                 Hccl::NicType::DEVICE_NIC_TYPE),
             return HCCL_E_PTR);
@@ -144,7 +132,7 @@ HcclResult SocketMgr::CreateSocket(const Hccl::SocketConfig& socketConfig, const
         tmpSocket->ConnectAsync();
     } else if (socketConfig.link.GetType() == Hccl::PortDeploymentType::HOST_NET) {
         EXCEPTION_CATCH(
-            tmpSocket = std::make_unique<Hccl::Socket>(
+            tmpSocket = std::make_shared<Hccl::Socket>(
                 socketHandle, localIpAddress, socketConfig.listeningPort, remoteIpAddress, hccpSocketTag, socketRole,
                 Hccl::NicType::HOST_NIC_TYPE),
             return HCCL_E_PTR);
@@ -313,6 +301,45 @@ HcclResult SocketMgr::GetHostSocket(const Hccl::SocketConfig& socketConfig, Hccl
     return HCCL_SUCCESS;
 }
 
+HcclResult SocketMgr::AcceptSocket(
+    Hccl::Socket* listener, const Hccl::SocketConfig& socketConfig, std::shared_ptr<Hccl::Socket>& outSocket,
+    u32 acceptTimeOut)
+{
+    CHK_PTR_NULL(listener);
+    std::shared_ptr<Hccl::Socket> acceptedSocket = nullptr;
+    CHK_RET(listener->Accept(socketConfig.GetHccpTag(), acceptedSocket, acceptTimeOut));
+    CHK_SMART_PTR_NULL(acceptedSocket);
+
+    Hccl::SocketConfig connConfig = socketConfig;
+    connConfig.link.SetRemoteAddr(acceptedSocket->GetRemoteIp());
+
+    std::unique_lock<std::mutex> lock(mutex_);
+    SocketEntry* entry = nullptr;
+    auto it = socketMap_.find(connConfig);
+    if (it != socketMap_.end()) {
+        HCCL_WARNING(
+            "[SocketMgr][%s] accept same peer again, reuse existing socket, tag[%s], remoteIp[%s]", __func__,
+            connConfig.GetHccpTag().c_str(), connConfig.link.GetRemoteAddr().GetIpStr().c_str());
+        entry = &it->second;
+        entry->refCount++;
+    } else {
+        SocketEntry& newEntry = socketMap_[connConfig];
+        newEntry.socket = std::move(acceptedSocket);
+        newEntry.refCount = 1;
+        entry = &newEntry;
+    }
+
+    socketInUseMap_[entry->socket.get()] = true;
+    outSocket = entry->socket;
+
+    HCCL_INFO(
+        "[SocketMgr][%s] accept socket ok, tag[%s], remoteIp[%s], localAddr[%s]", __func__,
+        connConfig.GetHccpTag().c_str(), connConfig.link.GetRemoteAddr().GetIpStr().c_str(),
+        socketConfig.link.GetLocalAddr().GetIpStr().c_str());
+
+    return HCCL_SUCCESS;
+}
+
 HcclResult SocketMgr::PutSocket(const Hccl::SocketConfig*& socketConfig, Hccl::Socket*& socket)
 {
     // 与 GetSocket/DestroySocket 保持一致的锁保护，避免无锁路径对非原子 refCount 及 socketMap_/socketInUseMap_
@@ -465,7 +492,7 @@ HcclResult SocketMgr::DestroySocket(const Hccl::SocketConfig& socketConfig)
 void SocketMgr::DeInit(u32 devPhyId)
 {
     HCCL_INFO("[SocketMgr][%s] DeInit devPhyId[%u]", __func__, devPhyId);
-    auto& inst = GetInstance(static_cast<s32>(devPhyId));
+    auto& inst = GetSocketMgr(static_cast<s32>(devPhyId));
     std::lock_guard<std::mutex> lock(inst.mutex_);
     for (auto& it : inst.socketMap_) {
         if (it.second.socket != nullptr) {

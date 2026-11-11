@@ -14,6 +14,7 @@
 #include "hcomm_primitives.h"
 #include "host_cpu_roce_channel.h"
 #include "hcclCommOp.h"
+#include "endpoint_pair/channel/dfx/channel_dfx_pub.h"
 
 using namespace hccl;
 
@@ -25,7 +26,7 @@ protected:
 
     EndpointHandle epHandle = reinterpret_cast<void*>(0x01);
     HcommChannelDesc channelDesc{};
-    hcomm::HostCpuRoceChannel channelOnHost{epHandle, channelDesc};
+    hcomm::HostCpuRoceChannel channelOnHost{epHandle, channelDesc, COMM_ENGINE_RESERVED};
     ChannelHandle channel = reinterpret_cast<ChannelHandle>(&channelOnHost);
     int32_t res{HCCL_E_RESERVED};
     std::function<HcclResult(const Hccl::TaskParam&, u64)> callback = [](const Hccl::TaskParam&, u64) -> HcclResult {

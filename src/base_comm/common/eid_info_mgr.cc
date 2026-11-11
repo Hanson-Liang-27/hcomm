@@ -11,26 +11,9 @@
 #include "eid_info_mgr.h"
 
 #include "hccl_common.h"
-#include "orion_adpt_utils.h"
+#include "common/orion_adpt_utils_pub.h"
 
 namespace hcomm {
-
-EidInfoMgr& EidInfoMgr::GetInstance(const uint32_t devicePhyId)
-{
-    static EidInfoMgr eidInfoMgr[MAX_MODULE_DEVICE_NUM + 1];
-
-    uint32_t devPhyId = devicePhyId;
-    if (devPhyId >= MAX_MODULE_DEVICE_NUM) {
-        HCCL_WARNING(
-            "[EidInfoMgr][%s] use the backup device, devPhyId[%u] should be "
-            "less than %u.",
-            __func__, devPhyId, MAX_MODULE_DEVICE_NUM);
-        devPhyId = MAX_MODULE_DEVICE_NUM; // 使用备份设备
-    }
-
-    eidInfoMgr[devPhyId].devPhyId_ = devPhyId;
-    return eidInfoMgr[devPhyId];
-}
 
 HcclResult EidInfoMgr::Init()
 {

@@ -9,20 +9,21 @@
  */
 
 #include "ccu_dev_mgr_imp.h"
+#include "ccu_device.h"
 
 #include "hccl_common.h"
 #include "eid_info_mgr.h"
+#include "base_comm_node_accessors.h"
 
 #include "ccu_comp.h"
 #include "ccu_res_specs.h"
 #include "ccu_res_batch_allocator.h"
 
 // 支持ccu新老通信域混跑临时添加
-#include "log.h"
 #include "unified_platform/ccu/ccu_device/ccu_component/ccu_component.h"
 #include "unified_platform/ccu/ccu_device/ccu_res_specs_legacy.h"
 #include "unified_platform/ccu/ccu_device/ccu_res_batch_allocator_legacy.h"
-#include "orion_adpt_utils.h"
+#include "common/orion_adpt_utils_pub.h"
 #include "exception_handler.h"
 
 /* 开源自定义算子CCU设备管理实现，当前支持新老通信域混跑，
@@ -42,6 +43,7 @@
 #include "ccu_res_desc.h"
 
 #include "dev_type.h"
+#include "common/dev_type_utils_pub.h"
 
 namespace hcomm {
 
@@ -53,9 +55,12 @@ static thread_local Hccl::HcclMainboardId mainBoardType = Hccl::HcclMainboardId:
 inline bool CheckCcuOpenSourceEnable()
 {
     // A6 不支持legacy ccu mc2，可以完全切换至开源流程
-    auto devType = DevType::DEV_TYPE_COUNT;
-    (void)hrtGetDeviceType(devType);
-    return devType == DevType::DEV_TYPE_960;
+    // 取数失败按安全默认 false 回退 legacy 流程
+    auto is960 = hcomm::EqualTo960();
+    CHK_PRT_RET(
+        !is960.has_value(),
+        HCCL_ERROR("[CheckCcuOpenSourceEnable] get device type failed, fallback to legacy ccu flow."), false);
+    return *is960;
 }
 
 CcuResult CcuInitFeature(const int32_t userDevId, std::shared_ptr<CcuDrvHandle>& ccuDrvHandle)
@@ -210,6 +215,8 @@ static CcuResult FillResReqByResDesc(CcuResReq& resReq, uint8_t dieId, const Ccu
     resReq.blockXnReq[dieId] = num;
     CCU_CHK_RET(desc.QueryResNum(ResType::GSA, num));
     resReq.blockGsaReq[dieId] = num;
+    CCU_CHK_RET(desc.QueryResNum(ResType::CASC_CNT, num));
+    resReq.cascCntReq[dieId] = num;
 
     resReq.loopEngineReq[dieId] = 0;
     resReq.msReq[dieId] = 0;
@@ -441,7 +448,7 @@ HcclResult CcuAllocChannels(
     CHK_RET(hrtGetDevicePhyIdByIndex(static_cast<uint32_t>(userDevId), devPhyId));
 
     DevEidInfo eidInfo{};
-    CHK_RET(EidInfoMgr::GetInstance(devPhyId).GetEidInfoByAddr(ccuChannelPara.commAddr, eidInfo));
+    CHK_RET(GetEidInfoMgr(devPhyId).GetEidInfoByAddr(ccuChannelPara.commAddr, eidInfo));
     const uint8_t dieId = static_cast<uint8_t>(eidInfo.dieId);
     const uint32_t feId = eidInfo.funcId;
     ChannelPara para{};
@@ -910,36 +917,115 @@ HcclResult CcuCleanDieCkes(const int32_t userDevId, const uint8_t dieId)
     return ret;
 }
 
-CcuResult CcuAllocCntXnBlock(const int32_t userDevId, const uint8_t dieId, CntXnBlock& cntXnBlock)
+CcuResult CcuAllocCntXn(const int32_t userDevId, const uint8_t dieId, const uint32_t num, ResInfo& resInfo)
 {
     if (!CheckCcuOpenSourceEnable()) {
         HCCL_WARNING("[CcuDevMgrImp][%s] is not supported for legacy interface.", __func__);
         return CcuResult::CCU_E_NOT_SUPPORT;
     }
 
-    HCCL_INFO("[%s] new alloc count xn block request: userDevId[%d], dieId[%u].", __func__, userDevId, dieId);
-    HcclResult ret = CcuComponent::GetInstance(userDevId).AllocCntXnBlock(dieId, cntXnBlock);
+    HCCL_INFO("[%s] new alloc count xn request: userDevId[%d], dieId[%u], num[%u].", __func__, userDevId, dieId, num);
+    HcclResult ret = CcuComponent::GetInstance(userDevId).AllocCntXn(dieId, num, resInfo);
+    if (ret == HcclResult::HCCL_E_NOT_SUPPORT) {
+        // cntXn 资源为 CCU_V2 专有能力, 保留不支持语义, 避免上层误判为内部错误
+        HCCL_WARNING("[%s] alloc count xn not support: userDevId[%d], dieId[%u].", __func__, userDevId, dieId);
+        return CcuResult::CCU_E_NOT_SUPPORT;
+    }
     if (ret == HcclResult::HCCL_E_UNAVAIL) {
-        // 资源不足(本 die 配置寄存器耗尽或 cntXn 不足), 保留可回退语义, 供上层区分于内部错误
-        HCCL_WARNING("[%s] alloc count xn block unavailable: userDevId[%d], dieId[%u].", __func__, userDevId, dieId);
+        // 资源不足(cntXn 私有池耗尽), 保留可回退语义, 供上层区分于内部错误
+        HCCL_WARNING(
+            "[%s] alloc count xn unavailable: userDevId[%d], dieId[%u], num[%u].", __func__, userDevId, dieId, num);
         return CcuResult::CCU_E_UNAVAIL;
     }
     if (ret != HcclResult::HCCL_SUCCESS) {
-        HCCL_ERROR("[%s] alloc count xn block failed: ret[%d].", __func__, ret);
+        HCCL_ERROR(
+            "[%s] alloc count xn failed: userDevId[%d], dieId[%u], num[%u], ret[%d].", __func__, userDevId, dieId, num,
+            ret);
         return CcuResult::CCU_E_INTERNAL;
     }
     return CcuResult::CCU_SUCCESS;
 }
 
-CcuResult CcuReleaseCntXnBlock(const int32_t userDevId, const uint8_t dieId, const CntXnBlock& cntXnBlock)
+CcuResult CcuConfirmCntXns(
+    const int32_t userDevId, const uint8_t dieId, const std::pair<uint32_t, uint32_t>& wishCntXns,
+    const uint32_t totalCntXn, const uint32_t expectedCntXn, uint32_t& blockIdx)
 {
     if (!CheckCcuOpenSourceEnable()) {
         HCCL_WARNING("[CcuDevMgrImp][%s] is not supported for legacy interface.", __func__);
         return CcuResult::CCU_E_NOT_SUPPORT;
     }
 
-    HCCL_INFO("[%s] release count xn block request: userDevId[%d], dieId[%u].", __func__, userDevId, dieId);
-    if (CcuComponent::GetInstance(userDevId).ReleaseCntXnBlock(dieId, cntXnBlock) != HcclResult::HCCL_SUCCESS) {
+    HCCL_INFO("[%s] confirm count xn request: userDevId[%d], dieId[%u].", __func__, userDevId, dieId);
+    HcclResult ret
+        = CcuComponent::GetInstance(userDevId).ConfirmCntXns(dieId, wishCntXns, totalCntXn, expectedCntXn, blockIdx);
+    if (ret == HcclResult::HCCL_E_NOT_SUPPORT) {
+        // total 比较寄存器为 CCU_V2 专有资源, 保留不支持语义, 避免上层误判为内部错误
+        HCCL_WARNING(
+            "[%s] confirm count xns not support: userDevId[%d], dieId[%u], wishCntXns[%u,%u], totalCntXn[%u], "
+            "expectedCntXn[%u].",
+            __func__, userDevId, dieId, wishCntXns.first, wishCntXns.second, totalCntXn, expectedCntXn);
+        return CcuResult::CCU_E_NOT_SUPPORT;
+    }
+    if (ret == HcclResult::HCCL_E_UNAVAIL) {
+        // total 比较寄存器耗尽, 保留可回退语义, 供上层区分于内部错误
+        HCCL_WARNING(
+            "[%s] confirm count xns unavailable: userDevId[%d], dieId[%u], wishCntXns[%u,%u], totalCntXn[%u], "
+            "expectedCntXn[%u].",
+            __func__, userDevId, dieId, wishCntXns.first, wishCntXns.second, totalCntXn, expectedCntXn);
+        return CcuResult::CCU_E_UNAVAIL;
+    }
+    if (ret != HcclResult::HCCL_SUCCESS) {
+        HCCL_ERROR(
+            "[%s] confirm count xns failed: userDevId[%d], dieId[%u], wishCntXns[%u,%u], totalCntXn[%u], "
+            "expectedCntXn[%u], ret[%d].",
+            __func__, userDevId, dieId, wishCntXns.first, wishCntXns.second, totalCntXn, expectedCntXn, ret);
+        return CcuResult::CCU_E_INTERNAL;
+    }
+    return CcuResult::CCU_SUCCESS;
+}
+
+CcuResult CcuReleaseCntXn(const int32_t userDevId, const uint8_t dieId, const ResInfo& resInfo)
+{
+    if (!CheckCcuOpenSourceEnable()) {
+        HCCL_WARNING("[CcuDevMgrImp][%s] is not supported for legacy interface.", __func__);
+        return CcuResult::CCU_E_NOT_SUPPORT;
+    }
+
+    HCCL_INFO(
+        "[%s] release count xn request: userDevId[%d], dieId[%u], startId[%u], num[%u].", __func__, userDevId, dieId,
+        resInfo.startId, resInfo.num);
+    HcclResult ret = CcuComponent::GetInstance(userDevId).ReleaseCntXn(dieId, resInfo);
+    if (ret != HcclResult::HCCL_SUCCESS) {
+        HCCL_ERROR(
+            "[%s] release count xn failed: userDevId[%d], dieId[%u], startId[%u], num[%u], ret[%d].", __func__,
+            userDevId, dieId, resInfo.startId, resInfo.num, ret);
+        return CcuResult::CCU_E_INTERNAL;
+    }
+    return CcuResult::CCU_SUCCESS;
+}
+
+CcuResult CcuResetTotalCntXn(const int32_t userDevId, const uint8_t dieId, const uint32_t blockIdx)
+{
+    if (!CheckCcuOpenSourceEnable()) {
+        HCCL_WARNING("[CcuDevMgrImp][%s] is not supported for legacy interface.", __func__);
+        return CcuResult::CCU_E_NOT_SUPPORT;
+    }
+
+    HCCL_INFO(
+        "[%s] reset total count xn request: userDevId[%d], dieId[%u], blockIdx[%u].", __func__, userDevId, dieId,
+        blockIdx);
+    HcclResult ret = CcuComponent::GetInstance(userDevId).ResetTotalCntXn(dieId, blockIdx);
+    if (ret == HcclResult::HCCL_E_NOT_SUPPORT) {
+        // total 比较寄存器为 CCU_V2 专有资源, 保留不支持语义, 避免上层误判为内部错误
+        HCCL_WARNING(
+            "[%s] reset total count xn not support: userDevId[%d], dieId[%u], blockIdx[%u].", __func__, userDevId,
+            dieId, blockIdx);
+        return CcuResult::CCU_E_NOT_SUPPORT;
+    }
+    if (ret != HcclResult::HCCL_SUCCESS) {
+        HCCL_ERROR(
+            "[%s] reset total count xn failed: userDevId[%d], dieId[%u], blockIdx[%u], ret[%d].", __func__, userDevId,
+            dieId, blockIdx, ret);
         return CcuResult::CCU_E_INTERNAL;
     }
     return CcuResult::CCU_SUCCESS;

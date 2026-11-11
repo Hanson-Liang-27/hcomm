@@ -90,15 +90,6 @@ struct RsUrmaOps gUrmaOps = {
 };
 #endif
 
-void RsUbApiDeinit(void)
-{
-    if (gUrmaApiHandle != NULL) {
-        (void)HccpDlclose(gUrmaApiHandle);
-        gUrmaApiHandle = NULL;
-    }
-    return;
-}
-
 STATIC int RsUrmaDeviceApiInit(void)
 {
 #ifndef CA_CONFIG_LLT
@@ -376,7 +367,7 @@ STATIC int RsOpenUrmaSo(void)
             goto out;
         }
         pthread_mutex_unlock(&gUrmaApiLock);
-        return -EINVAL;
+        return -ENOTSUPP;
     } else {
         hccp_run_info("urma_api dlopen again, gUrmaApiRefcnt:%d", gUrmaApiRefcnt + 1);
     }
@@ -408,14 +399,20 @@ out:
     return;
 }
 
+void RsUbApiDeinit(void)
+{
+    RsCloseUrmaSo();
+    return;
+}
+
 STATIC int RsUrmaApiInit(void)
 {
     int ret;
 
     ret = RsOpenUrmaSo();
     CHK_PRT_RETURN(ret,
-        hccp_err("HccpDlopen[liburma.so] failed! ret=[%d], "
-                 "Please check network adapter driver has been installed",
+        hccp_run_warn("HccpDlopen[liburma.so] unsuccessful! ret=[%d], "
+                      "Please check network adapter driver has been installed",
             ret),
         ret);
 
@@ -462,7 +459,7 @@ int RsUbApiInit(void)
     int ret;
 
     ret = RsUrmaApiInit();
-    CHK_PRT_RETURN(ret, hccp_err("rs_urma_api_init failed! ret=[%d]", ret), ret);
+    CHK_PRT_RETURN(ret, hccp_info_rma("rs_urma_api_init unsuccessful! ret=[%d]", ret), ret);
 
     return 0;
 }
@@ -489,7 +486,7 @@ int RsUrmaUninit(void)
     return PERF_TRACE(RDMA_OP, DlRetConvert(gUrmaOps.rsUrmaUninit()));
 }
 
-uint64_t RsUrmaGetAbiVersion()
+uint64_t RsUrmaGetAbiVersion(void)
 {
     if (gUrmaOps.rsUrmaGetAbiVersion == NULL) {
 #ifndef CA_CONFIG_LLT

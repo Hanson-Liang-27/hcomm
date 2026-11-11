@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
@@ -30,6 +30,29 @@ using namespace hccl;
 using namespace hcomm;
 
 constexpr size_t CCU_CTX_RAW_CAPACITY = 64;
+
+// 构造 CCU 任务 TaskInfo（dfxOpInfo_ 默认空；withDfxOpInfo 时带空 DfxOpInfo）
+static Hccl::TaskInfo CreateCcuTaskInfo(bool withDfxOpInfo = false)
+{
+    Hccl::ParaCcu paraCcu = {};
+    Hccl::TaskParam taskParam
+        = {.taskType = Hccl::TaskParamType::TASK_CCU,
+           .beginTime = 0,
+           .endTime = 0,
+           .isMaster = false,
+           .taskPara = {.Ccu = paraCcu},
+           .ccuDetailInfo = nullptr};
+    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    if (withDfxOpInfo) {
+        taskInfo.dfxOpInfo_ = std::make_shared<Hccl::DfxOpInfo>();
+    }
+    return taskInfo;
+}
+
+// 注：RPT_INPUT_ERR 宏依赖的 RptInputErr 为 weak 符号，其调用点在被测源码所在
+// libhccl_llt.so 内部（SHARED 链接），测试可执行文件侧的符号定义与 MOCKER 均无法
+// 覆盖（已实测），上报内容在本 UT 目标不可观测。EI0002 分支改以
+// GetGroupRankInfo 调用链路（MOCKER_CPP 拦截）+ errorInfo 断言覆盖。
 
 class CcuTaskExceptionTest : public BaseInit {
 public:
@@ -376,31 +399,108 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_Normal)
     baseInfo.status = 0x0102;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
 }
 
-TEST_F(CcuTaskExceptionTest, GetRankIdByChannelId_Normal)
+// EI0002 分支（status=0x0902）：验证 GenStatusInfo 经 GetGroupRankInfo 取组信息后正常回填 errorInfo
+TEST_F(CcuTaskExceptionTest, GenStatusInfo_EI0002_Normal)
 {
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    MOCKER_CPP(&CcuTaskException::GetGroupRankInfo).expects(once()).will(returnValue(std::string("")));
 
-    RankId rankId = CcuTaskException::GetRankIdByChannelId(101, taskInfo, 0);
+    ErrorInfoBase baseInfo = {};
+    baseInfo.dieId = 0;
+    baseInfo.missionId = 1;
+    baseInfo.currentInsId = 0;
+    baseInfo.status = 0x0902; // highPart=CCUM_EXECUTE_ERROR(0x09), lowPart=CCU_MISSION_TASK_KILLED(0x02)
 
-    // 验证输出
-    EXPECT_TRUE(true);
+    vector<CcuErrorInfo> errorInfo;
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
+
+    EXPECT_EQ(errorInfo.size(), 1u);
+    EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
 }
 
-TEST_F(CcuTaskExceptionTest, GetAddrPairByChannelId_Normal)
+// EI0002 分支（status=0x0902）comm 可用：GetGroupRankInfo 真实组装 group/hcclUdi/rankSize/rankId
+TEST_F(CcuTaskExceptionTest, GenStatusInfo_EI0002_WithComm)
+{
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo(true);
+    hccl::ManagerCallbacks callbacks;
+    callbacks.getAicpuCommState = []() {
+        return true;
+    };
+    callbacks.setAicpuCommState = [](bool) {};
+    callbacks.kernelLaunchAicpuCommInit = []() {
+        return HCCL_SUCCESS;
+    };
+    std::string commName = "TestComm";
+    hccl::CollComm collComm(nullptr, 1, commName, callbacks);
+    taskInfo.dfxOpInfo_->comm_ = &collComm;
+    std::string testCommStr = "TestComm";
+    MOCKER_CPP(&hccl::CollComm::GetCommId).stubs().will(returnValue(testCommStr));
+    MOCKER_CPP(&hccl::CollComm::GetRankSize).stubs().will(returnValue(8u));
+    MOCKER_CPP(&hccl::CollComm::GetMyRankId).stubs().will(returnValue(3u));
+    collComm.GetCommConfig().SetConfigUdi(std::string("test_udi"));
+
+    ErrorInfoBase baseInfo = {};
+    baseInfo.dieId = 0;
+    baseInfo.missionId = 1;
+    baseInfo.currentInsId = 0;
+    baseInfo.status = 0x0902; // highPart=CCUM_EXECUTE_ERROR(0x09), lowPart=CCU_MISSION_TASK_KILLED(0x02)
+
+    vector<CcuErrorInfo> errorInfo;
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
+
+    EXPECT_EQ(errorInfo.size(), 1u);
+    EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
+}
+
+// 说明：解码器 CcuTaskException 通过全局回调 g_ccuTaskExceptionCallbacks 查询通信域信息，
+// 该组回调由 coll 侧 ccuTaskExceptionAdpt.cc 的静态对象 g_ccuTaskExceptionCallbacksRegister 在 .so
+// 加载时自动注册（本 UT 目标以 SHARED 方式链接 hcomm 时生效）。若将来改为静态库链接，需在本文件
+// 显式调用 RegisterCcuTaskExceptionCallbacks 注册真实回调，否则下列用例将退化为「回调未注册」分支。
+
+// dfxOpInfo_ 为空：解码器直接返回 INVALID_UINT（不触碰回调，避免空指针）。
+TEST_F(CcuTaskExceptionTest, GetRankIdByChannelId_NullDfxOpInfo_Expect_InvalidUint)
+{
+    Hccl::ParaCcu paraCcu = {};
+    Hccl::TaskParam taskParam
+        = {.taskType = Hccl::TaskParamType::TASK_CCU,
+           .beginTime = 0,
+           .endTime = 0,
+           .isMaster = false,
+           .taskPara = {.Ccu = paraCcu},
+           .ccuDetailInfo = nullptr};
+    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false); // dfxOpInfo_ == nullptr
+
+    u32 rankId = CcuTaskException::GetRankIdByChannelId(101, taskInfo, 0);
+
+    EXPECT_EQ(rankId, 0xFFFFFFFFu); // INVALID_UINT
+}
+
+// 非 CCU task：解码器直接返回 INVALID_UINT。
+TEST_F(CcuTaskExceptionTest, GetRankIdByChannelId_NonCcuTask_Expect_InvalidUint)
+{
+    Hccl::ParaCcu paraCcu = {};
+    Hccl::TaskParam taskParam
+        = {.taskType = Hccl::TaskParamType::TASK_SDMA,
+           .beginTime = 0,
+           .endTime = 0,
+           .isMaster = false,
+           .taskPara = {.Ccu = paraCcu},
+           .ccuDetailInfo = nullptr};
+    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    taskInfo.dfxOpInfo_ = std::make_shared<Hccl::DfxOpInfo>();
+
+    u32 rankId = CcuTaskException::GetRankIdByChannelId(101, taskInfo, 0);
+
+    EXPECT_EQ(rankId, 0xFFFFFFFFu); // INVALID_UINT
+}
+
+// dfxOpInfo_ 存在但 comm_ 为空：解码器返回 INVALID_UINT。
+TEST_F(CcuTaskExceptionTest, GetRankIdByChannelId_NullComm_Expect_InvalidUint)
 {
     Hccl::ParaCcu paraCcu = {};
     Hccl::TaskParam taskParam
@@ -411,10 +511,32 @@ TEST_F(CcuTaskExceptionTest, GetAddrPairByChannelId_Normal)
            .taskPara = {.Ccu = paraCcu},
            .ccuDetailInfo = nullptr};
     Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    taskInfo.dfxOpInfo_ = std::make_shared<Hccl::DfxOpInfo>();
+    taskInfo.dfxOpInfo_->comm_ = nullptr;
+
+    u32 rankId = CcuTaskException::GetRankIdByChannelId(101, taskInfo, 0);
+
+    EXPECT_EQ(rankId, 0xFFFFFFFFu); // INVALID_UINT
+}
+
+// dfxOpInfo_ 为空：返回默认（dummy）地址对。
+TEST_F(CcuTaskExceptionTest, GetAddrPairByChannelId_NullDfxOpInfo_Expect_Dummy)
+{
+    Hccl::ParaCcu paraCcu = {};
+    Hccl::TaskParam taskParam
+        = {.taskType = Hccl::TaskParamType::TASK_CCU,
+           .beginTime = 0,
+           .endTime = 0,
+           .isMaster = false,
+           .taskPara = {.Ccu = paraCcu},
+           .ccuDetailInfo = nullptr};
+    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false); // dfxOpInfo_ == nullptr
 
     auto addrPair = CcuTaskException::GetAddrPairByChannelId(101, taskInfo, 0);
 
-    EXPECT_TRUE(true);
+    Hccl::IpAddress expected{};
+    EXPECT_EQ(addrPair.first.Describe(), expected.Describe());
+    EXPECT_EQ(addrPair.second.Describe(), expected.Describe());
 }
 
 TEST_F(CcuTaskExceptionTest, GetMSIdPerDie_Normal)
@@ -438,7 +560,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_UnsupportedOpcode)
     baseInfo.status = 0x0100;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -454,7 +576,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_LocalOpError)
     baseInfo.status = 0x0201;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -470,7 +592,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_RemoteOpError)
     baseInfo.status = 0x0301;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -486,7 +608,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_TransactionRetryExceeded)
     baseInfo.status = 0x0400;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -503,7 +625,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_TransactionAckTimeout)
     baseInfo.status = 0x0500;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -518,7 +640,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_JettyWorkRequestFlushed)
     baseInfo.status = 0x0600;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -533,7 +655,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_CCUAAlgTaskError)
     baseInfo.status = 0x0700;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -548,7 +670,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_MemoryECCError)
     baseInfo.status = 0x0800;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -563,7 +685,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_CCUMExecuteError)
     baseInfo.status = 0x0901;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -579,7 +701,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_CCUAExecuteError)
     baseInfo.status = 0x0A02;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -595,7 +717,7 @@ TEST_F(CcuTaskExceptionTest, GenStatusInfo_HighPartNotInMap)
     baseInfo.status = 0x1100;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    CcuTaskException::GenStatusInfo(baseInfo, CreateCcuTaskInfo(), errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -1524,7 +1646,7 @@ TEST_F(CcuTaskExceptionTest, PrintCcuUbRegisters_When_JettysExist_Expect_QueryBy
     jetty.jettyInfo_.taJettyId = 7;
 
     HcommChannelDesc chDesc{};
-    CcuUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x10), chDesc);
+    CcuUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x10), chDesc, COMM_ENGINE_RESERVED);
     void* channelPtr = static_cast<Channel*>(&channel);
 
     MOCKER(HcommChannelGet)
@@ -1701,7 +1823,7 @@ TEST_F(CcuTaskExceptionTest, NotifyControlPlaneOnUbError_When_JettyStatusQuery_E
         SCOPED_TRACE("scene: " + scene.sceneName);
         CcuJetty jetty(Hccl::IpAddress{}, CcuJettyInfo{});
         HcommChannelDesc chDesc{};
-        CcuUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x10), chDesc);
+        CcuUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x10), chDesc, COMM_ENGINE_RESERVED);
         CcuChannelCtxPool pool(0);
         EndpointDesc epDesc{};
         UrmaEndpoint endpoint(epDesc);
@@ -1744,7 +1866,7 @@ TEST_F(CcuTaskExceptionTest, CollectErrorJettys_When_MixedErrorInfos_Expect_Skip
 
     CcuJetty jetty(Hccl::IpAddress{}, CcuJettyInfo{});
     HcommChannelDesc chDesc{};
-    CcuUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x10), chDesc);
+    CcuUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x10), chDesc, COMM_ENGINE_RESERVED);
     CcuChannelCtxPool pool(0);
     EndpointDesc epDesc{};
     UrmaEndpoint endpoint(epDesc);
@@ -1773,15 +1895,14 @@ TEST_F(CcuTaskExceptionTest, CollectErrorJettys_When_MixedErrorInfos_Expect_Skip
         makeErrorInfo(CcuRep::CcuRepType::READ, dieId, channelIdA),
         makeErrorInfo(CcuRep::CcuRepType::READ, dieId, channelIdB)};
 
-    CcuJettyNotifyInfo jettyInfo;
-    CcuTaskException::CollectErrorJettys(errorInfos, jettyInfo);
+    std::vector<CcuJetty*> ccuJettys;
+    std::vector<uint16_t> channelIds;
+    CcuTaskException::CollectErrorJettys(errorInfos, ccuJettys, channelIds);
 
-    EXPECT_EQ(jettyInfo.ccuJettys.size(), 1u);
-    EXPECT_EQ(jettyInfo.ccuJettys[0], &jetty);
-    EXPECT_EQ(jettyInfo.channelIds.size(), 1u);
-    EXPECT_EQ(jettyInfo.channelIds[0], channelIdA);
-    EXPECT_EQ(jettyInfo.jettyHandles.size(), 1u);
-    EXPECT_EQ(jettyInfo.jettyHandles[0], reinterpret_cast<JettyHandle>(0x2));
+    EXPECT_EQ(ccuJettys.size(), 1u);
+    EXPECT_EQ(ccuJettys[0], &jetty);
+    EXPECT_EQ(channelIds.size(), 1u);
+    EXPECT_EQ(channelIds[0], channelIdA);
 
     TeardownJettyQueryScene({channelIdA, channelIdB, channelIdNoJetty}, pool, endpoint);
 }
@@ -1790,23 +1911,44 @@ TEST_F(CcuTaskExceptionTest, CollectErrorJettys_When_MixedErrorInfos_Expect_Skip
 
 TEST_F(CcuTaskExceptionTest, NotifyJettyErrorToControlPlane_When_SkipConditions_Expect_NoNotify)
 {
-    CcuJetty jetty(Hccl::IpAddress{}, CcuJettyInfo{});
-    jetty.ctxHandle_ = nullptr; // GetCtxHandle返回nullptr，rdmaHandle为空直接跳过
-    jetty.jettyHandlePtr_ = reinterpret_cast<void*>(0x2);
+    enum class SkipPath : u32 { NONE, RDMA_HANDLE_NULL, MEMCPY_SRC_EID_FAIL, MEMCPY_DST_EID_FAIL };
+    struct TestScene {
+        SkipPath skipPath;
+        JettyStatus jettyStatus;
+        std::string sceneName;
+    };
+    const std::vector<TestScene> scenes = {
+        {SkipPath::NONE, JettyStatus::READY, "JettyStatusReady"},
+        {SkipPath::RDMA_HANDLE_NULL, JettyStatus::ERROR, "RdmaHandleNull"},
+        {SkipPath::MEMCPY_SRC_EID_FAIL, JettyStatus::ERROR, "MemcpySrcEidFail"},
+        {SkipPath::MEMCPY_DST_EID_FAIL, JettyStatus::ERROR, "MemcpyDstEidFail"},
+    };
 
     Hccl::TaskParam taskParam{.taskType = Hccl::TaskParamType::TASK_CCU};
-    Hccl::TaskInfo taskInfo{0, 0, 0, taskParam, nullptr, false};
+    Hccl::TaskInfo taskInfo{0, 0, 0, taskParam, nullptr, false}; // dfxOpInfo_为空，GetAddrPairByChannelId返回默认地址对
 
-    // 场景1：rdmaHandle为空，跳过该jetty
+    for (const auto& scene : scenes) {
+        SCOPED_TRACE("scene: " + scene.sceneName);
+        CcuJetty jetty(Hccl::IpAddress{}, CcuJettyInfo{});
+        jetty.ctxHandle_ = (scene.skipPath == SkipPath::RDMA_HANDLE_NULL) ?
+                               nullptr // GetCtxHandle返回nullptr，rdmaHandle为空直接跳过
+                               :
+                               reinterpret_cast<CtxHandle>(0x1);
+        jetty.jettyHandlePtr_ = reinterpret_cast<void*>(0x2);
 
-    SCOPED_TRACE("scene: RdmaHandleNull");
-    CcuJettyNotifyInfo jettyInfo;
-    jettyInfo.ccuJettys.push_back(&jetty);
-    jettyInfo.jettyHandles.push_back(jetty.GetJettyHandle());
-    jettyInfo.channelIds.push_back(200);
-    std::vector<u32> errorJettyIdx{0};
+        if (scene.skipPath == SkipPath::MEMCPY_SRC_EID_FAIL) {
+            MOCKER(memcpy_s).stubs().will(returnValue(-1));
+        } else if (scene.skipPath == SkipPath::MEMCPY_DST_EID_FAIL) {
+            MOCKER(memcpy_s).stubs().will(returnValue(EOK)).then(returnValue(-1));
+        }
 
-    MOCKER(RaCtxNotifyEvent).expects(never());
-    EXPECT_NO_THROW(CcuTaskException::NotifyJettyErrorToControlPlane(0, taskInfo, 0, 0x01, jettyInfo, errorJettyIdx));
-    GlobalMockObject::verify();
+        std::vector<CcuJetty*> ccuJettys{&jetty};
+        std::vector<uint16_t> channelIds{200};
+        std::vector<JettyStatus> jettyStatusVec{scene.jettyStatus};
+
+        MOCKER(RaCtxNotifyEvent).expects(never());
+        EXPECT_NO_THROW(
+            CcuTaskException::NotifyJettyErrorToControlPlane(0, taskInfo, 0x01, jettyStatusVec, ccuJettys, channelIds));
+        GlobalMockObject::verify();
+    }
 }

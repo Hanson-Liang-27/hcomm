@@ -63,7 +63,10 @@ TEST_F(HcclCommProfilingTest, Init_AlreadyInitialized)
     EXPECT_EQ(ret, HCCL_SUCCESS);
 }
 
-TEST_F(HcclCommProfilingTest, ReportOp_NotInitialized) { EXPECT_NO_THROW(profiling_->ReportOp(1000, false, true)); }
+TEST_F(HcclCommProfilingTest, ReportOp_NotInitialized)
+{
+    EXPECT_EQ(profiling_->ReportOp(1000, false, true), HcclResult::HCCL_SUCCESS);
+}
 
 TEST_F(HcclCommProfilingTest, SetCurrDfxOpInfo_Null) { EXPECT_NO_THROW(profiling_->SetCurrDfxOpInfo(nullptr)); }
 
@@ -115,7 +118,7 @@ TEST_F(HcclCommProfilingLiteTest, UpdateProfStat_NotInitialized) { EXPECT_NO_THR
 
 TEST_F(HcclCommProfilingLiteTest, ReportAllTasks_NotInitialized)
 {
-    std::vector<hccl::Thread*> threads;
+    std::vector<ThreadHandle> threads;
     Hccl::DfxCommContext ctx{};
     EXPECT_NO_THROW(profilingLite_->ReportAllTasks(threads, ctx));
 }

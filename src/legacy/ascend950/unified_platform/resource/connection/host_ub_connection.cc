@@ -11,6 +11,7 @@
 #include "host_ub_connection.h"
 
 #include <cstdlib>
+#include <random>
 
 #include "exception_util.h"
 #include "rma_conn_exception.h"
@@ -83,16 +84,16 @@ HostUbConnection::HostUbConnection(
 
 HostUbTpConnection::HostUbTpConnection(
     const RdmaHandle rdmaHandle, const IpAddress& locAddr, const IpAddress& rmtAddr, const OpMode opMode,
-    const HrtUbJfcMode jfcMode, u8 qos, u32 sqDepth, u32 scqDepth)
-    : HostUbConnection(rdmaHandle, locAddr, rmtAddr, opMode, jfcMode, qos, sqDepth, scqDepth)
+    const HrtUbJfcMode jfcMode, u8 qos, u32 inSqDepth, u32 inScqDepth)
+    : HostUbConnection(rdmaHandle, locAddr, rmtAddr, opMode, jfcMode, qos, inSqDepth, inScqDepth)
 {
     tpProtocol = TpProtocol::TP;
 }
 
 HostUbCtpConnection::HostUbCtpConnection(
     const RdmaHandle rdmaHandle, const IpAddress& locAddr, const IpAddress& rmtAddr, const OpMode opMode,
-    const HrtUbJfcMode jfcMode, u8 qos, u32 sqDepth, u32 scqDepth)
-    : HostUbConnection(rdmaHandle, locAddr, rmtAddr, opMode, jfcMode, qos, sqDepth, scqDepth)
+    const HrtUbJfcMode jfcMode, u8 qos, u32 inSqDepth, u32 inScqDepth)
+    : HostUbConnection(rdmaHandle, locAddr, rmtAddr, opMode, jfcMode, qos, inSqDepth, inScqDepth)
 {
     tpProtocol = TpProtocol::CTP;
 }
@@ -153,8 +154,8 @@ void HostUbConnection::Connect() { GetStatus(); }
 
 inline uint32_t GetRandomNum()
 {
-    uint32_t randNum = std::rand();
-    return randNum;
+    thread_local std::mt19937 gen(std::random_device{}());
+    return gen();
 }
 
 RmaConnStatus HostUbConnection::GetStatus()
@@ -230,7 +231,7 @@ std::unique_ptr<Serializable> HostUbConnection::GetExchangeDto()
     return std::unique_ptr<Serializable>(dto.release());
 }
 
-void HostUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto)
+HcclResult HostUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto)
 {
     auto dto = dynamic_cast<const ExchangeUbConnDto&>(rmtDto);
     HCCL_INFO("[HostUbConnection][%s] remoteConnDto[%s]", __func__, dto.Describe().c_str());
@@ -238,14 +239,18 @@ void HostUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto)
         HCCL_ERROR(
             "[HostUbConnection][%s] invalid remote qpKeySize[%u], max[%u].", __func__, dto.qpKeySize,
             HRT_UB_QP_KEY_MAX_LEN);
-        ThrowAbnormalStatus(std::string(__func__));
+        status = RmaConnStatus::CONN_INVALID;
+        ubConnStatus = UbConnStatus::CONN_INVALID;
+        return HCCL_E_PARA;
     }
     remoteTokenValue = dto.tokenValue;
     remoteKeySize = dto.qpKeySize;
     errno_t ret = memcpy_s(remoteQpKey, HRT_UB_QP_KEY_MAX_LEN, dto.qpKey, remoteKeySize);
     if (ret != EOK) {
         HCCL_ERROR("[HostUbConnection][%s] memcpy_s failed, ret=%d", __func__, ret);
-        ThrowAbnormalStatus(std::string(__func__));
+        status = RmaConnStatus::CONN_INVALID;
+        ubConnStatus = UbConnStatus::CONN_INVALID;
+        return HCCL_E_INTERNAL;
     }
 
     if (tpProtocol != TpProtocol::INVALID) {
@@ -255,24 +260,28 @@ void HostUbConnection::ParseRmtExchangeDto(const Serializable& rmtDto)
             "[HostUbConnection][%s] tpEnable, remoteTpHandle[0x%llx], remotePsn[%u].", __func__,
             jettyImportCfg.remoteTpHandle, jettyImportCfg.remotePsn);
     }
+    return HCCL_SUCCESS;
 }
 
-void HostUbConnection::ImportRmtDto()
+HcclResult HostUbConnection::ImportRmtDto()
 {
     if (ubConnStatus == UbConnStatus::READY) {
         HCCL_WARNING("[HostUbConnection][%s] import jetty already, %s.", __func__, Describe().c_str());
-        return;
+        return HCCL_SUCCESS;
     }
 
     if (ubConnStatus != UbConnStatus::JETTY_CREATED) {
         HCCL_ERROR(
             "[HostUbConnection][%s] failed, ubConnStatus[%s] is not expected.", __func__,
             ubConnStatus.Describe().c_str());
-        ThrowAbnormalStatus(std::string(__func__));
+        status = RmaConnStatus::CONN_INVALID;
+        ubConnStatus = UbConnStatus::CONN_INVALID;
+        return HCCL_E_INTERNAL;
     }
 
-    ImportJetty();
+    TRY_CATCH_RETURN(ImportJetty(););
     ubConnStatus = UbConnStatus::JETTY_IMPORTING;
+    return HCCL_SUCCESS;
 }
 
 void HostUbConnection::ThrowAbnormalStatus(std::string funcName)
@@ -405,7 +414,13 @@ void HostUbConnection::SetImportInfo()
 
 void HostUbConnection::ReleaseTp()
 {
-    ReleaseUbConnectionTp(HrtGetDevice(), locAddr, rmtAddr, tpProtocol, tpInfo, static_cast<uint32_t>(qos_));
+    HcclResult ret
+        = ReleaseUbConnectionTp(HrtGetDevice(), locAddr, rmtAddr, tpProtocol, tpInfo, static_cast<uint32_t>(qos_));
+    if (ret != HCCL_SUCCESS) {
+        // 审计路径：释放失败（如缓存键漂移导致 NOT_FOUND）时 useCnt 不回减，记 ERROR 供定位
+        HCCL_ERROR(
+            "[HostUbConnection][%s] release tp failed, ret[%d], tpHandle may leak in TpManager cache.", __func__, ret);
+    }
 }
 
 void HostUbConnection::ReleaseResource()
@@ -549,44 +564,15 @@ string HostUbConnection::Describe() const
 
 void HostUbConnection::AddNop(const Stream& stream) { (void)stream; }
 
-HrtUbJfcMode HostUbConnection::GetUbJfcMode() const { return jfcMode; }
-
 JettyHandle& HostUbConnection::GetJettyHandle() { return jettyHandle_; }
 
 JettyHandle& HostUbConnection::GetRemoteJettyHandle() { return remoteJettyHandle_; }
 
 RdmaHandle& HostUbConnection::GetRdmaHandle() { return rdmaHandle; }
 
-u32 HostUbConnection::GetPiVal() const { return piVal; }
-
-u32 HostUbConnection::GetCiVal() const { return ciVal; }
-
-u32 HostUbConnection::GetSqDepth() const { return sqDepth; }
-
 uint64_t HostUbConnection::GetCqVa() const { return cqInfo_.va; }
 
 u64 HostUbConnection::GetJettyVa() const { return jettyVa_; }
 
 JettyHandle HostUbConnection::GetTJettyVa() const { return remoteJettyVa_; }
-
-void HostUbConnection::UpdateCiVal(u32 ci) { ciVal = ci; }
-
-bool IfNeedUpdatingUbCi(const std::vector<HostUbConnection*>& ubConns)
-{
-    for (auto& ubConn : ubConns) {
-        u32 pi = ubConn->GetPiVal();
-        u32 ci = ubConn->GetCiVal();
-        u32 sqDepth = ubConn->GetSqDepth();
-        // 考虑pi翻转场景
-        u32 extra = pi >= ci ? 0 : sqDepth;
-        constexpr u32 thresholdDivisor = 2;
-
-        if (static_cast<double>(pi + extra - ci) >= static_cast<double>(sqDepth) / thresholdDivisor) {
-            // 当pi和ci差距大于sqDepth/2时，更新ci
-            return true;
-        }
-    }
-    return false;
-}
-
 } // namespace Hccl

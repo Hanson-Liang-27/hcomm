@@ -17,7 +17,6 @@ hcclvm_apply_common_flags(store)
 # 设置头文件包含路径（改为绝对路径，基于项目根目录）
 target_include_directories(store PRIVATE
     ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/include/runnerdb
     ${PROJECT_SOURCE_DIR}/include/store
 
     ${HCCL_VM_SRC}
@@ -37,11 +36,14 @@ target_include_directories(store PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime/runtime/rts
-
-    ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
 )
+if(NOT BUILD_LEVEL1_ONLY)
+    target_include_directories(store PRIVATE
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+    )
+endif()
 
-target_link_libraries(store PRIVATE log loader)
+target_link_libraries(store PRIVATE log loader runtime_state)
 
 # 日志染色: 模块 tag
 target_compile_definitions(store PRIVATE HCCL_VM_MODULE="STORE")

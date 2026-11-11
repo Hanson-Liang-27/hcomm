@@ -11,8 +11,9 @@
 #include "hccl_api_base_test.h"
 #include "coll_comm_mgr.h"
 #include "hcomm_c_adpt.h"
-#include "hcomm_result_defs.h"
+#include "common/result_defs_pub.h"
 #include "hcom_common.h"
+#include "llt_dca_stub.h"
 
 extern thread_local s32 g_hcclDeviceId;
 
@@ -213,6 +214,37 @@ TEST_F(CollCommMgrTest, Ut_UnRegisteCollComm_When_NotRegistered_Expect_NoCrashNo
     EXPECT_EQ(CollCommMgr::GetInstance().GetAllCollComms().count(commId), 0U);
 }
 
+// ===== GetDpuTaskExpMem / GetDpuDevId（commId 反查链，锁内完成反查与取值）=====
+
+TEST_F(CollCommMgrTest, Ut_GetDpuTaskExpMem_When_CommNotRegistered_Expect_NotFound)
+{
+    DpuTaskExpMemRef ref;
+    HcclResult ret = CollCommMgr::GetInstance().GetDpuTaskExpMem("ut_cpu_thread_absent", ref);
+    EXPECT_EQ(ret, HCCL_E_NOT_FOUND);
+    EXPECT_EQ(ref.addr, nullptr);
+    EXPECT_EQ(ref.keepAlive, nullptr);
+}
+
+// simpleMode 下 commEngineResMgr_ 为 null，GetThreadMgr() 返回 nullptr：验证反查链在解引用前的空指针拦截，
+// 并确认注销后条目被摘除、不再反查到已销毁通信域
+TEST_F(CollCommMgrTest, Ut_GetDpuTaskExpMem_When_ThreadMgrMissing_Expect_PtrError)
+{
+    const std::string commId = "ut_cpu_thread_stub";
+    CollComm stub(nullptr, 0, commId, ManagerCallbacks{}, CollCommInitMode::simpleMode);
+    CollCommMgr::GetInstance().RegisterCollComm(&stub);
+
+    DpuTaskExpMemRef ref;
+    EXPECT_EQ(CollCommMgr::GetInstance().GetDpuTaskExpMem(commId, ref), HCCL_E_PTR);
+    EXPECT_EQ(ref.addr, nullptr);
+
+    uint32_t devId = 0;
+    EXPECT_EQ(CollCommMgr::GetInstance().GetDpuDevId(commId, devId), HCCL_E_PTR);
+
+    CollCommMgr::GetInstance().UnregisterCollComm(&stub);
+    EXPECT_EQ(CollCommMgr::GetInstance().GetDpuTaskExpMem(commId, ref), HCCL_E_NOT_FOUND);
+    EXPECT_EQ(CollCommMgr::GetInstance().GetDpuDevId(commId, devId), HCCL_E_NOT_FOUND);
+}
+
 // ===== 析构顺序问题（static destruction order fiasco）=====
 // CollCommMgr 是 Meyers 单例，~CollCommMgr() 间接依赖 base_comm 层单例。
 // 若 base_comm 单例后于 CollCommMgr 构造，则先于其析构，导致 coredump。
@@ -240,4 +272,32 @@ TEST_F(CollCommMgrTest, Ut_GetInstance_When_HcommResMgrInitFails_Expect_ReturnsV
     CollCommMgr& inst = CollCommMgr::GetInstance();
     EXPECT_EQ(&inst, &CollCommMgr::GetInstance())
         << "GetInstance should return valid singleton even if HcommResMgrInit fails";
+}
+
+// ===== CollComm 与 DetectConnectionAnomalies 生命周期配对（dcaInited_）=====
+
+TEST_F(CollCommMgrTest, Ut_CollComm_When_DcaInitedToggled_Expect_DeinitPairedWithInit)
+{
+    // 轮1：fullMode + dcaInited_=true：析构时 Deinit 恰好一次
+    {
+        CollComm comm(nullptr, 0, "ut_dca_pair_inited", ManagerCallbacks{}, CollCommInitMode::fullMode);
+        comm.dcaInited_ = true;
+        hcomm::DcaStubResetCounts();
+    }
+    EXPECT_EQ(hcomm::DcaStubDeinitCallCount(), 1u);
+
+    // 轮2：未 Init（dcaInited_ 默认 false）→ 不触发 Deinit（零增量）
+    {
+        CollComm comm(nullptr, 0, "ut_dca_pair_notinited", ManagerCallbacks{}, CollCommInitMode::fullMode);
+    }
+    EXPECT_EQ(hcomm::DcaStubDeinitCallCount(), 1u);
+}
+
+TEST_F(CollCommMgrTest, Ut_GetDetectConnectionAnomalies_When_DeviceLogicIdOutOfRange_Expect_ReturnDefaultInstance)
+{
+    // 越界 deviceLogicId 回退 0 号实例
+    s32 outOfRange = -1;
+    hcomm::DetectConnectionAnomalies& fallback = CollCommMgr::GetInstance().GetDetectConnectionAnomalies(outOfRange);
+    hcomm::DetectConnectionAnomalies& slot0 = CollCommMgr::GetInstance().GetDetectConnectionAnomalies(0);
+    EXPECT_EQ(&fallback, &slot0);
 }

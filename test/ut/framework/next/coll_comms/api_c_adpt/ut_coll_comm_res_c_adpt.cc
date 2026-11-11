@@ -28,7 +28,10 @@
 #include "hccp.h"
 #include "my_rank.h"
 #include "aiv_urma_channel.h"
-#include "channel_process.h"
+#include "aicpu_ts_urma_channel.h"
+#include "endpoint_pair/channel/channel_process_pub.h"
+#include "endpoint_pair/channel/channel_c_adpt_pub.h"
+#include "endpoint_pair/channel/dfx/channel_dfx_pub.h"
 #include "coll_comm_res_c_adpt.h"
 #include "hcomm_c_adpt.h"
 #include "channel_config.h"
@@ -158,6 +161,13 @@ HcclResult StubCreateChannelsCapture(
         }
         channels[0] = g_testChannel;
     }
+    return HCCL_SUCCESS;
+}
+
+HcclResult StubChannelBuildDeviceEntity(ChannelHandle channelHandle, uint64_t* devChannelEntity)
+{
+    EXPECT_EQ(channelHandle, g_testChannel);
+    *devChannelEntity = reinterpret_cast<uint64_t>(g_testDevChannelEntity);
     return HCCL_SUCCESS;
 }
 
@@ -302,6 +312,12 @@ protected:
         channelDesc.notifyNum = 1;
         channelDesc.memHandles = &g_userMemHandle;
         channelDesc.memHandleNum = 1;
+        channelDesc.localEndpoint.protocol = COMM_PROTOCOL_UBOE;
+        channelDesc.localEndpoint.loc.locType = ENDPOINT_LOC_TYPE_DEVICE;
+        channelDesc.localEndpoint.commAddr.type = COMM_ADDR_TYPE_IP_V4;
+        channelDesc.remoteEndpoint.protocol = COMM_PROTOCOL_UBOE;
+        channelDesc.remoteEndpoint.loc.locType = ENDPOINT_LOC_TYPE_DEVICE;
+        channelDesc.remoteEndpoint.commAddr.type = COMM_ADDR_TYPE_IP_V4;
     }
 
     void MockConsumedPendingSymMem()
@@ -333,7 +349,7 @@ protected:
 
         HcommChannelDesc hcommDesc
             = MyRankUtils::ChannelDescHccl2Hcomm(out, hcclCommPtr->GetCollComm()->GetCommConfig());
-        ASSERT_EQ(CheckRoceAttr(hcommDesc, ENDPOINT_LOC_TYPE_HOST), HCCL_SUCCESS);
+        ASSERT_EQ(CheckRoceAttr(hcommDesc, ENDPOINT_LOC_TYPE_HOST, nullptr), HCCL_SUCCESS);
         EXPECT_EQ(hcommDesc.roceAttr.sl, expectSl) << "hcclQos=" << hcclQos;
         EXPECT_EQ(hcommDesc.roceAttr.tc, expectTc) << "hcclQos=" << hcclQos;
     }
@@ -401,6 +417,17 @@ TEST_F(HcclChannelDescTest, Ut_ProcessRoceChannelDesc_When_IsCommunicatorV2_Is_T
     MOCKER(HcommDpuChannelRegisterDfx).stubs().will(returnValue(0));
     ret = HcclChannelAcquire(comm, CommEngine::COMM_ENGINE_CPU, channelDesc.data(), 1, channels.data());
     EXPECT_EQ(ret, HCCL_SUCCESS);
+}
+
+// PrepareV2ChannelAcquire: 刷新device失败时返回错误码，不继续建链
+TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_GetDeviceRefreshFails_Expect_RuntimeError)
+{
+    std::vector<HcclChannelDesc> channelDesc(1);
+    std::vector<ChannelHandle> channels(1);
+    GetChannelDesc(channelDesc);
+    MOCKER(hrtGetDeviceRefresh).stubs().will(returnValue(HCCL_E_RUNTIME));
+    ret = HcclChannelAcquire(comm, CommEngine::COMM_ENGINE_CPU, channelDesc.data(), 1, channels.data());
+    EXPECT_EQ(ret, HCCL_E_RUNTIME);
 }
 
 TEST_F(HcclChannelDescTest, Ut_ProcessRoceChannelDesc_When_HostQpCountAvailable_Expect_HostCountPreferred)
@@ -493,6 +520,7 @@ TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_Notifynum_Exceeds_Return_
     GetChannelDesc(channelDesc);
     channelDesc[0].notifyNum = 65;
     MOCKER(&hcomm::ClusterMonitor::RegisterToClusterMonitor).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&MyRank::QueryChannels).expects(never());
 
     ret = HcclChannelAcquire(comm, CommEngine::COMM_ENGINE_AICPU_TS, channelDesc.data(), 1, channels.data());
     EXPECT_EQ(ret, HCCL_E_PARA);
@@ -505,7 +533,9 @@ TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_BuildConnection_Fails_Ret
     GetChannelDesc(channelDesc);
 
     // Mock BuildConnection 失败
-    MOCKER(&HostCpuRoceChannel::BuildConnection).stubs().will(returnValue(HCCL_E_NETWORK));
+    // BuildConnection 已收口为基类虚步骤,虚成员指针非真实地址,需借实例虚表挂钩
+    HostCpuRoceChannel vtblProbe(reinterpret_cast<EndpointHandle>(0x1), HcommChannelDesc{}, COMM_ENGINE_RESERVED);
+    MOCKER_CPP_VIRTUAL(vtblProbe, &HostCpuRoceChannel::BuildConnection).stubs().will(returnValue(HCCL_E_NETWORK));
 
     ret = HcclChannelAcquire(comm, CommEngine::COMM_ENGINE_AICPU_TS, channelDesc.data(), 1, channels.data());
     EXPECT_EQ(ret, HCCL_E_PTR);
@@ -518,7 +548,8 @@ TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_IbvPostRecv_Fails_Return_
     GetChannelDesc(channelDesc);
 
     // Mock BuildConnection 成功
-    MOCKER(&HostCpuRoceChannel::BuildConnection).stubs().will(returnValue(HCCL_SUCCESS));
+    HostCpuRoceChannel vtblProbe(reinterpret_cast<EndpointHandle>(0x1), HcommChannelDesc{}, COMM_ENGINE_RESERVED);
+    MOCKER_CPP_VIRTUAL(vtblProbe, &HostCpuRoceChannel::BuildConnection).stubs().will(returnValue(HCCL_SUCCESS));
     // Mock IbvPostRecv 失败
     MOCKER(&HostCpuRoceChannel::IbvPostRecv).stubs().will(returnValue(HCCL_E_INTERNAL));
 
@@ -703,6 +734,26 @@ TEST_F(CheckCcuChannelProtocolTest, Ut_CheckCcuChannelProtocol_When_MixedDescs_E
     EXPECT_EQ(ret, HCCL_E_NOT_SUPPORT);
 }
 
+TEST_F(CheckCcuChannelProtocolTest, Ut_CheckCcuChannelProtocol_When_CcuUbcTp_Expect_Success)
+{
+    HcclChannelDesc desc{};
+    ASSERT_EQ(HcclChannelDescInit(&desc, 1), HCCL_SUCCESS);
+    desc.channelProtocol = COMM_PROTOCOL_UBC_TP;
+
+    ret = CheckCcuChannelProtocol(CommEngine::COMM_ENGINE_CCU, {desc}, "ut_group");
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+}
+
+TEST_F(CheckCcuChannelProtocolTest, Ut_CheckCcuChannelProtocol_When_CcuRoce_Expect_NotSupport)
+{
+    HcclChannelDesc desc{};
+    ASSERT_EQ(HcclChannelDescInit(&desc, 1), HCCL_SUCCESS);
+    desc.channelProtocol = COMM_PROTOCOL_ROCE;
+
+    ret = CheckCcuChannelProtocol(CommEngine::COMM_ENGINE_CCU, {desc}, "ut_group");
+    EXPECT_EQ(ret, HCCL_E_NOT_SUPPORT);
+}
+
 TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_CcuUbRtp_Expect_NotSupport)
 {
     HcclChannelDesc channelDesc{};
@@ -722,6 +773,9 @@ TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_PendingConsumed_AppendHis
 {
     std::vector<HcclChannelDesc> channelDesc(1);
     std::vector<ChannelHandle> channels(1);
+    hcomm::AicpuTsUrmaChannel aicpuChannel(
+        reinterpret_cast<EndpointHandle>(0x1), HcommChannelDesc{}, COMM_ENGINE_RESERVED);
+    g_testChannel = reinterpret_cast<ChannelHandle>(&aicpuChannel);
     InitSymMemChannelDesc(channelDesc[0]);
 
     MockConsumedPendingSymMem();
@@ -771,6 +825,8 @@ TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_ExistingChannelHasSymmetr
 
     ret = HcclChannelAcquire(comm, CommEngine::COMM_ENGINE_AICPU, channelDesc.data(), 1, channels.data());
     EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(channels[0], g_testChannel);
+    // PrepareMemHandles 只转换原始用户句柄；远端已有 symmetric tag，不追加 symmetric 句柄。
     ASSERT_EQ(g_capturedMemHandles.size(), 1U);
     EXPECT_EQ(g_capturedMemHandles[0], g_userMemHandle);
 }
@@ -801,15 +857,14 @@ TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_AivUbRtp_ConvertsHostHand
     channelDesc.remoteRank = 2;
     channelDesc.channelProtocol = COMM_PROTOCOL_UB_RTP;
 
-    hcomm::AivUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x1), HcommChannelDesc{});
+    hcomm::AivUrmaChannel channel(reinterpret_cast<EndpointHandle>(0x1), HcommChannelDesc{}, COMM_ENGINE_RESERVED);
     g_testChannel = reinterpret_cast<ChannelHandle>(&channel);
 
     MOCKER(&hcomm::ClusterMonitor::RegisterToClusterMonitor).stubs().will(returnValue(HCCL_SUCCESS));
     MOCKER_CPP(&MyRank::CreateChannels).stubs().will(invoke(StubCreateChannelsCapture));
-    MOCKER_CPP(&hcomm::ChannelProcess::ChannelGet).expects(once()).will(invoke(StubChannelGet));
-    MOCKER_CPP(&hcomm::AivUrmaChannel::BuildChannelEntityToDevice, HcclResult(hcomm::AivUrmaChannel::*)(void**))
+    MOCKER_CPP(&hcomm::ChannelProcess::ChannelBuildDeviceEntity)
         .expects(once())
-        .will(invoke(StubBuildChannelEntityToDevice));
+        .will(invoke(StubChannelBuildDeviceEntity));
     MOCKER_CPP(&hcomm::ChannelProcess::RegisterChannelD2HMap).expects(once()).will(returnValue(HCCL_SUCCESS));
 
     ChannelHandle outputChannel = 0;
@@ -820,8 +875,13 @@ TEST_F(HcclChannelDescTest, Ut_HcclChannelAcquire_When_AivUbRtp_ConvertsHostHand
 
 TEST_F(HcclChannelDescTest, Ut_ProcessRoceChannelDesc_When_HcclQosUnset_UsesRdmaEnvSlTc)
 {
-    // EnvRdmaConfig 默认 SL=4、TC=132（CI 中 setenv 晚于 EnvConfig 解析时不生效）
-    ExpectRoceSlTcInHcommChannelDesc(HCCL_COMM_QOS_CONFIG_NOT_SET, 4U, 132U);
+    // hcclQos 未配置时 SL/TC 取自 EnvRdmaConfig；EnvConfig 为进程级单例、解析时机随用例执行顺序变化
+    // （先于本 fixture setenv 则为默认 4/132，晚于则为 env 注入 2/120），故期望值与实现同源读取，保证
+    // 用例在全量/单跑两种顺序下稳定。
+    const auto& rdmaCfg = Hccl::EnvConfig::GetInstance().GetRdmaConfig();
+    ExpectRoceSlTcInHcommChannelDesc(
+        HCCL_COMM_QOS_CONFIG_NOT_SET, static_cast<uint8_t>(rdmaCfg.GetRdmaServerLevel()),
+        static_cast<uint8_t>(rdmaCfg.GetRdmaTrafficClass()));
 }
 
 TEST_F(HcclChannelDescTest, Ut_ProcessRoceChannelDesc_When_HcclQos1_MapsSlAndTcFromHccn)

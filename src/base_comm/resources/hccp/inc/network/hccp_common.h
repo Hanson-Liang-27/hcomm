@@ -46,8 +46,8 @@ enum NotifyTypeT {
  * white list switch
  */
 enum WhiteListStatus {
-    WHITE_LIST_DISABLE = 0, /**< enable white list */
-    WHITE_LIST_ENABLE,      /**< disable white list */
+    WHITE_LIST_DISABLE = 0, /**< disable white list */
+    WHITE_LIST_ENABLE,      /**< enable white list */
 };
 
 /**
@@ -302,6 +302,22 @@ enum RaWrOpcode {
 enum PortStatus {
     PORT_STATUS_DOWN = 0,
     PORT_STATUS_ACTIVE = 1,
+};
+
+/**
+ * @ingroup librdma
+ * rdev attribute
+ */
+struct RdevAttr {
+    enum PortStatus status;
+    union {
+        uint32_t maxReadSize;
+        uint32_t maxWriteSize;
+        uint32_t maxMsgSize;
+    };
+    uint32_t maxQpWr;
+    uint32_t maxCqe;
+    bool isInlineReduceSupported;
 };
 
 /**

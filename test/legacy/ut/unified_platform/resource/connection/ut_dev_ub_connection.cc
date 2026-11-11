@@ -19,6 +19,7 @@
 #include "orion_adapter_rts.h"
 #include "not_support_exception.h"
 #include "rma_conn_exception.h"
+#include "internal_exception.h"
 #include "rdma_handle_manager.h"
 #include "tp_manager.h"
 #include "hccp_async.h"
@@ -708,7 +709,7 @@ TEST_F(DevUbConnectionTest, rma_net_connection_prepare_write_task_in_offload_mod
         .then(returnValue(postSendRes3));
 
     DevUbConnection devUbConnection(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OFFLOAD);
-    EXPECT_EQ(devUbConnection.GetSqDepth(), 128U);
+    EXPECT_EQ(devUbConnection.sqDepth, 128U);
 
     // Given
     MemoryBuffer localMemBuffer1(0, 0, 0);
@@ -757,7 +758,7 @@ TEST_F(DevUbConnectionTest, rma_net_connection_prepare_write_task_in_offload_mod
     EXPECT_NO_THROW(devUbConnection1.AddNop(stream));
 }
 
-TEST_F(DevUbConnectionTest, rma_ub_connection_get_pi_ci_sqDepth_ok)
+TEST_F(DevUbConnectionTest, rma_ub_connection_get_pi_sqDepth_ok)
 {
     // Given: socket time out
     MOCKER_CPP(&Socket::GetStatus).stubs().will(returnValue((SocketStatus)SocketStatus::TIMEOUT));
@@ -772,9 +773,8 @@ TEST_F(DevUbConnectionTest, rma_ub_connection_get_pi_ci_sqDepth_ok)
     DevUbConnection devUbConnection(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
 
     // Then
-    EXPECT_EQ(devUbConnection.GetPiVal(), 0);
-    EXPECT_EQ(devUbConnection.GetCiVal(), 0);
-    EXPECT_EQ(devUbConnection.GetSqDepth(), 8192);
+    EXPECT_EQ(devUbConnection.piVal, 0);
+    EXPECT_EQ(devUbConnection.sqDepth, 8192);
 }
 
 TEST_F(DevUbConnectionTest, rma_ub_connection_get_jfcMode_and_jettyHandle_ok)
@@ -794,75 +794,8 @@ TEST_F(DevUbConnectionTest, rma_ub_connection_get_jfcMode_and_jettyHandle_ok)
     devUbConnection.jettyHandle = jettyHandle;
 
     // Then
-    EXPECT_EQ(devUbConnection.GetUbJfcMode(), HrtUbJfcMode::STARS_POLL);
+    EXPECT_EQ(devUbConnection.jfcMode, HrtUbJfcMode::STARS_POLL);
     EXPECT_EQ(devUbConnection.GetJettyHandle(), jettyHandle);
-}
-
-TEST_F(DevUbConnectionTest, GetStarsPollUbConns_ok)
-{
-    // Given: socket time out
-    MOCKER_CPP(&Socket::GetStatus).stubs().will(returnValue((SocketStatus)SocketStatus::TIMEOUT));
-    RdmaHandle rdmaHandle = (void*)0x1000000;
-    string tag = "SENDRECV";
-    QpHandle fakeQpHandle = (void*)0x1000000;
-
-    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
-    LinkData linkData(portType, 0, 1, 0, 1);
-
-    // When
-    DevUbConnection devUbConnection(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
-    std::vector<RmaConnection*> conns;
-    conns.push_back(&devUbConnection);
-    std::vector<DevUbConnection*> devUbConns = GetStarsPollUbConns(conns);
-
-    // Then
-    EXPECT_EQ(devUbConns.size(), 1);
-}
-
-TEST_F(DevUbConnectionTest, IfNeedUpdatingUbCi_false)
-{
-    // Given: socket time out
-    MOCKER_CPP(&Socket::GetStatus).stubs().will(returnValue((SocketStatus)SocketStatus::TIMEOUT));
-    RdmaHandle rdmaHandle = (void*)0x1000000;
-    string tag = "SENDRECV";
-    QpHandle fakeQpHandle = (void*)0x1000000;
-
-    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
-    LinkData linkData(portType, 0, 1, 0, 1);
-
-    // When
-    DevUbConnection devUbConnection(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
-    devUbConnection.piVal = 10;
-    devUbConnection.ciVal = 0;
-    std::vector<DevUbConnection*> conns;
-    conns.push_back(&devUbConnection);
-    bool ret = IfNeedUpdatingUbCi(conns);
-
-    // Then
-    EXPECT_EQ(ret, false);
-}
-
-TEST_F(DevUbConnectionTest, IfNeedUpdatingUbCi_true)
-{
-    // Given: socket time out
-    MOCKER_CPP(&Socket::GetStatus).stubs().will(returnValue((SocketStatus)SocketStatus::TIMEOUT));
-    RdmaHandle rdmaHandle = (void*)0x1000000;
-    string tag = "SENDRECV";
-    QpHandle fakeQpHandle = (void*)0x1000000;
-
-    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
-    LinkData linkData(portType, 0, 1, 0, 1);
-
-    // When
-    DevUbConnection devUbConnection(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
-    devUbConnection.piVal = 4000;
-    devUbConnection.ciVal = 0;
-    std::vector<DevUbConnection*> conns;
-    conns.push_back(&devUbConnection);
-    bool ret = IfNeedUpdatingUbCi(conns);
-
-    // Then
-    EXPECT_EQ(ret, false);
 }
 
 TEST_F(DevUbConnectionTest, getExchangeDto_test)
@@ -1042,6 +975,84 @@ TEST_F(DevUbConnectionTest, Ut_ImportRmtDto)
     GlobalMockObject::verify();
 }
 
+TEST_F(DevUbConnectionTest, Ut_DetachTpOwnership_WithValidTpHandle_ExpectSuccessAndFieldsSnapshotted)
+{
+    // 真实实现：tpHandle 有效时移交成功，releaseTpOnDestroy_ 置 false，ownership 五字段为成员快照
+    RdmaHandle rdmaHandle = reinterpret_cast<void*>(0x1000000);
+    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
+    LinkData linkData(portType, 0, 1, 0, 1);
+
+    DevUbConnection conn(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
+    conn.tpProtocol = TpProtocol::UBOE;
+    conn.tpInfo.tpHandle = 0x1234U;
+    EXPECT_TRUE(conn.releaseTpOnDestroy_);
+
+    DevUbConnection::TpOwnership ownership{};
+    EXPECT_EQ(conn.DetachTpOwnership(ownership), HcclResult::HCCL_SUCCESS);
+    EXPECT_FALSE(conn.releaseTpOnDestroy_);
+    EXPECT_EQ(ownership.devLogicId, conn.devLogicId);
+    EXPECT_EQ(ownership.locAddr, conn.locAddr);
+    EXPECT_EQ(ownership.rmtAddr, conn.rmtAddr);
+    EXPECT_EQ(ownership.tpProtocol, TpProtocol::UBOE);
+    EXPECT_EQ(ownership.qos, static_cast<u32>(conn.qos_));
+    EXPECT_EQ(ownership.tpInfo.tpHandle, 0x1234U);
+}
+
+TEST_F(DevUbConnectionTest, Ut_DetachTpOwnership_WithoutTpHandle_ExpectNotFoundAndFlagKept)
+{
+    // 真实实现：tpHandle=0（GetTpInfo 未完成/失败）无有效引用可移交，flag 保持 true（析构仍 ReleaseTp）
+    RdmaHandle rdmaHandle = reinterpret_cast<void*>(0x1000000);
+    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
+    LinkData linkData(portType, 0, 1, 0, 1);
+
+    DevUbConnection conn(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
+    conn.tpInfo.tpHandle = 0;
+
+    DevUbConnection::TpOwnership ownership{};
+    EXPECT_EQ(conn.DetachTpOwnership(ownership), HcclResult::HCCL_E_NOT_FOUND);
+    EXPECT_TRUE(conn.releaseTpOnDestroy_);
+}
+
+TEST_F(DevUbConnectionTest, Ut_DetachTpOwnership_Twice_ExpectIdempotent)
+{
+    // 幂等防御：第二次调用返回 NOT_FOUND，不再产出第二个释放回调（避免 useCnt 重复扣减）
+    RdmaHandle rdmaHandle = reinterpret_cast<void*>(0x1000000);
+    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
+    LinkData linkData(portType, 0, 1, 0, 1);
+
+    DevUbConnection conn(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
+    conn.tpInfo.tpHandle = 0x1234U;
+
+    DevUbConnection::TpOwnership first{};
+    EXPECT_EQ(conn.DetachTpOwnership(first), HcclResult::HCCL_SUCCESS);
+    DevUbConnection::TpOwnership second{};
+    EXPECT_EQ(conn.DetachTpOwnership(second), HcclResult::HCCL_E_NOT_FOUND);
+    EXPECT_FALSE(conn.releaseTpOnDestroy_);
+}
+
+TEST_F(DevUbConnectionTest, Ut_RestoreTpOwnershipOnDestroy_ExpectFlagRestored)
+{
+    // DetachTpOwnership 成功翻转标志后、调用方构造释放回调失败（bad_alloc 等）时的回滚：
+    // Restore 还原析构释放，避免 TP 引用既不随析构释放也无回调接管（useCnt 永久漏扣）；
+    // 重复调用无副作用
+    RdmaHandle rdmaHandle = reinterpret_cast<void*>(0x1000000);
+    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
+    LinkData linkData(portType, 0, 1, 0, 1);
+
+    DevUbConnection conn(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
+    conn.tpInfo.tpHandle = 0x1234U;
+
+    DevUbConnection::TpOwnership ownership{};
+    ASSERT_EQ(conn.DetachTpOwnership(ownership), HcclResult::HCCL_SUCCESS);
+    EXPECT_FALSE(conn.releaseTpOnDestroy_);
+
+    conn.RestoreTpOwnershipOnDestroy();
+    EXPECT_TRUE(conn.releaseTpOnDestroy_);
+
+    conn.RestoreTpOwnershipOnDestroy();
+    EXPECT_TRUE(conn.releaseTpOnDestroy_);
+}
+
 TEST_F(DevUbConnectionTest, Ut_UbRtpConnection_Constructor_SetsTpProtocolAndQos)
 {
     constexpr u32 expectedSqDepth = 512U;
@@ -1059,7 +1070,7 @@ TEST_F(DevUbConnectionTest, Ut_UbRtpConnection_Constructor_SetsTpProtocolAndQos)
     EXPECT_EQ(ubRtpConn.tpProtocol, TpProtocol::UB_RTP);
     EXPECT_EQ(ubRtpConn.jettyTimeOut, 16);
     EXPECT_EQ(ubRtpConn.qos_, qos);
-    EXPECT_EQ(ubRtpConn.GetSqDepth(), expectedSqDepth);
+    EXPECT_EQ(ubRtpConn.sqDepth, expectedSqDepth);
 }
 
 static HcclResult StubGetTpInfoWithMappedQos(TpManager*, const RaUbGetTpInfoParam&, TpInfo& tpInfo, bool)

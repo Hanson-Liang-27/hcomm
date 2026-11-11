@@ -57,6 +57,7 @@ target_include_directories(hcomm_base_obj PRIVATE
     # ============================================================
     ${CMAKE_CURRENT_SOURCE_DIR}/
     ${CMAKE_CURRENT_SOURCE_DIR}/dfx
+    ${CMAKE_CURRENT_SOURCE_DIR}/dfx/aicpu
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/ccu/ccu_device
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/ccu/ccu_device/ccu_comp
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/ccu/ccu_device/ccu_comp/ccu_channel
@@ -84,6 +85,8 @@ target_include_directories(hcomm_base_obj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/hccp/inc/network
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/hccp/inc/private
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/hccp/inc/private/network
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/southbound_adpt
+    ${CMAKE_CURRENT_SOURCE_DIR}/resources/hccp/external_depends/aubdfx
     ${CMAKE_CURRENT_SOURCE_DIR}/resources/hccp/external_depends/ubengine
 
 
@@ -193,11 +196,6 @@ target_include_directories(hcomm_base_obj PRIVATE
     # 6. 三方件头文件
     # ============================================================
     ${URMA_INCLUDE_DIR}
-)
-
-# base_comm根目录源文件
-target_sources(hcomm_base_obj PRIVATE
-    hcomm_res_mgr.cc
 )
 
 # 链接CANN库以获取必要的头文件路径

@@ -10,52 +10,75 @@
 
 #include "aiv_ub_mem_channel.h"
 #include "endpoint.h"
+#include "hcomm_c_adpt.h"
+#include "base_comm_node_accessors.h"
 
 namespace hcomm {
 
-AivUbMemChannel::AivUbMemChannel(EndpointHandle endpointHandle, const HcommChannelDesc& channelDesc)
-    : endpointHandle_(endpointHandle),
-      channelDesc_(channelDesc)
+AivUbMemChannel::AivUbMemChannel(EndpointHandle endpointHandle, const HcommChannelDesc& channelDesc, CommEngine engine)
+    : Channel(endpointHandle, channelDesc, engine, HcommChannelKind::AIV_UB_MEM, "AivUbMemChannel")
 {}
+
+AivUbMemChannel::~AivUbMemChannel() { StopListen(); }
 
 HcclResult AivUbMemChannel::ParseInputParam()
 {
-    Endpoint* localEpPtr = static_cast<Endpoint*>(endpointHandle_);
-    CHK_PTR_NULL(localEpPtr);
-    localEp_ = localEpPtr->GetEndpointDesc();
-    socket_ = static_cast<Hccl::Socket*>(channelDesc_.socket);
+    CHK_RET(Channel::ParseInputParam());
+
+    CHK_RET(CollectLocalRmaBuffers(local_.commonRes.bufferVec));
+
     return HCCL_SUCCESS;
 }
 
-HcclResult AivUbMemChannel::BuildTransport()
+HcclResult AivUbMemChannel::StartListen()
 {
-    EXCEPTION_CATCH(transport_ = std::make_unique<AivUbMemTransport>(socket_, channelDesc_), return HCCL_E_PTR);
+    CHK_RET(Channel::StartListen());
+    return HCCL_SUCCESS;
+}
+
+HcclResult AivUbMemChannel::BuildSocket()
+{
+    CHK_RET(Channel::BuildSocket());
+    return HCCL_SUCCESS;
+}
+
+HcclResult AivUbMemChannel::BuildConnection()
+{
+    CHK_RET(Channel::BuildConnection());
+    return HCCL_SUCCESS;
+}
+
+HcclResult AivUbMemChannel::BuildNotify()
+{
+    CHK_RET(Channel::BuildNotify());
+    return HCCL_SUCCESS;
+}
+
+HcclResult AivUbMemChannel::BuildBuffer()
+{
+    CHK_RET(Channel::BuildBuffer());
+    EXCEPTION_CATCH(
+        transport_ = std::make_unique<AivUbMemTransport>(local_.commonRes.bufferVec, local_.socket, channelDesc_),
+        return HCCL_E_PTR);
     CHK_PTR_NULL(transport_);
     CHK_RET(transport_->Init());
     return HCCL_SUCCESS;
 }
 
-HcclResult AivUbMemChannel::Init()
-{
-    CHK_RET(ParseInputParam());
-    CHK_RET(BuildTransport());
-    return HCCL_SUCCESS;
-}
-
-ChannelStatus AivUbMemChannel::GetStatus()
-{
-    return TransportStatusToChannelStatus(transport_->GetStatus(), localEp_, GetChannelDesc());
-}
-
 HcclResult AivUbMemChannel::GetNotifyNum([[maybe_unused]] uint32_t* notifyNum) const
 {
-    HCCL_INFO("AivUbMemChannel GetNotifyNum is not supported.");
+    HCCL_INFO("[%s::%s] AivUbMemChannel GetNotifyNum is not supported.", channelClassName_, __func__);
     return HCCL_SUCCESS;
 }
 
 HcclResult AivUbMemChannel::GetRemoteMems(uint32_t* memNum, CommMem** remoteMem, char*** memInfos)
 {
     return transport_->GetRemoteMems(memNum, remoteMem, memInfos);
+}
+
+ChannelStatus AivUbMemChannel::GetStatus()
+{
+    return TransportStatusToChannelStatus(transport_->GetStatus(), local_.ep, GetChannelDesc());
 }
 
 HcclResult AivUbMemChannel::UpdateMemInfo(HcommMemHandle* memHandles, uint32_t memHandleNum)
@@ -75,44 +98,11 @@ HcclResult AivUbMemChannel::Resume()
     return HCCL_SUCCESS;
 }
 
-HcclResult AivUbMemChannel::NotifyRecord([[maybe_unused]] const uint32_t remoteNotifyIdx)
+void AivUbMemChannel::StopListen()
 {
-    HCCL_INFO("[AivUbMemChannel::%s] not supported yet.", __func__);
-    return HCCL_E_NOT_SUPPORT;
+    if (local_.isSocketServer == true) {
+        (void)HcommEndpointStopListen(endpointHandle_, local_.serverPort);
+    }
 }
 
-HcclResult
-AivUbMemChannel::NotifyWait([[maybe_unused]] const uint32_t localNotifyIdx, [[maybe_unused]] const uint32_t timeout)
-{
-    HCCL_INFO("[AivUbMemChannel::%s] not supported yet.", __func__);
-    return HCCL_E_NOT_SUPPORT;
-}
-
-HcclResult AivUbMemChannel::WriteWithNotify(
-    [[maybe_unused]] void* dst, [[maybe_unused]] const void* src, [[maybe_unused]] const uint64_t len,
-    [[maybe_unused]] uint32_t remoteNotifyIdx)
-{
-    HCCL_INFO("[AivUbMemChannel::%s] not supported yet.", __func__);
-    return HCCL_E_NOT_SUPPORT;
-}
-
-HcclResult
-AivUbMemChannel::Write([[maybe_unused]] void* dst, [[maybe_unused]] const void* src, [[maybe_unused]] uint64_t len)
-{
-    HCCL_INFO("[AivUbMemChannel::%s] not supported yet.", __func__);
-    return HCCL_E_NOT_SUPPORT;
-}
-
-HcclResult
-AivUbMemChannel::Read([[maybe_unused]] void* dst, [[maybe_unused]] const void* src, [[maybe_unused]] uint64_t len)
-{
-    HCCL_INFO("[AivUbMemChannel::%s] not supported yet.", __func__);
-    return HCCL_E_NOT_SUPPORT;
-}
-
-HcclResult AivUbMemChannel::ChannelFence()
-{
-    HCCL_INFO("[AivUbMemChannel::%s] not supported yet.", __func__);
-    return HCCL_E_NOT_SUPPORT;
-}
 } // namespace hcomm

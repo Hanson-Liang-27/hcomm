@@ -9,12 +9,32 @@
  */
 
 #include "../../../ut_hcomm_base.h"
-#include "channel_process.h"
+#include "endpoint_pair/endpoint_pair_pub.h"
+#include "endpoint_pair/channel/channel_process_pub.h"
+#include "endpoint_pair/channel/channel_c_adpt_pub.h"
+#include "channel_map_registry.h"
 #include "aiv_urma_channel.h"
-#include "aicpu_ts_roce_channel_v2.h"
-#include "aicpu_ts_channel_helper.h"
-#include "aiv_channel_helper.h"
+#include "aiv_roce_host_loc_channel.h"
+#include "aicpu_ts_channel_entity.h"
+#include "aicpu_ts_urma_channel.h"
+#include "aiv_channel_entity.h"
+#include "launch_aicpu.h"
 #include "mem_device_pub.h"
+#include "opbase_adpt.h"
+#include "ccu/ccu_urma_channel.h"
+#include "hcomm_res_ccu_entity.h"
+#include "base_comm_node_accessors.h"
+
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+
+using hcomm::HCOMM_AICPU_CHANNEL_CTX_MAGIC_WORD;
+using hcomm::HCOMM_AICPU_CHANNEL_CTX_VERSION;
+using hcomm::HcommAicpuChannelCtx;
+using hcomm::UnwrapChannelHandle;
+
+static hcomm::ChannelHandleRegistryProc& ChannelRegistry() { return hcomm::GetChannelHandleRegistryProc(); }
 
 // ConvertToLinkStatus 是 channel_process.cc 内 hcomm 命名空间下的自由函数(外部链接),
 // 头文件未声明, 这里前向声明以便 UT 直接验证终态映射契约。
@@ -27,21 +47,22 @@ public:
     void SetUp() override { TestHcommCAdptBase::SetUp(); }
     void TearDown() override
     {
-        {
-            std::lock_guard<std::mutex> lock(hcomm::ChannelProcess::g_ChannelMapMtx);
-            hcomm::ChannelProcess::g_ChannelMap.clear();
-            hcomm::ChannelProcess::g_ChannelD2HMap.clear();
-        }
+        // 持锁清四张表
+        auto& registry = ChannelRegistry();
+        std::lock_guard<std::mutex> lock(registry.ChannelMapMtx());
+        registry.ChannelMap().clear();
+        registry.ChannelD2HMap().clear();
+        registry.ChannelH2DMap().clear();
+        registry.ChannelDestroyHandleMap().clear();
         TestHcommCAdptBase::TearDown();
     }
 };
 
-class FakeChannelForProcess : public hcomm::Channel {
+class FakeChannelForProcess : public hcomm::Channel, public hcomm::IChannelEntity {
 public:
-    explicit FakeChannelForProcess(hcomm::HcommChannelKind kind) : kind_(kind) {}
-
-    hcomm::HcommChannelKind GetChannelKind() const override { return kind_; }
-    HcclResult Init() override { return HCCL_SUCCESS; }
+    explicit FakeChannelForProcess(hcomm::HcommChannelKind kind, CommEngine engine = COMM_ENGINE_RESERVED)
+        : hcomm::Channel(nullptr, HcommChannelDesc{}, engine, kind, "FakeChannelForProcess")
+    {}
     HcclResult GetNotifyNum(uint32_t*) const override { return HCCL_SUCCESS; }
     HcclResult GetRemoteMems(uint32_t*, CommMem**, char***) override { return HCCL_SUCCESS; }
     hcomm::ChannelStatus GetStatus() override { return hcomm::ChannelStatus::READY; }
@@ -59,16 +80,263 @@ public:
     HcclResult Read(void*, const void*, uint64_t) override { return HCCL_SUCCESS; }
     HcclResult ChannelFence() override { return HCCL_SUCCESS; }
 
+    // fake 自身充当实体，Set/IsDeviceEntityReady 用例调用走实体接口（对齐 FakeChannel）
+    hcomm::IChannelEntity* GetChannelEntity() override { return this; }
+    HcclResult PreAllocCtx(ChannelHandle& outHandle) override { return HCCL_SUCCESS; }
+    void* GetCtxPtr() const override { return ctxPtr_; }
+    void SetCtxPtr(void* ctxPtr) { ctxPtr_ = ctxPtr; }
+
 private:
-    hcomm::HcommChannelKind kind_;
+    void* ctxPtr_{nullptr};
 };
+
+class FakeAicpuChannelForDestroy : public FakeChannelForProcess {
+public:
+    explicit FakeAicpuChannelForDestroy(CommEngine engine = COMM_ENGINE_AICPU_TS)
+        : FakeChannelForProcess(hcomm::HcommChannelKind::AICPU_TS_URMA, engine)
+    {}
+    hcomm::IChannelEntity* GetChannelEntity() override { return &entity_; }
+
+private:
+    hcomm::AicpuTsChannelEntity entity_;
+};
+
+// 保留真实 ChannelDestroy、RemoveSingleChannel 和 ctx 所有权，仅替换设备内存与 kernel 边界。
+class TestChannelDestroyLifecycle : public TestChannelProcess {
+public:
+    void SetUp() override
+    {
+        TestChannelProcess::SetUp();
+        activeTest_ = this;
+        MOCKER(hrtGetDevice).stubs().will(invoke(+[](int32_t* deviceId) -> HcclResult {
+            *deviceId = 0;
+            return HCCL_SUCCESS;
+        }));
+        MOCKER(hrtMalloc).stubs().will(invoke(+[](void** ptr, u64 size, bool) -> HcclResult {
+            *ptr = std::calloc(1, size);
+            return *ptr != nullptr ? HCCL_SUCCESS : HCCL_E_MEMORY;
+        }));
+        MOCKER(hrtFree).stubs().will(invoke(+[](void* ptr) -> HcclResult {
+            ++activeTest_->freedCtxCount_;
+            std::free(ptr);
+            return HCCL_SUCCESS;
+        }));
+        MOCKER(hcomm::ChannelProcess::ChannelKernelDestroy).stubs().will(invoke(CheckDestroyKernel));
+    }
+
+    void TearDown() override
+    {
+        TestChannelProcess::TearDown();
+        activeTest_ = nullptr;
+    }
+
+    void AddChannel(ChannelHandle& hostHandle, ChannelHandle& userHandle, CommEngine engine = COMM_ENGINE_AICPU_TS)
+    {
+        auto channel = std::make_shared<FakeAicpuChannelForDestroy>(engine);
+        hostHandle = reinterpret_cast<ChannelHandle>(channel.get());
+        ASSERT_EQ(channel->GetChannelEntity()->PreAllocCtx(userHandle), HCCL_SUCCESS);
+        auto* ctx = static_cast<HcommAicpuChannelCtx*>(channel->GetChannelEntity()->GetCtxPtr());
+        ctx->abiHeader.version = HCOMM_AICPU_CHANNEL_CTX_VERSION;
+        ctx->abiHeader.magicWord = HCOMM_AICPU_CHANNEL_CTX_MAGIC_WORD;
+        ctx->abiHeader.size = sizeof(HcommAicpuChannelCtx);
+        ctx->deviceChannel = reinterpret_cast<void*>(0x1000U + channels_.size());
+        channels_.push_back(channel);
+        hostHandles_.push_back(hostHandle);
+        userHandles_.push_back(userHandle);
+        ASSERT_EQ(hcomm::InsertPluginChannelToMap(hostHandle, std::move(channel)), HCCL_SUCCESS);
+        ASSERT_EQ(hcomm::ChannelProcess::FillChannelD2HMap(&hostHandle, &hostHandle, 1), HCCL_SUCCESS);
+        ASSERT_EQ(hcomm::ChannelProcess::FillChannelD2HMap(&userHandle, &hostHandle, 1), HCCL_SUCCESS);
+    }
+
+    void AddNonAicpuChannel(CommEngine engine, ChannelHandle& hostHandle, ChannelHandle userHandle = 0)
+    {
+        auto channel = std::make_shared<FakeChannelForProcess>(hcomm::HcommChannelKind::INVALID, engine);
+        hostHandle = reinterpret_cast<ChannelHandle>(channel.get());
+        if (userHandle == 0) {
+            userHandle = hostHandle;
+        }
+        nonAicpuChannels_.push_back(channel);
+        hostHandles_.push_back(hostHandle);
+        ASSERT_EQ(hcomm::InsertPluginChannelToMap(hostHandle, std::move(channel)), HCCL_SUCCESS);
+        ASSERT_EQ(hcomm::ChannelProcess::FillChannelD2HMap(&hostHandle, &hostHandle, 1), HCCL_SUCCESS);
+        ASSERT_EQ(hcomm::ChannelProcess::FillChannelD2HMap(&userHandle, &hostHandle, 1), HCCL_SUCCESS);
+    }
+
+    void CheckHostChannelsRemoved()
+    {
+        for (const auto& hostHandle : hostHandles_) {
+            EXPECT_EQ(hcomm::RemovePluginChannelFromMap(hostHandle), HCCL_E_NOT_FOUND);
+        }
+        EXPECT_TRUE(ChannelRegistry().ChannelD2HMap().empty());
+        EXPECT_TRUE(ChannelRegistry().ChannelH2DMap().empty());
+    }
+
+    static HcclResult CheckDestroyKernel(ChannelHandle* handles, uint32_t num, aclrtBinHandle binHandle)
+    {
+        auto& test = *activeTest_;
+        ++test.kernelCalls_;
+        EXPECT_NE(binHandle, nullptr);
+        if (num != test.channels_.size()) {
+            ADD_FAILURE() << "Unexpected channel count in AICPU destroy kernel: " << num;
+            return HCCL_E_INTERNAL;
+        }
+        EXPECT_EQ(test.freedCtxCount_, 0U);
+        test.CheckHostChannelsRemoved();
+        for (const auto& channel : test.nonAicpuChannels_) {
+            EXPECT_FALSE(channel.expired());
+        }
+        for (uint32_t i = 0; i < num; ++i) {
+            EXPECT_EQ(handles[i], test.userHandles_[i]);
+            // 先判断生命周期，避免回归时测试本身解引用已释放的 ctx。
+            if (test.channels_[i].expired()) {
+                ADD_FAILURE() << "Channel/ctx released before device destroy";
+                return HCCL_E_INTERNAL;
+            }
+            ChannelHandle transport = handles[i];
+            EXPECT_EQ(hcomm::UnwrapChannelHandle(transport), HCCL_SUCCESS);
+            EXPECT_EQ(transport, 0x1000U + i);
+        }
+        return test.kernelResult_;
+    }
+
+    static TestChannelDestroyLifecycle* activeTest_;
+    std::vector<std::weak_ptr<FakeAicpuChannelForDestroy>> channels_;
+    std::vector<std::weak_ptr<FakeChannelForProcess>> nonAicpuChannels_;
+    std::vector<ChannelHandle> hostHandles_;
+    std::vector<ChannelHandle> userHandles_;
+    uint32_t freedCtxCount_{0};
+    uint32_t kernelCalls_{0};
+    HcclResult kernelResult_{HCCL_SUCCESS};
+};
+
+TestChannelDestroyLifecycle* TestChannelDestroyLifecycle::activeTest_ = nullptr;
+
+TEST_F(TestChannelDestroyLifecycle, KeepsCtxAliveUntilDeviceDestroyReturns)
+{
+    ChannelHandle host = 0;
+    ChannelHandle user = 0;
+    AddChannel(host, user);
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(&user, 1, reinterpret_cast<aclrtBinHandle>(1)), HCCL_SUCCESS);
+    EXPECT_EQ(kernelCalls_, 1U);
+    EXPECT_TRUE(channels_[0].expired());
+    EXPECT_EQ(freedCtxCount_, 1U);
+}
+
+TEST_F(TestChannelDestroyLifecycle, KeepsWholeBatchAliveForMixedHostAndCtxHandles)
+{
+    ChannelHandle host[2]{};
+    ChannelHandle user[2]{};
+    AddChannel(host[0], user[0]);
+    AddChannel(host[1], user[1]);
+    ChannelHandle handles[]{host[0], user[1]};
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(handles, 2, reinterpret_cast<aclrtBinHandle>(1)), HCCL_SUCCESS);
+    EXPECT_EQ(kernelCalls_, 1U);
+    EXPECT_TRUE(channels_[0].expired());
+    EXPECT_TRUE(channels_[1].expired());
+    EXPECT_EQ(freedCtxCount_, 2U);
+}
+
+TEST_F(TestChannelDestroyLifecycle, ReleasesCtxWithoutLaunchingWhenBinHandleIsNull)
+{
+    ChannelHandle host = 0;
+    ChannelHandle user = 0;
+    AddChannel(host, user);
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(&host, 1), HCCL_SUCCESS);
+    EXPECT_EQ(kernelCalls_, 0U);
+    EXPECT_TRUE(channels_[0].expired());
+    EXPECT_EQ(freedCtxCount_, 1U);
+}
+
+TEST_F(TestChannelDestroyLifecycle, ReleasesRemovedChannelsOnInvalidBatchWithoutLaunching)
+{
+    ChannelHandle host = 0;
+    ChannelHandle user = 0;
+    AddChannel(host, user);
+    ChannelHandle handles[]{user, 0};
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(handles, 2, reinterpret_cast<aclrtBinHandle>(1)), HCCL_E_NOT_FOUND);
+    EXPECT_EQ(kernelCalls_, 0U);
+    EXPECT_TRUE(channels_[0].expired());
+    EXPECT_EQ(freedCtxCount_, 1U);
+}
+
+TEST_F(TestChannelDestroyLifecycle, ReleasesCtxAndPropagatesKernelLaunchFailure)
+{
+    ChannelHandle host = 0;
+    ChannelHandle user = 0;
+    AddChannel(host, user);
+    kernelResult_ = HCCL_E_RUNTIME; // 模拟尚未提交任务的 launch 失败，不模拟仍在运行的超时任务。
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(&user, 1, reinterpret_cast<aclrtBinHandle>(1)), HCCL_E_RUNTIME);
+    EXPECT_EQ(kernelCalls_, 1U);
+    EXPECT_TRUE(channels_[0].expired());
+    EXPECT_EQ(freedCtxCount_, 1U);
+}
+
+TEST_F(TestChannelDestroyLifecycle, SkipsCcuKernelWithLoadedBin)
+{
+    ChannelHandle host = 0;
+    AddNonAicpuChannel(COMM_ENGINE_CCU, host);
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(&host, 1, reinterpret_cast<aclrtBinHandle>(1)), HCCL_SUCCESS);
+    EXPECT_EQ(kernelCalls_, 0U);
+    EXPECT_TRUE(nonAicpuChannels_[0].expired());
+    CheckHostChannelsRemoved();
+}
+
+TEST_F(TestChannelDestroyLifecycle, SkipsAivKernelWithLoadedBin)
+{
+    ChannelHandle host = 0;
+    ChannelHandle user = 0x2000;
+    AddNonAicpuChannel(COMM_ENGINE_AIV, host, user);
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(&user, 1, reinterpret_cast<aclrtBinHandle>(1)), HCCL_SUCCESS);
+    EXPECT_EQ(kernelCalls_, 0U);
+    EXPECT_TRUE(nonAicpuChannels_[0].expired());
+    CheckHostChannelsRemoved();
+}
+
+TEST_F(TestChannelDestroyLifecycle, SkipsReservedEngineKernelWithLoadedBin)
+{
+    ChannelHandle host = 0;
+    AddNonAicpuChannel(COMM_ENGINE_RESERVED, host);
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(&host, 1, reinterpret_cast<aclrtBinHandle>(1)), HCCL_SUCCESS);
+    EXPECT_EQ(kernelCalls_, 0U);
+    EXPECT_TRUE(nonAicpuChannels_[0].expired());
+    CheckHostChannelsRemoved();
+}
+
+TEST_F(TestChannelDestroyLifecycle, FiltersMixedEngineBatchAndRetainsChannelsUntilKernelReturns)
+{
+    ChannelHandle host[3]{};
+    ChannelHandle user[2]{};
+    AddNonAicpuChannel(COMM_ENGINE_CCU, host[0]);
+    AddChannel(host[1], user[0]);
+    AddChannel(host[2], user[1], COMM_ENGINE_AICPU);
+    ChannelHandle handles[]{host[0], user[0], host[2]};
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelDestroy(handles, 3, reinterpret_cast<aclrtBinHandle>(1)), HCCL_SUCCESS);
+    EXPECT_EQ(kernelCalls_, 1U);
+    EXPECT_TRUE(nonAicpuChannels_[0].expired());
+    EXPECT_TRUE(channels_[0].expired());
+    EXPECT_TRUE(channels_[1].expired());
+    EXPECT_EQ(freedCtxCount_, 2U);
+    CheckHostChannelsRemoved();
+}
+
+static std::vector<std::string> launchedKernelNames;
 
 // CreateChannelsLoop 空指针测试
 TEST_F(TestChannelProcess, Ut_TestCreateChannelsLoop_When_EndpointHandleNullptr_Return_HCCL_E_PTR)
 {
     HcommChannelDesc desc = {};
     ChannelHandle outHandles[1] = {};
-    HcclResult ret = hcomm::ChannelProcess::CreateChannelsLoop(nullptr, COMM_ENGINE_AICPU, &desc, 1, outHandles);
+    HcclResult ret
+        = hcomm::ChannelProcess::CreateChannelsLoop(nullptr, COMM_ENGINE_AICPU, &desc, 1, nullptr, outHandles);
     EXPECT_EQ(ret, HCCL_E_PTR);
 }
 
@@ -101,7 +369,7 @@ TEST_F(TestChannelProcess, Ut_TestLaunchChannelKernelCommon_When_ChannelHandlesN
     HcommChannelDesc hcommDescs[1] = {};
     ChannelHandle hostHandles[1] = {};
     HcclResult ret = hcomm::ChannelProcess::LaunchChannelKernelCommon(
-        nullptr, hostHandles, hcommDescs, 1, "test_tag", nullptr, "test_kernel", false);
+        nullptr, hostHandles, hcommDescs, 1, "test_tag", nullptr, "test_kernel");
     EXPECT_EQ(ret, HCCL_E_PTR);
 }
 
@@ -110,7 +378,7 @@ TEST_F(TestChannelProcess, Ut_TestLaunchChannelKernelCommon_When_HostChannelHand
     HcommChannelDesc hcommDescs[1] = {};
     ChannelHandle deviceHandles[1] = {};
     HcclResult ret = hcomm::ChannelProcess::LaunchChannelKernelCommon(
-        deviceHandles, nullptr, hcommDescs, 1, "test_tag", nullptr, "test_kernel", false);
+        deviceHandles, nullptr, hcommDescs, 1, "test_tag", nullptr, "test_kernel");
     EXPECT_EQ(ret, HCCL_E_PTR);
 }
 
@@ -120,7 +388,7 @@ TEST_F(TestChannelProcess, Ut_TestLaunchChannelKernelCommon_When_ListNumZero_Ret
     ChannelHandle deviceHandles[1] = {};
     ChannelHandle hostHandles[1] = {};
     HcclResult ret = hcomm::ChannelProcess::LaunchChannelKernelCommon(
-        deviceHandles, hostHandles, hcommDescs, 0, "test_tag", nullptr, "test_kernel", false);
+        deviceHandles, hostHandles, hcommDescs, 0, "test_tag", nullptr, "test_kernel");
     EXPECT_EQ(ret, HCCL_E_PARA);
 }
 
@@ -147,6 +415,20 @@ TEST_F(TestChannelProcess, Ut_TestChannelGetRemoteMems_When_MemNumNullptr_Return
     char** memInfos = nullptr;
     HcclResult ret = hcomm::ChannelProcess::ChannelGetRemoteMems(0, nullptr, &remoteMem, &memInfos);
     EXPECT_EQ(ret, HCCL_E_PTR);
+}
+
+// CCU Channel 实体出参为空指针
+TEST_F(TestChannelProcess, Ut_CcuChannelGetEntity_When_EntityNullptr_Return_HCCL_E_PTR)
+{
+    HcclResult ret = hcomm::ChannelProcess::CcuChannelGetEntity(1, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PTR);
+}
+
+// 对外入口直接透传 ChannelProcess 查询结果，空出参应保持错误码语义一致
+TEST_F(TestChannelProcess, Ut_HcommCcuChannelGetEntity_When_EntityNullptr_Return_HCCL_E_PTR)
+{
+    HcommResult ret = HcommCcuChannelGetEntity(1, nullptr);
+    EXPECT_EQ(ret, static_cast<HcommResult>(HCCL_E_PTR));
 }
 
 TEST_F(TestChannelProcess, Ut_ChannelClean_NullList_Returns_E_PARA)
@@ -184,7 +466,7 @@ TEST_F(TestChannelProcess, Ut_ChannelResume_NullList_Returns_E_PARA)
 }
 
 // 公共：mock LaunchChannelKernelCommon 短接 V2 路径，验证指定 kind 命中 V2 分流
-// （ChannelKernelLaunchForBase → LaunchChannelKernelCommon）。UBOE/ROCE_V2/PCIE 三个 kind 共用。
+// （ChannelKernelLaunchForBase → LaunchChannelKernelCommon）。UBOE/ROCE_HOST_LOC/PCIE 三个 kind 共用。
 static void LaunchChannelKernelForKindExpectsV2(hcomm::HcommChannelKind kind)
 {
     HcommChannelDesc hcommDescs[1] = {};
@@ -197,11 +479,11 @@ static void LaunchChannelKernelForKindExpectsV2(hcomm::HcommChannelKind kind)
         &hcomm::ChannelProcess::LaunchChannelKernelCommon,
         HcclResult(
             ChannelHandle*, ChannelHandle*, const HcommChannelDesc*, uint32_t, const std::string&, aclrtBinHandle,
-            const std::string&, bool))
+            const std::string&))
         .stubs()
         .with(
             mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(),
-            mockcpp::any(), mockcpp::any())
+            mockcpp::any())
         .will(returnValue(HCCL_SUCCESS));
 
     auto ret = hcomm::ChannelProcess::LaunchChannelKernel(deviceHandles, hostHandles, hcommDescs, 1, nullptr);
@@ -213,9 +495,9 @@ TEST_F(TestChannelProcess, Ut_LaunchChannelKernel_When_ChannelKindIsUBOE_CallsCh
     LaunchChannelKernelForKindExpectsV2(hcomm::HcommChannelKind::AICPU_TS_UBOE);
 }
 
-TEST_F(TestChannelProcess, Ut_LaunchChannelKernel_When_ChannelKindIsRoceV2_CallsChannelKernelLaunchForBase)
+TEST_F(TestChannelProcess, Ut_LaunchChannelKernel_When_ChannelKindIsRoceHostLoc_CallsChannelKernelLaunchForBase)
 {
-    LaunchChannelKernelForKindExpectsV2(hcomm::HcommChannelKind::AICPU_TS_ROCE_V2);
+    LaunchChannelKernelForKindExpectsV2(hcomm::HcommChannelKind::AICPU_TS_ROCE_HOST_LOC);
 }
 
 TEST_F(TestChannelProcess, Ut_LaunchChannelKernel_When_ChannelKindIsPcie_CallsChannelKernelLaunchForBase)
@@ -234,6 +516,35 @@ TEST_F(TestChannelProcess, Ut_ChannelUpdateKernelLaunch_When_ChannelKindUnsuppor
     EXPECT_EQ(ret, HCCL_E_NOT_SUPPORT);
 }
 
+static HcclResult StubAicpuKernelLaunchCaptureName(
+    rtStream_t, void*, u32, aclrtBinHandle, const std::string& kernelName, bool, u16, void*, u32)
+{
+    launchedKernelNames.push_back(kernelName);
+    return HCCL_SUCCESS;
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelUpdateKernelLaunch_When_ChannelSupported_Expect_LaunchRecoveryKernel)
+{
+    launchedKernelNames.clear();
+
+    hcomm::AicpuTsUrmaChannel channel(nullptr, HcommChannelDesc{}, COMM_ENGINE_RESERVED);
+    ChannelHandle deviceHandles[1] = {static_cast<ChannelHandle>(0x1234)};
+    ChannelHandle hostHandles[1] = {reinterpret_cast<ChannelHandle>(&channel)};
+
+    MOCKER_CPP(&hcomm::AicpuTsUrmaChannel::PackOpData, HcclResult(hcomm::AicpuTsUrmaChannel::*)(std::vector<char>&))
+        .stubs()
+        .will(returnValue(HCCL_SUCCESS));
+    MOCKER(hccl::AicpuAclKernelLaunch).stubs().will(invoke(StubAicpuKernelLaunchCaptureName));
+    MOCKER(hcclStreamSynchronize).stubs().will(returnValue(HCCL_SUCCESS));
+
+    HcclResult ret
+        = hcomm::ChannelProcess::ChannelUpdateKernelLaunch(deviceHandles, hostHandles, 1, "test_tag", nullptr);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+
+    ASSERT_EQ(launchedKernelNames.size(), 1U);
+    EXPECT_EQ(launchedKernelNames[0], "RunAicpuIndOpChannelUpdateV2");
+}
+
 TEST_F(TestChannelProcess, Ut_CopyUpdateKernelPackResToDevice_When_TotalSizeTooSmall_Expect_Para)
 {
     std::vector<std::vector<char>> hostPackBuffers{{'a', 'b'}, {'c', 'd'}};
@@ -250,7 +561,7 @@ TEST_F(TestChannelProcess, Ut_CopyUpdateKernelPackResToDevice_When_TotalSizeTooS
 // ===================== 非阻塞建链 UT =====================
 
 // 通用 FakeChannel，支持配置 engine/kind/status/deviceEntityReady/ctxMem
-class FakeChannel : public hcomm::Channel {
+class FakeChannel : public hcomm::Channel, public hcomm::IChannelEntity {
 public:
     FakeChannel(CommEngine eng = COMM_ENGINE_AICPU, hcomm::ChannelStatus sta = hcomm::ChannelStatus::READY)
     {
@@ -262,9 +573,8 @@ public:
 
     void SetStatus(hcomm::ChannelStatus s) { fakeStatus_ = s; }
     void SetDesc(const HcommChannelDesc& d) { desc_ = d; }
+    void SetCtxPtrForTest(void* ctxPtr) { ctxPtr_ = ctxPtr; }
 
-    hcomm::HcommChannelKind GetChannelKind() const override { return channelKind_; }
-    HcclResult Init() override { return HCCL_SUCCESS; }
     HcclResult GetNotifyNum(uint32_t* notifyNum) const override { return HCCL_SUCCESS; }
     HcclResult GetRemoteMems(uint32_t* memNum, CommMem** remoteMem, char*** memInfos) override { return HCCL_SUCCESS; }
     hcomm::ChannelStatus GetStatus() override { return fakeStatus_; }
@@ -281,9 +591,18 @@ public:
     HcclResult Read(void* dst, const void* src, uint64_t len) override { return HCCL_SUCCESS; }
     HcclResult ChannelFence() override { return HCCL_SUCCESS; }
 
+    // 数据面实体窄接口：fake 自身充当实体，Set/IsDeviceEntityReady 用例调用走实体接口
+    hcomm::IChannelEntity* GetChannelEntity() override { return this; }
+    HcclResult PreAllocCtx(ChannelHandle& outHandle) override { return HCCL_SUCCESS; }
+    void* GetCtxPtr() const override { return ctxPtr_; }
+    bool IsDeviceEntityReady() const override { return deviceEntityReady_; }
+    void SetDeviceEntityReady() override { deviceEntityReady_ = true; }
+
 private:
     hcomm::ChannelStatus fakeStatus_{hcomm::ChannelStatus::INIT};
     HcommChannelDesc desc_{};
+    bool deviceEntityReady_{false};
+    void* ctxPtr_{nullptr};
 };
 
 // 辅助：注册 FakeChannel 到全局 map
@@ -293,10 +612,80 @@ static ChannelHandle RegisterFakeChannel(std::shared_ptr<FakeChannel>& ch)
     int32_t deviceId = 0;
     // mock hrtGetDevice 返回 0
     hcomm::DeviceChannelKey key{0, handle};
-    std::lock_guard<std::mutex> lock(hcomm::ChannelProcess::g_ChannelMapMtx);
-    hcomm::ChannelProcess::g_ChannelMap.emplace(handle, ch);
-    hcomm::ChannelProcess::g_ChannelD2HMap.emplace(key, handle);
+    std::lock_guard<std::mutex> lock(ChannelRegistry().ChannelMapMtx());
+    ChannelRegistry().ChannelMap().emplace(handle, ch);
+    ChannelRegistry().ChannelD2HMap().emplace(key, handle);
     return handle;
+}
+
+// --- HcommChannelBuildDeviceEntity：参数校验 + 三路分发（RoceV2/AivUrma/非 AIV→E_PARA）的 else 分支 ---
+TEST_F(TestChannelProcess, Ut_HcommChannelBuildDeviceEntity_When_DevEntityNullptr_Return_E_PTR)
+{
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+    auto ch = std::make_shared<FakeChannel>(COMM_ENGINE_AICPU, hcomm::ChannelStatus::READY);
+    ChannelHandle handle = RegisterFakeChannel(ch);
+    EXPECT_EQ(HcommChannelBuildDeviceEntity(handle, nullptr), static_cast<HcommResult>(HCCL_E_PTR));
+}
+
+TEST_F(TestChannelProcess, Ut_HcommChannelBuildDeviceEntity_When_NotAivDirectChannel_Expect_E_PARA)
+{
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+    auto ch = std::make_shared<FakeChannel>(COMM_ENGINE_AICPU, hcomm::ChannelStatus::READY);
+    ChannelHandle handle = RegisterFakeChannel(ch);
+    uint64_t devEntity = 0;
+    // FakeChannel 既非 AivRoceHostLocChannel 也非 AivUrmaChannel → 命中 else 分支返回 E_PARA
+    EXPECT_EQ(HcommChannelBuildDeviceEntity(handle, &devEntity), static_cast<HcommResult>(HCCL_E_PARA));
+}
+
+TEST_F(TestChannelProcess, Ut_HcommChannelBuildDeviceEntity_When_HandleNotFound_Expect_NotFound)
+{
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+    ChannelHandle handle = static_cast<ChannelHandle>(0x9999);
+    uint64_t devEntity = 0;
+    EXPECT_EQ(HcommChannelBuildDeviceEntity(handle, &devEntity), static_cast<HcommResult>(HCCL_E_NOT_FOUND));
+}
+
+// 辅助：注册任意 Channel 子类到全局 map
+static ChannelHandle RegisterChannel(std::shared_ptr<hcomm::Channel>& ch)
+{
+    ChannelHandle handle = reinterpret_cast<ChannelHandle>(ch.get());
+    hcomm::DeviceChannelKey key{0, handle};
+    ChannelRegistry().ChannelMap().emplace(handle, ch);
+    ChannelRegistry().ChannelD2HMap().emplace(key, handle);
+    return handle;
+}
+
+static HcclResult StubBuildAivChannelEntity(hcomm::IChannelEntity*, void** devChannelPtr)
+{
+    *devChannelPtr = reinterpret_cast<void*>(0x1);
+    return HCCL_SUCCESS;
+}
+
+// 三路分发之一：AivRoceHostLocChannel → BuildAndGetDevChannelEntity
+TEST_F(TestChannelProcess, Ut_HcommChannelBuildDeviceEntity_When_RoceV2_Expect_DelegateRoceV2Build)
+{
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+    std::shared_ptr<hcomm::Channel> ch
+        = std::make_shared<hcomm::AivRoceHostLocChannel>(EndpointHandle{0}, HcommChannelDesc{}, COMM_ENGINE_AIV);
+    ChannelHandle handle = RegisterChannel(ch);
+    MOCKER_CPP(&hcomm::AivRoceHostLocChannel::BuildAndGetDevChannelEntity).stubs().will(returnValue(HCCL_SUCCESS));
+    uint64_t devEntity = 0;
+    EXPECT_EQ(HcommChannelBuildDeviceEntity(handle, &devEntity), static_cast<HcommResult>(HCCL_SUCCESS));
+}
+
+// 三路分发之二：AivUrmaChannel → GetChannelEntity()->BuildChannelEntityToDevice
+TEST_F(TestChannelProcess, Ut_HcommChannelBuildDeviceEntity_When_AivUrma_Expect_DelegateAivBuild)
+{
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+    std::shared_ptr<hcomm::Channel> ch
+        = std::make_shared<hcomm::AivUrmaChannel>(EndpointHandle{0}, HcommChannelDesc{}, COMM_ENGINE_RESERVED);
+    ChannelHandle handle = RegisterChannel(ch);
+    MOCKER_CPP_VIRTUAL(*ch->GetChannelEntity(), &hcomm::IChannelEntity::BuildChannelEntityToDevice)
+        .stubs()
+        .will(invoke(StubBuildAivChannelEntity));
+    uint64_t devEntity = 0;
+    EXPECT_EQ(HcommChannelBuildDeviceEntity(handle, &devEntity), static_cast<HcommResult>(HCCL_SUCCESS));
+    EXPECT_NE(devEntity, 0u);
 }
 
 // --- GetChannelsInfo 参数校验 ---
@@ -352,7 +741,158 @@ TEST_F(TestChannelProcess, Ut_LaunchAicpuKernel_When_AllReady_Skip)
     std::vector<int32_t> linkStatus = {hcomm::HCOMM_CHANNEL_STATUS_READY};
     int32_t statusList[1] = {0};
     EXPECT_EQ(
-        AicpuTsChannelHelper::HandleStatus(&handle, 1, COMM_ENGINE_AICPU, descs, linkStatus, statusList), HCCL_SUCCESS);
+        hcomm::AicpuTsChannelEntity::HandleStatus(&handle, 1, COMM_ENGINE_AICPU, descs, linkStatus, statusList),
+        HCCL_SUCCESS);
+}
+
+TEST_F(TestChannelProcess, Ut_EnsureDeviceReady_When_NotAicpuEngine_Return_NotSupport)
+{
+    MOCKER(hrtGetDevice).stubs().will(invoke(+[](int32_t* deviceId) -> HcclResult {
+        *deviceId = 0;
+        return HCCL_SUCCESS;
+    }));
+    MOCKER_CPP(&hcomm::AicpuCommEngineBinProc::EnsureKernelBinLoaded).expects(never());
+    MOCKER(hcomm::ChannelProcess::LaunchChannelKernel).expects(never());
+
+    for (CommEngine engine : {COMM_ENGINE_CPU, COMM_ENGINE_AIV, COMM_ENGINE_CCU}) {
+        auto ch = std::make_shared<FakeChannel>(engine);
+        ChannelHandle handle = RegisterFakeChannel(ch);
+
+        EXPECT_EQ(hcomm::AicpuTsChannelEntity::EnsureDeviceReady(&handle, 1), HCCL_E_NOT_SUPPORT) << engine;
+    }
+}
+
+TEST_F(TestChannelProcess, Ut_EnsureDeviceReady_When_AllReady_Expect_NoKernelLaunch)
+{
+    MOCKER(hrtGetDevice).stubs().will(invoke(+[](int32_t* deviceId) -> HcclResult {
+        *deviceId = 0;
+        return HCCL_SUCCESS;
+    }));
+    // 隔离 bin 文件加载，保留 EnsureDeviceReady 到 LaunchKernel 的真实筛选路径。
+    MOCKER_CPP(&hcomm::AicpuCommEngineBinProc::EnsureKernelBinLoaded).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::LaunchChannelKernel).expects(never());
+
+    for (CommEngine engine : {COMM_ENGINE_AICPU, COMM_ENGINE_AICPU_TS}) {
+        auto first = std::make_shared<FakeChannel>(engine);
+        auto second = std::make_shared<FakeChannel>(engine);
+        first->SetDeviceEntityReady();
+        second->SetDeviceEntityReady();
+        const ChannelHandle channelList[] = {RegisterFakeChannel(first), RegisterFakeChannel(second)};
+
+        EXPECT_EQ(hcomm::AicpuTsChannelEntity::EnsureDeviceReady(channelList, 2), HCCL_SUCCESS) << engine;
+        EXPECT_TRUE(first->GetChannelEntity()->IsDeviceEntityReady());
+        EXPECT_TRUE(second->GetChannelEntity()->IsDeviceEntityReady());
+    }
+}
+
+class TestChannelEnsureDeviceReady : public TestChannelProcess {
+public:
+    void SetUp() override
+    {
+        TestChannelProcess::SetUp();
+        activeTest_ = this;
+        MOCKER(hrtGetDevice).stubs().will(invoke(+[](int32_t* deviceId) -> HcclResult {
+            *deviceId = 0;
+            return HCCL_SUCCESS;
+        }));
+    }
+
+    void TearDown() override
+    {
+        TestChannelProcess::TearDown();
+        activeTest_ = nullptr;
+    }
+
+    static HcclResult InitUnreadyChannel(
+        ChannelHandle* deviceHandles, ChannelHandle* hostHandles, HcommChannelDesc* descs, uint32_t num,
+        aclrtBinHandle binHandle)
+    {
+        auto& test = *activeTest_;
+        if (num != 1 || deviceHandles == nullptr || hostHandles == nullptr || descs == nullptr) {
+            ADD_FAILURE() << "Expected exactly one unready channel";
+            return HCCL_E_INTERNAL;
+        }
+        EXPECT_EQ(hostHandles[0], test.unreadyHost_);
+        EXPECT_EQ(descs[0].notifyNum, 7U);
+        EXPECT_EQ(binHandle, test.binHandle_);
+        // 模拟 kernel 写入 ctx；输出数组保持为零，映射必须通过真实 ctx 回读完成。
+        test.ctx_.deviceChannel = &test.transport_;
+        return HCCL_SUCCESS;
+    }
+
+    static TestChannelEnsureDeviceReady* activeTest_;
+    const aclrtBinHandle binHandle_{reinterpret_cast<aclrtBinHandle>(1)};
+    ChannelHandle unreadyHost_{0};
+    hcomm::HcommAicpuChannelCtx ctx_{};
+    uint64_t transport_{0};
+};
+
+TestChannelEnsureDeviceReady* TestChannelEnsureDeviceReady::activeTest_ = nullptr;
+
+TEST_F(TestChannelEnsureDeviceReady, Ut_EnsureDeviceReady_When_PartiallyReady_Expect_InitUnreadyOnly)
+{
+    auto ready = std::make_shared<FakeChannel>(COMM_ENGINE_AICPU_TS);
+    auto unready = std::make_shared<FakeChannel>(COMM_ENGINE_AICPU_TS);
+    ready->SetDeviceEntityReady();
+    unready->SetCtxPtrForTest(&ctx_);
+    HcommChannelDesc desc{};
+    desc.notifyNum = 7;
+    unready->SetDesc(desc);
+    const ChannelHandle hostHandles[] = {RegisterFakeChannel(ready), RegisterFakeChannel(unready)};
+    unreadyHost_ = hostHandles[1];
+
+    uint64_t readyTransport = 0;
+    const ChannelHandle originalDeviceHandles[]
+        = {reinterpret_cast<ChannelHandle>(&readyTransport), reinterpret_cast<ChannelHandle>(&ctx_)};
+    ASSERT_EQ(hcomm::ChannelProcess::FillChannelD2HMap(originalDeviceHandles, hostHandles, 2), HCCL_SUCCESS);
+    MOCKER_CPP(&hcomm::AicpuCommEngineBinProc::EnsureKernelBinLoaded).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hcomm::AicpuCommEngineBinProc::GetBinHandle).stubs().will(returnValue(binHandle_));
+    MOCKER(hcomm::ChannelProcess::LaunchChannelKernel)
+        .expects(exactly(1))
+        .with(mockcpp::any(), mockcpp::any(), mockcpp::any(), eq(uint32_t{1}), eq(binHandle_))
+        .will(invoke(InitUnreadyChannel));
+    MOCKER(hrtMemSyncCopy)
+        .expects(exactly(1))
+        .with(
+            mockcpp::any(), eq(uint64_t{sizeof(ctx_)}), eq(static_cast<const void*>(&ctx_)), eq(uint64_t{sizeof(ctx_)}),
+            eq(HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_DEVICE_TO_HOST))
+        .will(invoke(+[](void* dst, uint64_t destMax, const void* src, uint64_t count, HcclRtMemcpyKind) -> HcclResult {
+            return memcpy_s(dst, destMax, src, count) == EOK ? HCCL_SUCCESS : HCCL_E_INTERNAL;
+        }));
+
+    ASSERT_EQ(hcomm::AicpuTsChannelEntity::EnsureDeviceReady(hostHandles, 2), HCCL_SUCCESS);
+    EXPECT_TRUE(ready->IsDeviceEntityReady());
+    EXPECT_TRUE(unready->IsDeviceEntityReady());
+    ChannelHandle deviceHandle = 0;
+    ASSERT_EQ(hcomm::ChannelProcess::ResolveHostHandleToDevice(unreadyHost_, deviceHandle), HCCL_SUCCESS);
+    EXPECT_EQ(deviceHandle, reinterpret_cast<ChannelHandle>(&transport_));
+    ChannelHandle hostHandle = 0;
+    ASSERT_EQ(hcomm::ChannelProcess::ResolveUserHandleToHost(deviceHandle, hostHandle), HCCL_SUCCESS);
+    EXPECT_EQ(hostHandle, unreadyHost_);
+    ASSERT_EQ(hcomm::ChannelProcess::ResolveHostHandleToDevice(hostHandles[0], deviceHandle), HCCL_SUCCESS);
+    EXPECT_EQ(deviceHandle, originalDeviceHandles[0]);
+
+    // 第二次调用全部已就绪，不应再次下发 kernel 或回读 ctx。
+    EXPECT_EQ(hcomm::AicpuTsChannelEntity::EnsureDeviceReady(hostHandles, 2), HCCL_SUCCESS);
+}
+
+TEST_F(TestChannelEnsureDeviceReady, Ut_EnsureDeviceReady_When_LoadBinFailed_Expect_Error)
+{
+    auto channel = std::make_shared<FakeChannel>(COMM_ENGINE_AICPU_TS);
+    const ChannelHandle hostHandle = RegisterFakeChannel(channel);
+    const ChannelHandle ctxHandle = reinterpret_cast<ChannelHandle>(&ctx_);
+    ASSERT_EQ(hcomm::ChannelProcess::FillChannelD2HMap(&ctxHandle, &hostHandle, 1), HCCL_SUCCESS);
+    MOCKER_CPP(&hcomm::AicpuCommEngineBinProc::EnsureKernelBinLoaded)
+        .expects(exactly(1))
+        .will(returnValue(HCCL_E_RUNTIME));
+    MOCKER_CPP(&hcomm::AicpuCommEngineBinProc::GetBinHandle).expects(never());
+    MOCKER(hcomm::ChannelProcess::LaunchChannelKernel).expects(never());
+
+    EXPECT_EQ(hcomm::AicpuTsChannelEntity::EnsureDeviceReady(&hostHandle, 1), HCCL_E_RUNTIME);
+    EXPECT_FALSE(channel->IsDeviceEntityReady());
+    ChannelHandle deviceHandle = 0;
+    ASSERT_EQ(hcomm::ChannelProcess::ResolveHostHandleToDevice(hostHandle, deviceHandle), HCCL_SUCCESS);
+    EXPECT_EQ(deviceHandle, ctxHandle);
 }
 
 // --- FillAivDevEntities: 全 ready 跳过 ---
@@ -365,7 +905,7 @@ TEST_F(TestChannelProcess, Ut_FillAivDevEntities_When_AllReady_Skip)
     HcommChannelDesc descs[1] = {};
     std::vector<int32_t> linkStatus = {hcomm::HCOMM_CHANNEL_STATUS_READY};
     int32_t statusList[1] = {0};
-    EXPECT_EQ(AivChannelHelper::HandleStatus(&handle, 1, descs, linkStatus, statusList), HCCL_SUCCESS);
+    EXPECT_EQ(hcomm::AivChannelEntity::HandleStatus(&handle, 1, descs, linkStatus, statusList), HCCL_SUCCESS);
 }
 
 // --- FillAivDevEntities: 非 READY 状态跳过 ---
@@ -377,8 +917,8 @@ TEST_F(TestChannelProcess, Ut_FillAivDevEntities_When_NotReadyStatus_Skip)
     HcommChannelDesc descs[1] = {};
     std::vector<int32_t> linkStatus = {hcomm::HCOMM_CHANNEL_STATUS_CONNECTING};
     int32_t statusList[1] = {0};
-    EXPECT_EQ(AivChannelHelper::HandleStatus(&handle, 1, descs, linkStatus, statusList), HCCL_SUCCESS);
-    EXPECT_FALSE(ch->IsDeviceEntityReady());
+    EXPECT_EQ(hcomm::AivChannelEntity::HandleStatus(&handle, 1, descs, linkStatus, statusList), HCCL_SUCCESS);
+    EXPECT_FALSE(ch->GetChannelEntity()->IsDeviceEntityReady());
 }
 
 // --- PreAllocChannels: 非 AICPU/AIV engine 直接拷贝 ---
@@ -417,47 +957,167 @@ TEST_F(TestChannelProcess, Ut_PreAllocChannels_When_ZeroNum_Return_E_PARA)
 TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_HandleZero_Return_E_PTR)
 {
     ChannelHandle handle = 0;
-    EXPECT_EQ(UnwrapChannelHandle(handle), HCCL_E_PTR);
+    EXPECT_EQ(hcomm::UnwrapChannelHandle(handle), HCCL_E_PTR);
 }
 
-// --- UnwrapChannelHandle: magic word 匹配则解包 ---
-TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_MagicMatch_Unwrap)
+// --- UnwrapChannelHandle: AICPU ChannelEntity 解包为原 hcomm 通道句柄 ---
+TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_ChannelEntity_UnwrapCompatHandle)
+{
+    ChannelEntity entity{};
+    entity.abiHeader.version = HCOMM_CHANNEL_ENTITY_VERSION;
+    entity.abiHeader.magicWord = HCOMM_CHANNEL_ENTITY_MAGIC_WORD;
+    entity.abiHeader.size = sizeof(ChannelEntity);
+    entity.compatChannelHandle = static_cast<ChannelHandle>(0x1234);
+
+    ChannelHandle handle = reinterpret_cast<ChannelHandle>(&entity);
+    EXPECT_EQ(hcomm::UnwrapChannelHandle(handle), HCCL_SUCCESS);
+    EXPECT_EQ(handle, static_cast<ChannelHandle>(0x1234));
+}
+
+// --- UnwrapChannelHandle: AICPU ChannelEntity 兼容句柄缺失时报错 ---
+TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_ChannelEntityCompatHandleNull_Return_E_INTERNAL)
+{
+    ChannelEntity entity{};
+    entity.abiHeader.version = HCOMM_CHANNEL_ENTITY_VERSION;
+    entity.abiHeader.magicWord = HCOMM_CHANNEL_ENTITY_MAGIC_WORD;
+    entity.abiHeader.size = sizeof(ChannelEntity);
+
+    ChannelHandle handle = reinterpret_cast<ChannelHandle>(&entity);
+    EXPECT_EQ(hcomm::UnwrapChannelHandle(handle), HCCL_E_INTERNAL);
+}
+
+// --- UnwrapChannelHandle: upstream ctx 句柄解包为 device transport 句柄 ---
+TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_LegacyCtx_UnwrapDeviceHandle)
+{
+    hcomm::HcommAicpuChannelCtx ctx{};
+    ctx.abiHeader.size = sizeof(ctx);
+    ctx.deviceChannel = reinterpret_cast<void*>(0x1234);
+
+    ChannelHandle handle = reinterpret_cast<ChannelHandle>(&ctx);
+    EXPECT_EQ(hcomm::UnwrapChannelHandle(handle), HCCL_SUCCESS);
+    EXPECT_EQ(handle, static_cast<ChannelHandle>(0x1234));
+}
+
+// --- UnwrapChannelHandle: upstream ctx 未完成 device 初始化时报错 ---
+TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_LegacyCtxDeviceHandleNull_Return_E_INTERNAL)
+{
+    hcomm::HcommAicpuChannelCtx ctx{};
+    ctx.abiHeader.size = sizeof(ctx);
+
+    ChannelHandle handle = reinterpret_cast<ChannelHandle>(&ctx);
+    EXPECT_EQ(hcomm::UnwrapChannelHandle(handle), HCCL_E_INTERNAL);
+}
+
+// --- UnwrapChannelHandle: ctx abiHeader.size 非法时报错 ---
+TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_LegacyCtxSizeInvalid_Return_E_INTERNAL)
 {
     HcommAicpuChannelCtx ctx{};
     ctx.abiHeader.version = HCOMM_AICPU_CHANNEL_CTX_VERSION;
     ctx.abiHeader.magicWord = HCOMM_AICPU_CHANNEL_CTX_MAGIC_WORD;
-    ctx.deviceChannel = reinterpret_cast<void*>(static_cast<uintptr_t>(0xABCD));
+    ctx.abiHeader.size = sizeof(ctx) - 1;
+    ctx.deviceChannel = reinterpret_cast<void*>(0x1234);
 
     ChannelHandle handle = reinterpret_cast<ChannelHandle>(&ctx);
-    EXPECT_EQ(UnwrapChannelHandle(handle), HCCL_SUCCESS);
-    EXPECT_EQ(handle, static_cast<ChannelHandle>(reinterpret_cast<uintptr_t>(ctx.deviceChannel)));
+    EXPECT_EQ(UnwrapChannelHandle(handle), HCCL_E_INTERNAL);
 }
 
 // --- UnwrapChannelHandle: magic word 不匹配则保持不变 ---
 TEST_F(TestChannelProcess, Ut_UnwrapChannelHandle_When_MagicNotMatch_KeepHandle)
 {
-    HcommAicpuChannelCtx ctx{};
-    ctx.abiHeader.version = 0;
-    ctx.abiHeader.magicWord = 0;
-    ctx.deviceChannel = reinterpret_cast<void*>(static_cast<uintptr_t>(0xABCD));
+    uint8_t rawStorage[sizeof(ChannelEntity)] = {};
+    auto* header = reinterpret_cast<CommAbiHeader*>(rawStorage);
+    header->version = 0;
+    header->magicWord = 0;
 
-    ChannelHandle handle = reinterpret_cast<ChannelHandle>(&ctx);
+    ChannelHandle handle = reinterpret_cast<ChannelHandle>(rawStorage);
     ChannelHandle original = handle;
-    EXPECT_EQ(UnwrapChannelHandle(handle), HCCL_SUCCESS);
+    EXPECT_EQ(hcomm::UnwrapChannelHandle(handle), HCCL_SUCCESS);
     EXPECT_EQ(handle, original);
+}
+
+TEST_F(TestChannelProcess, Ut_RegisterChannelHandleAlias_When_QueryAndDestroyUseDifferentHandles)
+{
+    constexpr ChannelHandle deviceHandle = 0x1234;
+    constexpr ChannelHandle hostHandle = 0x9abc;
+
+    ChannelEntity entity{};
+    entity.abiHeader.version = HCOMM_CHANNEL_ENTITY_VERSION;
+    entity.abiHeader.magicWord = HCOMM_CHANNEL_ENTITY_MAGIC_WORD;
+    entity.abiHeader.size = sizeof(ChannelEntity);
+    const ChannelHandle entityHandle = reinterpret_cast<ChannelHandle>(&entity);
+
+    hcomm::DeviceChannelKey deviceKey{0, deviceHandle};
+    hcomm::DeviceChannelKey hostKey{0, hostHandle};
+    {
+        std::lock_guard<std::mutex> lock(ChannelRegistry().ChannelMapMtx());
+        ChannelRegistry().ChannelD2HMap()[deviceKey] = hostHandle;
+        ChannelRegistry().ChannelH2DMap()[hostKey] = deviceHandle;
+    }
+
+    EXPECT_EQ(hcomm::ChannelProcess::RegisterChannelHandleAlias(entityHandle, hostHandle), HCCL_SUCCESS);
+
+    ChannelHandle queryHandle = 0;
+    EXPECT_EQ(hcomm::ChannelProcess::ResolveHostHandleToDevice(hostHandle, queryHandle), HCCL_SUCCESS);
+    EXPECT_EQ(queryHandle, entityHandle);
+
+    ChannelHandle destroyHandle = 0;
+    {
+        std::lock_guard<std::mutex> lock(ChannelRegistry().ChannelMapMtx());
+        const auto itDestroy = ChannelRegistry().ChannelDestroyHandleMap().find(hostKey);
+        ASSERT_TRUE(itDestroy != ChannelRegistry().ChannelDestroyHandleMap().end());
+        destroyHandle = itDestroy->second;
+    }
+    EXPECT_EQ(destroyHandle, deviceHandle);
+}
+
+TEST_F(TestChannelProcess, Ut_RegisterChannelHandleAlias_When_RepeatedBuildKeepOriginalDeviceHandle)
+{
+    constexpr ChannelHandle deviceHandle = 0x1234;
+    constexpr ChannelHandle hostHandle = 0x9abc;
+
+    ChannelEntity firstEntity{};
+    firstEntity.abiHeader.version = HCOMM_CHANNEL_ENTITY_VERSION;
+    firstEntity.abiHeader.magicWord = HCOMM_CHANNEL_ENTITY_MAGIC_WORD;
+    firstEntity.abiHeader.size = sizeof(ChannelEntity);
+    const ChannelHandle firstEntityHandle = reinterpret_cast<ChannelHandle>(&firstEntity);
+
+    ChannelEntity secondEntity{};
+    secondEntity.abiHeader.version = HCOMM_CHANNEL_ENTITY_VERSION;
+    secondEntity.abiHeader.magicWord = HCOMM_CHANNEL_ENTITY_MAGIC_WORD;
+    secondEntity.abiHeader.size = sizeof(ChannelEntity);
+    const ChannelHandle secondEntityHandle = reinterpret_cast<ChannelHandle>(&secondEntity);
+
+    hcomm::DeviceChannelKey deviceKey{0, deviceHandle};
+    hcomm::DeviceChannelKey hostKey{0, hostHandle};
+    {
+        std::lock_guard<std::mutex> lock(ChannelRegistry().ChannelMapMtx());
+        ChannelRegistry().ChannelD2HMap()[deviceKey] = hostHandle;
+        ChannelRegistry().ChannelH2DMap()[hostKey] = deviceHandle;
+    }
+
+    ASSERT_EQ(hcomm::ChannelProcess::RegisterChannelHandleAlias(firstEntityHandle, hostHandle), HCCL_SUCCESS);
+    ASSERT_EQ(hcomm::ChannelProcess::RegisterChannelHandleAlias(secondEntityHandle, hostHandle), HCCL_SUCCESS);
+
+    ChannelHandle currentHandle = 0;
+    ASSERT_EQ(hcomm::ChannelProcess::ResolveHostHandleToDevice(hostHandle, currentHandle), HCCL_SUCCESS);
+    EXPECT_EQ(currentHandle, secondEntityHandle);
+
+    ChannelHandle originalHandle = 0;
+    ASSERT_EQ(hcomm::ChannelProcess::ResolveHostHandleToOriginalDevice(hostHandle, originalHandle), HCCL_SUCCESS);
+    EXPECT_EQ(originalHandle, deviceHandle);
 }
 
 // 可配置 GetStatus 返回值的 Fake Channel，用于 ChannelGetStatus 测试
 class FakeStatusChannel : public hcomm::Channel {
 public:
-    explicit FakeStatusChannel(hcomm::ChannelStatus status) : status_(status) {}
-    hcomm::HcommChannelKind GetChannelKind() const override { return hcomm::HcommChannelKind::AICPU_TS_UBOE; }
-    const HcommChannelDesc& GetChannelDesc() const override
-    {
-        static HcommChannelDesc defaultDesc{};
-        return defaultDesc;
-    }
-    HcclResult Init() override { return HCCL_SUCCESS; }
+    explicit FakeStatusChannel(hcomm::ChannelStatus status)
+        : hcomm::Channel(
+              nullptr, HcommChannelDesc{}, COMM_ENGINE_RESERVED, hcomm::HcommChannelKind::AICPU_TS_UBOE,
+              "FakeStatusChannel"),
+          status_(status)
+    {}
+    const HcommChannelDesc& GetChannelDesc() const override { return channelDesc_; }
+    void SetChannelDesc(const HcommChannelDesc& channelDesc) { channelDesc_ = channelDesc; }
     HcclResult GetNotifyNum(uint32_t* notifyNum) const override { return HCCL_SUCCESS; }
     HcclResult GetRemoteMems(uint32_t* memNum, CommMem** remoteMem, char*** memInfos) override { return HCCL_SUCCESS; }
     hcomm::ChannelStatus GetStatus() override { return status_; }
@@ -475,16 +1135,103 @@ public:
 
 private:
     hcomm::ChannelStatus status_;
+    HcommChannelDesc channelDesc_{};
 };
 
-// 将 channel 注册到 g_ChannelMap / g_ChannelD2HMap（deviceId=0，handle 即 channel 指针值）
+// 将 channel 注册到 ChannelMap / ChannelD2HMap（deviceId=0，handle 即 channel 指针值）
 static ChannelHandle RegisterFakeChannel(std::shared_ptr<hcomm::Channel> channel)
 {
     ChannelHandle handle = reinterpret_cast<ChannelHandle>(channel.get());
-    hcomm::ChannelProcess::g_ChannelMap[handle] = std::move(channel);
+    ChannelRegistry().ChannelMap()[handle] = std::move(channel);
     hcomm::DeviceChannelKey key{0, handle};
-    hcomm::ChannelProcess::g_ChannelD2HMap[key] = handle;
+    ChannelRegistry().ChannelD2HMap()[key] = handle;
     return handle;
+}
+
+// 注册到通道表中的非 CCU 通道应返回不支持，避免错误解读实体地址
+TEST_F(TestChannelProcess, Ut_CcuChannelGetEntity_When_ChannelIsNotCcu_Return_HCCL_E_NOT_SUPPORT)
+{
+    auto channel = std::make_shared<FakeChannelForProcess>(hcomm::HcommChannelKind::AICPU_TS_UBOE);
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    HcclSetThreadDeviceId(0);
+
+    HcommCcuChannelEntity channelEntity{};
+    auto ret = hcomm::ChannelProcess::CcuChannelGetEntity(handle, &channelEntity);
+    EXPECT_EQ(ret, HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(channelEntity.header.size, 0U);
+}
+
+// 未建立 transport 的 CCU 通道应返回未就绪，覆盖入口到 CcuUrmaChannel 的分发
+TEST_F(TestChannelProcess, Ut_CcuChannelGetEntity_When_CcuChannelNotReady_Return_HCCL_E_UNAVAIL)
+{
+    HcommChannelDesc desc{};
+    auto channel = std::make_shared<hcomm::CcuUrmaChannel>(nullptr, desc, COMM_ENGINE_RESERVED);
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    HcclSetThreadDeviceId(0);
+
+    HcommCcuChannelEntity channelEntity{};
+    auto ret = hcomm::ChannelProcess::CcuChannelGetEntity(handle, &channelEntity);
+    EXPECT_EQ(ret, HCCL_E_UNAVAIL);
+    EXPECT_EQ(channelEntity.header.size, 0U);
+}
+
+// 正常链路应完成 entity 装配，且同线程两次查询复用同一个远端 buffer 数组地址。
+TEST_F(TestChannelProcess, Ut_CcuChannelGetEntity_When_Normal_Expect_EntityAndTlsBufferReused)
+{
+    auto channel = std::make_shared<hcomm::CcuUrmaChannel>(nullptr, HcommChannelDesc{}, COMM_ENGINE_RESERVED);
+    hcomm::CcuChannelInfo channelInfo{};
+    channelInfo.channelId = 101U;
+    channelInfo.dieId = 1U;
+    static hcomm::UrmaEndpoint endpoint{EndpointDesc{}};
+    channel->ccuEndpoint_ = &endpoint;
+    channel->local_.socket = reinterpret_cast<Hccl::Socket*>(0x1);
+    channel->memHandles_.push_back(reinterpret_cast<HcommMemHandle>(0x1));
+    channel->isFirstPrintChannelInfo_ = false;
+    channel->channelStatus_ = hcomm::ChannelStatus::SOCKET_OK;
+
+    auto connection = std::make_unique<hcomm::CcuConnection>(
+        CommAddr{}, CommAddr{}, channelInfo, std::vector<hcomm::CcuJetty*>{}, Hccl::UB_QOS_DEFAULT);
+    connection->rmtCcuBufAddr_ = 0x10000U;
+    connection->rmtCcuBufSize_ = 0x1000U;
+    connection->rmtCcuBufTokenId_ = 10U;
+    connection->rmtCcuBufTokenValue_ = 20U;
+    auto impl = std::make_unique<hcomm::CcuTransport>(
+        reinterpret_cast<Hccl::Socket*>(0x1), std::move(connection), hcomm::CcuTransport::CclBufferInfo{});
+    impl->dieId_ = 1U;
+    impl->userDevId_ = 0;
+    impl->SetLocResStatus(hcomm::CcuTransport::CcuResStatus::RES_OK);
+    impl->locRes_.ckes = {10U, 11U};
+    impl->locRes_.xns = {20U, 21U};
+    impl->rmtRes_.ckes = {30U, 31U};
+    impl->rmtRes_.xns = {40U, 41U};
+    impl->transStatus_ = hcomm::CcuTransport::TransStatus::READY;
+    impl->rmtBufferVec_.push_back(
+        std::make_unique<Hccl::RemoteUbRmaBuffer>(0x20000U, 0x2000U, 11U, 12U, HCCL_MEM_TYPE_DEVICE, "ccu_user"));
+    channel->impl_ = std::move(impl);
+
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    MOCKER(hrtGetDevice).stubs().will(invoke(+[](int32_t* deviceId) -> HcclResult {
+        *deviceId = 0;
+        return HCCL_SUCCESS;
+    }));
+    const hcomm::CcuVersion version = hcomm::CcuVersion::CCU_V2;
+    MOCKER(hcomm::CcuDevMgrImp::GetCcuVersion)
+        .stubs()
+        .with(mockcpp::any(), outBound(version))
+        .will(returnValue(HCCL_SUCCESS));
+
+    HcommCcuChannelEntity firstEntity{};
+    ASSERT_EQ(hcomm::ChannelProcess::CcuChannelGetEntity(handle, &firstEntity), HCCL_SUCCESS);
+    ASSERT_EQ(firstEntity.remoteBufferNum, 1U);
+    ASSERT_NE(firstEntity.remoteBuffers, nullptr);
+    EXPECT_EQ(firstEntity.remoteBuffers[0].bufferInfo.rma.addr, 0x20000U);
+
+    HcommCcuChannelEntity secondEntity{};
+    ASSERT_EQ(hcomm::ChannelProcess::CcuChannelGetEntity(handle, &secondEntity), HCCL_SUCCESS);
+    EXPECT_EQ(secondEntity.remoteBuffers, firstEntity.remoteBuffers);
+
+    GlobalMockObject::verify();
+    GlobalMockObject::reset();
 }
 
 // ChannelGetStatus channelList 空指针测试
@@ -737,4 +1484,196 @@ TEST_F(TestChannelProcess, Ut_ConvertToLinkStatus_When_ResUnavail_Expect_Correct
     // 显式校验资源不足码值, 锁定 STC V2.0 契约
     EXPECT_EQ(hcomm::HCOMM_CHANNEL_STATUS_RES_LOC_UNAVAIL, 4);
     EXPECT_EQ(hcomm::HCOMM_CHANNEL_STATUS_RES_RMT_UNAVAIL, 5);
+}
+
+// ==================== ChannelGetMemUpdatePack：取通道当刻的待下发条目 ======
+namespace {
+// pack 内容可在两轮之间变化，用于验证两轮取包协议不是原子的
+class FakePackChannel : public FakeChannelForProcess {
+public:
+    explicit FakePackChannel(std::vector<char> pack)
+        : FakeChannelForProcess(hcomm::HcommChannelKind::AICPU_TS_URMA),
+          pack_(std::move(pack))
+    {}
+
+    std::vector<char> GetMemUpdatePack() override
+    {
+        callCnt_++;
+        if (growOnSecondCall_ && callCnt_ >= 2) {
+            return std::vector<char>(pack_.size() + 1, 0x5A);
+        }
+        return pack_;
+    }
+
+    void SetGrowOnSecondCall(bool grow) { growOnSecondCall_ = grow; }
+
+    uint32_t callCnt_{0};
+
+private:
+    std::vector<char> pack_;
+    bool growOnSecondCall_{false};
+};
+} // namespace
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_PackSizeNull_Return_E_PTR)
+{
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(0, nullptr, nullptr), HCCL_E_PTR);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_HandleNotInD2HMap_Return_E_NOT_FOUND)
+{
+    uint32_t packSize = 0;
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(0x1234, nullptr, &packSize), HCCL_E_NOT_FOUND);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_ChannelMapMiss_Return_E_INTERNAL)
+{
+    ChannelHandle hostHandle = 0x1234;
+    hcomm::DeviceChannelKey key{0, hostHandle};
+    ChannelRegistry().ChannelD2HMap()[key] = 0x5678;
+    uint32_t packSize = 0;
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(hostHandle, nullptr, &packSize), HCCL_E_INTERNAL);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_ChannelSlotNull_Return_E_INTERNAL)
+{
+    ChannelHandle hostHandle = 0x1234;
+    hcomm::DeviceChannelKey key{0, hostHandle};
+    ChannelRegistry().ChannelD2HMap()[key] = 0x5678;
+    ChannelRegistry().ChannelMap()[0x5678] = nullptr;
+    uint32_t packSize = 0;
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(hostHandle, nullptr, &packSize), HCCL_E_INTERNAL);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_DeviceEntityNotReady_Expect_SizeZeroAndNoPackQuery)
+{
+    auto channel = std::make_shared<FakePackChannel>(std::vector<char>(60, 0x11));
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    uint32_t packSize = 0;
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    // 未就绪直接短路，通道的取包虚槽一次都不调
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(handle, nullptr, &packSize), HCCL_SUCCESS);
+    EXPECT_EQ(packSize, 0U);
+    EXPECT_EQ(channel->callCnt_, 0U);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_BaseChannelPackEmpty_Expect_SizeZero)
+{
+    auto channel = std::make_shared<FakeChannelForProcess>(hcomm::HcommChannelKind::AICPU_TS_URMA);
+    channel->GetChannelEntity()->SetDeviceEntityReady();
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    uint32_t packSize = 0;
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    // 基类默认实现回空表，未覆写的通道按「无条目」处理
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(handle, nullptr, &packSize), HCCL_SUCCESS);
+    EXPECT_EQ(packSize, 0U);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_HostPackNull_Expect_RequiredSize)
+{
+    // 4 字节包头 + 2 条 28 字节条目
+    std::vector<char> pack(60, 0x11);
+    auto channel = std::make_shared<FakePackChannel>(pack);
+    channel->GetChannelEntity()->SetDeviceEntityReady();
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    uint32_t packSize = 0;
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(handle, nullptr, &packSize), HCCL_SUCCESS);
+    EXPECT_EQ(packSize, pack.size());
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_CapacitySmaller_Return_E_PARA)
+{
+    std::vector<char> pack(60, 0x11);
+    auto channel = std::make_shared<FakePackChannel>(pack);
+    channel->GetChannelEntity()->SetDeviceEntityReady();
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    char buffer[128] = {0};
+    uint32_t packSize = static_cast<uint32_t>(pack.size() - 1);
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(handle, buffer, &packSize), HCCL_E_PARA);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_CapacityEnough_Expect_CopyBytesAndKeepTail)
+{
+    std::vector<char> pack(60, 0x11);
+    auto channel = std::make_shared<FakePackChannel>(pack);
+    channel->GetChannelEntity()->SetDeviceEntityReady();
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    char buffer[128];
+    const size_t bufferSize = sizeof(buffer);
+    for (size_t i = 0; i < bufferSize; ++i) {
+        buffer[i] = 0x7F;
+    }
+    uint32_t packSize = static_cast<uint32_t>(bufferSize);
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(handle, buffer, &packSize), HCCL_SUCCESS);
+    EXPECT_EQ(packSize, pack.size());
+    EXPECT_EQ(memcmp(buffer, pack.data(), pack.size()), 0);
+    // 容量按调用方给的算，回写的长度之外不碰
+    EXPECT_EQ(static_cast<unsigned char>(buffer[pack.size()]), 0x7F);
+    EXPECT_EQ(static_cast<unsigned char>(buffer[bufferSize - 1]), 0x7F);
+}
+
+TEST_F(TestChannelProcess, Ut_ChannelGetMemUpdatePack_When_PackGrowsBetweenRounds_Return_E_PARA)
+{
+    auto channel = std::make_shared<FakePackChannel>(std::vector<char>(60, 0x11));
+    channel->GetChannelEntity()->SetDeviceEntityReady();
+    channel->SetGrowOnSecondCall(true);
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    char buffer[128] = {0};
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    uint32_t packSize = 0;
+    ASSERT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(handle, nullptr, &packSize), HCCL_SUCCESS);
+    ASSERT_EQ(packSize, 60U);
+
+    // 两轮之间包变大：按第一轮问到的长度拷贝会被拒
+    packSize = 60;
+    EXPECT_EQ(hcomm::ChannelProcess::ChannelGetMemUpdatePack(handle, buffer, &packSize), HCCL_E_PARA);
+}
+
+// ChannelGetDesc: channelDesc 空指针返回 E_PTR
+TEST_F(TestChannelProcess, Ut_ChannelGetDesc_When_DescNullptr_Return_HCCL_E_PTR)
+{
+    HcclResult ret = hcomm::ChannelProcess::ChannelGetDesc((ChannelHandle)0x1, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PTR);
+}
+
+// ChannelGetDesc: handle 未注册时返回错误
+TEST_F(TestChannelProcess, Ut_ChannelGetDesc_When_HandleNotFound_Return_Error)
+{
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+    HcommChannelDesc desc{};
+    HcclResult ret = hcomm::ChannelProcess::ChannelGetDesc((ChannelHandle)0x1234, &desc);
+    EXPECT_EQ(ret, HCCL_E_NOT_FOUND);
+}
+
+// ChannelGetDesc: 正常返回 channel 内保存的 desc
+TEST_F(TestChannelProcess, Ut_ChannelGetDesc_When_Normal_Return_ChannelDesc)
+{
+    auto channel = std::make_shared<FakeStatusChannel>(hcomm::ChannelStatus::READY);
+    HcommChannelDesc expectDesc{};
+    expectDesc.role = HCOMM_SOCKET_ROLE_SERVER;
+    expectDesc.socket = reinterpret_cast<HcommSocket>(0xABCD);
+    channel->SetChannelDesc(expectDesc);
+    ChannelHandle handle = RegisterFakeChannel(channel);
+    MOCKER(hrtGetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+
+    HcommChannelDesc desc{};
+    HcclResult ret = hcomm::ChannelProcess::ChannelGetDesc(handle, &desc);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    EXPECT_EQ(desc.role, HCOMM_SOCKET_ROLE_SERVER);
+    EXPECT_EQ(desc.socket, reinterpret_cast<HcommSocket>(0xABCD));
 }

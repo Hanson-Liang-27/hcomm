@@ -125,7 +125,7 @@ typedef struct HcclRootInfoDef {
 
 const uint32_t HCCL_COMM_CONFIG_INFO_BYTES = 24;
 const uint32_t HCCL_COMM_CONFIG_MAGIC_WORD = 0xf0f0f0f0;
-const uint32_t HCCL_COMM_CONFIG_VERSION = 11;
+const uint32_t HCCL_COMM_CONFIG_VERSION = 12;
 const uint32_t HCCL_COMM_DEFAULT_BUFFSIZE = 200;
 const uint32_t HCCL_COMM_BUFFSIZE_CONFIG_NOT_SET = 0xffffffff;
 const uint32_t HCCL_COMM_DEFAULT_DETERMINISTIC = 0;
@@ -138,6 +138,7 @@ const int32_t HCCL_COMM_EXECTIMEOUT_CONFIG_NOT_SET = 0xffffffff;
 // 0xffffffff表示用户未配置QoS
 const uint32_t HCCL_COMM_QOS_CONFIG_NOT_SET = 0xffffffff;
 const uint32_t HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET = 0xffffffff;
+const uint32_t HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET = 0xffffffff;
 const uint64_t HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE = 16ULL;
 
 typedef struct HcclCommConfigDef {
@@ -146,7 +147,8 @@ typedef struct HcclCommConfigDef {
     uint32_t hcclDeterministic;
     char hcclCommName[COMM_NAME_MAX_LENGTH];
     char hcclUdi[UDI_MAX_LENGTH];
-    uint32_t hcclOpExpansionMode; // 0:默认值 1:host 2:aicpu 3:aiv 4:CCU_MS 5:CCU_SCHED 6:AIV_ONLY
+    // 0:默认 1:host_ts 2:aicpu_ts 3:aiv 4:aiv_only 5:ccu_ms 6:ccu_sched 7:aicpu 8:ccu_ms_only 9:ccu_sched_only
+    uint32_t hcclOpExpansionMode;
     uint32_t hcclRdmaTrafficClass;
     uint32_t hcclRdmaServiceLevel;
     uint32_t hcclWorldRankID;
@@ -162,6 +164,7 @@ typedef struct HcclCommConfigDef {
     uint32_t hcclQos;
     uint64_t hcclSymWinMaxMemSizePerRank; // 对称内存预留VA大小, 单位GB
     uint32_t hcclChannelSqDepth;
+    uint32_t hcclChannelScqDepth;
 } HcclCommConfig;
 
 typedef enum {

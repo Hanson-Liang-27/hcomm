@@ -8,11 +8,21 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+include_directories(${HCOMM_VM_ROOT_PATH}/src)
 add_subdirectory(utils)
 add_subdirectory(common)
 add_subdirectory(proxy)
-add_subdirectory(runnerdb)
+# 把后端无关 storage 抽象层加入正式 hccl-vm 构建。
+add_subdirectory(storage)
+# 模拟器业务存储层：唯一装配入口，以及运行态、操作数据两个领域库。
+# hccl_vm 本身已是模拟器工程，不再增加无语义的 simulation 目录层级。
+add_subdirectory(storage_composition)
+add_subdirectory(runtime_state)
+add_subdirectory(operation_data)
 add_subdirectory(store)
+# 仿真插件(checker/runner/ccu_executor)对 hcomm 仓的依赖收敛于 ccu_microcode_v1.h
+# 一个自包含头, 已由顶层 HCCLVM_CCU_MICROCODE_DIR 解析(hcomm 仓优先, 否则 vendor
+# 副本), 所有构建模式均可编译
 add_subdirectory(plugin)
 add_subdirectory(cmd)
 add_subdirectory(topo)
@@ -23,7 +33,7 @@ add_library(hccl_plugin_objs OBJECT
 )
 target_include_directories(hccl_plugin_objs PRIVATE
     ${HCOMM_VM_ROOT_PATH}/include
-    ${HCOMM_VM_ROOT_PATH}/include/runnerdb
+    ${HCOMM_VM_ROOT_PATH}/include/runtime_state
     ${HCOMM_VM_ROOT_PATH}/include/store
     ${HCOMM_VM_ROOT_PATH}/src/cmd
     ${HCOMM_VM_ROOT_PATH}/src/common
@@ -36,12 +46,16 @@ target_include_directories(hccl_plugin_objs PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc
     ${ASCEND_CANN_PACKAGE_PATH}/include
     ${ASCEND_CANN_PACKAGE_PATH}/include/hccl
-    ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/common
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime
 )
+if(NOT BUILD_LEVEL1_ONLY)
+    target_include_directories(hccl_plugin_objs PRIVATE
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+    )
+endif()
 hcclvm_apply_common_flags(hccl_plugin_objs)
 
 add_executable(hccl-vm
@@ -53,12 +67,10 @@ message(STATUS "ASCEND_CANN_PACKAGE_PATH = ${ASCEND_CANN_PACKAGE_PATH}")
 target_include_directories(hccl-vm PRIVATE
     # hccl vm头文件
     ${HCOMM_VM_ROOT_PATH}/include
-    ${HCOMM_VM_ROOT_PATH}/include/runnerdb
+    ${HCOMM_VM_ROOT_PATH}/include/runtime_state
     ${HCOMM_VM_ROOT_PATH}/src/store
-    ${HCOMM_VM_ROOT_PATH}/src/runnerdb
+    ${HCOMM_VM_ROOT_PATH}/src/runtime_state
     ${HCOMM_VM_ROOT_PATH}/src/cmd
-
-    ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
 
     ${HCCL_VM_SRC}/store
 
@@ -85,6 +97,12 @@ target_include_directories(hccl-vm PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin
 )
 
+if(NOT BUILD_LEVEL1_ONLY)
+    target_include_directories(hccl-vm PRIVATE
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+    )
+endif()
+
 target_link_libraries(hccl-vm
     PRIVATE
     -Wl,--whole-archive
@@ -94,14 +112,16 @@ target_link_libraries(hccl-vm
     store
     topo
     loader
-    runnerdb
-    modeldb
+    # 主程序只链接公共 storage 合同；具体引擎由后端模块经收集器接入 storage
+    #（客户库依赖经 PUBLIC 传递），本层不出现具体后端名。
+    storage
+    runtime_state
+    operation_data
     log
     -Wl,--end-group
     -Wl,--no-whole-archive
     dl
     rt
-    sqlite3
     yaml-cpp::yaml-cpp
     CLI11::CLI11
     JSON::JSON

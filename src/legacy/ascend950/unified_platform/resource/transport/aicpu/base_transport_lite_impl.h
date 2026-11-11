@@ -21,6 +21,7 @@
 #include "mem_transport_common.h"
 #include "rmt_rma_buf_slice_lite.h"
 #include "task_param.h"
+#include "rma_buf_entry_lite.h"
 namespace Hccl {
 
 inline HcclReduceOp ConvertReduceOpToHcclReduceOp(ReduceOp reduceOp)
@@ -66,10 +67,11 @@ public:
         return HCCL_SUCCESS;
     }
 
-    virtual void Post(u32 index, const StreamLite& stream)
+    virtual HcclResult Post(u32 index, const StreamLite& stream)
     {
         (void)index;
         (void)stream;
+        return HCCL_SUCCESS;
     }
 
     virtual void Wait(u32 index, const StreamLite& stream)
@@ -85,18 +87,20 @@ public:
         (void)timeout;
     }
 
-    virtual void Read(const RmaBufferLite& loc, const Buffer& rmt, const StreamLite& stream)
+    virtual HcclResult Read(const RmaBufferLite& loc, const Buffer& rmt, const StreamLite& stream)
     {
         (void)loc;
         (void)rmt;
         (void)stream;
+        return HCCL_SUCCESS;
     }
 
-    virtual void Write(const RmaBufferLite& loc, const Buffer& rmt, const StreamLite& stream)
+    virtual HcclResult Write(const RmaBufferLite& loc, const Buffer& rmt, const StreamLite& stream)
     {
         (void)loc;
         (void)rmt;
         (void)stream;
+        return HCCL_SUCCESS;
     }
 
     virtual void
@@ -108,25 +112,27 @@ public:
         (void)stream;
     }
 
-    virtual void
+    virtual HcclResult
     WriteReduce(const RmaBufferLite& loc, const Buffer& rmt, const ReduceIn& reduceIn, const StreamLite& stream)
     {
         (void)loc;
         (void)rmt;
         (void)reduceIn;
         (void)stream;
+        return HCCL_SUCCESS;
     }
 
-    virtual void WriteWithNotify(
+    virtual HcclResult WriteWithNotify(
         const RmaBufferLite& loc, const Buffer& rmt, const WithNotifyIn& withNotify, const StreamLite& stream)
     {
         (void)loc;
         (void)rmt;
         (void)withNotify;
         (void)stream;
+        return HCCL_SUCCESS;
     }
 
-    virtual void WriteReduceWithNotify(
+    virtual HcclResult WriteReduceWithNotify(
         const RmaBufferLite& loc, const Buffer& rmt, const ReduceIn& reduceIn, const WithNotifyIn& withNotify,
         const StreamLite& stream)
     {
@@ -135,6 +141,7 @@ public:
         (void)reduceIn;
         (void)withNotify;
         (void)stream;
+        return HCCL_SUCCESS;
     }
 
     virtual void BatchOneSidedWrite(
@@ -166,6 +173,26 @@ public:
     virtual void Drain(const StreamLite& stream) { (void)stream; }
 
     virtual HcclResult Fence() { return HCCL_SUCCESS; }
+
+    // Clean 默认空实现：仅 UB 类型真正实现
+    virtual HcclResult Clean() { return HCCL_SUCCESS; }
+
+    // Resume 默认不支持：非 UB 类型返回 HCCL_E_INTERNAL
+    virtual HcclResult Resume(std::vector<char>& uniqueId)
+    {
+        (void)uniqueId;
+        return HCCL_E_INTERNAL;
+    }
+
+    // SetTaskExceptionEnable 默认空实现：仅 UB 覆写
+    virtual void SetTaskExceptionEnable(bool enabled) { (void)enabled; }
+
+    // UpdateMemInfoEntry 默认空实现：仅 UB 覆写（按地址 upsert 进 rmt 表）
+    virtual HcclResult UpdateMemInfoEntry(const RmaBufEntryLite& entry)
+    {
+        (void)entry;
+        return HCCL_SUCCESS;
+    }
 
 private:
 };

@@ -29,6 +29,11 @@ target_compile_options(hccl_plf PRIVATE
     $<$<CONFIG:Release>:-O3>
 )
 
+# 链接选项
+target_link_options(hccl_plf PRIVATE
+    $<$<BOOL:${BUILD_OPEN_PROJECT}>:-Wl,--no-undefined>
+)
+
 # 头文件搜索路径
 target_include_directories(hccl_plf PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/
@@ -63,6 +68,7 @@ target_include_directories(hccl_plf PRIVATE
     ${HCOMM_DIR}/src/base_comm/resources/hccp/inc/
     ${HCOMM_DIR}/src/base_comm/resources/hccp/inc/network
     ${HCOMM_DIR}/src/base_comm/common
+    ${HCOMM_DIR}/src/base_comm/inc
 
     ${HCOMM_DIR}/include
     ${HCOMM_DIR}/include/hccl/

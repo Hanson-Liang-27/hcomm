@@ -76,7 +76,6 @@ target_sources(hccl_v2_utest
         ${HCCL_V2_CODE_ROOT}/framework/resource_manager/transport/aicpu/connected_link_mgr.cc
 
         ${HCCL_V2_CODE_ROOT}/framework/resource_manager/connection/rma_conn_manager.cc
-        ${HCCL_V2_CODE_ROOT}/framework/resource_manager/connection/ub_ci_updater/ub_ci_updater_manager.cc
 
         ${HCCL_V2_CODE_ROOT}/framework/resource_manager/notify/queue_notify_manager.cc
         ${HCCL_V2_CODE_ROOT}/framework/resource_manager/notify/conn_local_notify_manager.cc
@@ -90,10 +89,10 @@ target_sources(hccl_v2_utest
         ${HCCL_V2_CODE_ROOT}/framework/env_config/env_config.cc
 
         ${HCOMM_DIR}/src/base_comm/common/debug/plf_debug_config.cc
+        ${HCOMM_DIR}/src/legacy/ascend910/platform/common/plf_resource_runtime.cc
 
         ${HCCL_V2_CODE_ROOT}/framework/misc/json_parser/json_parser.cc
         ${HCOMM_DIR}/src/coll_communicator_mgr/rank_info_detect/whitelist.cc
-        ${HCCL_V2_CODE_ROOT}/framework/misc/mask_event/mask_event.cc
 
         ${HCCL_V2_CODE_ROOT}/framework/resource_manager/transport/ub_memory_transport_mgr.cc
 
@@ -132,9 +131,6 @@ target_sources(hccl_v2_utest
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/connection/aicpu/rma_conn_lite.cc
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/connection/aicpu/ub_conn_lite.cc
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/connection/aicpu/ub_conn_lite_mgr.cc
-        ${HCCL_V2_CODE_ROOT}/unified_platform/resource/connection/aicpu/rdma_conn_lite_v2.cc
-
-        ${HCCL_V2_CODE_ROOT}/unified_platform/resource/connection/ub_ci_updater/ub_ci_updater.cc
 
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/socket/socket.cc
 
@@ -170,7 +166,6 @@ target_sources(hccl_v2_utest
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/stream/aicpu/stream_lite.cc
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/stream/aicpu/hccl_sqe.cc
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/stream/aicpu/sqe_mgr.cc
-        ${HCCL_V2_CODE_ROOT}/unified_platform/resource/stream/aicpu/hccl_sqe_v82.cc
 
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/transport/base_mem_transport.cc
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/transport/p2p_transport.cc
@@ -180,7 +175,6 @@ target_sources(hccl_v2_utest
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/transport/aicpu/mem_transport_lite.cc
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/transport/aicpu/ub_transport_lite_impl.cc
         ${HCCL_V2_CODE_ROOT}/unified_platform/resource/transport/aicpu/p2p_transport_lite_impl.cc
-        ${HCCL_V2_CODE_ROOT}/unified_platform/resource/transport/aicpu/roce_transport_lite_impl.cc
 
         ${HCCL_V2_CODE_ROOT}/unified_platform/ccu/ccu_device/ccu_device_manager.cpp
         ${HCCL_V2_CODE_ROOT}/unified_platform/ccu/ccu_device/ccu_res_specs.cpp

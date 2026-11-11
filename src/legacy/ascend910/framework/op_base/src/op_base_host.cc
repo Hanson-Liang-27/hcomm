@@ -27,6 +27,7 @@
 #include "hccl_group.h"
 #include "hcom_common.h"
 #include "coll_comm_mgr.h"
+#include "coll_comm.h" // HcclDevMemAcquire 的 DPUTAG 分支：CollComm/ThreadMgr 完整类型
 #include "rank_consistentcy_checker.h"
 #include "../common/src/topo/topoinfo_ranktable_partition.h"
 #include "mmpa_api.h"
@@ -1246,20 +1247,25 @@ HcclResult HcclCommDestroyWrapper([[maybe_unused]] struct hcclAsyncJob* job_)
         hccl::hcclComm* hcclComm = static_cast<hccl::hcclComm*>(comm);
         HcclComm commV2 = hcclComm->GetCommunicatorV2();
         CHK_PTR_NULL(commV2);
+        CHK_RET(HcclCommStateNotify(comm, HcclCommStatePhase::HCCL_COMM_STATE_PHASE_DESTROY_PRE));
         CHK_RET(HcclCommDestroyV2(
             commV2)); // 临时处理，dpustream的销毁要在其他资源销毁前完成。待新方案CpuThread上库后，原dpuStream删除可以恢复顺序
         string group = hcclComm->GetIdentifier();
         HcclOpInfoCtx& opBaseHcom = CollCommMgr::GetInstance().LegacyGetHcclOpInfoCtx();
-        std::unique_lock<std::mutex> lock(opBaseHcom.opGroupMapMutex);
-        auto iter = opBaseHcom.opGroup2CommMap.find(group);
-        if (iter != opBaseHcom.opGroup2CommMap.end()) {
-            EXCEPTION_CATCH(opBaseHcom.opGroup2CommMap.erase(group), return HCCL_E_MEMORY);
-        } else {
-            HCCL_ERROR(
-                "[HcclCommDestroy] comm is not exist, comm=%p, group=%s, deviceLogicId=%d", comm, group.c_str(),
-                deviceLogicId);
-            return HCCL_E_PARA;
+        // 与同步路径一致，释放管理表锁后再通知回调，避免重入通信域管理接口时死锁。
+        {
+            std::unique_lock<std::mutex> lock(opBaseHcom.opGroupMapMutex);
+            auto iter = opBaseHcom.opGroup2CommMap.find(group);
+            if (iter != opBaseHcom.opGroup2CommMap.end()) {
+                EXCEPTION_CATCH(opBaseHcom.opGroup2CommMap.erase(group), return HCCL_E_MEMORY);
+            } else {
+                HCCL_ERROR(
+                    "[HcclCommDestroy] comm is not exist, comm=%p, group=%s, deviceLogicId=%d", comm, group.c_str(),
+                    deviceLogicId);
+                return HCCL_E_PARA;
+            }
         }
+        CHK_RET(HcclCommStateNotify(comm, HcclCommStatePhase::HCCL_COMM_STATE_PHASE_DESTROY_POST));
         return HCCL_SUCCESS;
     }());
     hccl::hcclComm* hcclComm = static_cast<hccl::hcclComm*>(comm);
@@ -1437,4 +1443,26 @@ HcclResult HcclCommDestroy([[maybe_unused]] HcclComm comm)
         "Entry-HcclCommDestroy op_base comm destroy complete, take time [%lld]us, group[%s], deviceLogicId[%d].",
         DURATION_US(endut - startut), group.c_str(), deviceLogicId);
     return HCCL_SUCCESS;
+}
+
+// HcclDevMemAcquire 的 DPUTAG 分支：取址要 CollComm/ThreadMgr 完整类型，故落在本文件（仅 host 编译），
+// 与 device 共编的 op_base_mc2.cc 只留声明
+HcclResult HcclAcquireCpuTagShmemHost(HcclComm comm, uint64_t* size, void** addr, bool* newCreated)
+{
+    hccl::hcclComm* hcclComm = static_cast<hccl::hcclComm*>(comm);
+    hccl::CollComm* collComm = hcclComm->GetCollComm();
+    CHK_PTR_NULL(collComm);
+    // g_hcclDeviceId 是 thread_local 且初值 INVALID_INT，须先经 HcclGetThreadDeviceId 惰性初始化，
+    // 否则会把 0xFFFFFFFF 当 devId 下发；此处不硬失败（kernel 已拉起时 devId 不被消费），
+    // 兜底判参在 EnsureCpuKernelLaunched 的首次拉起分支
+    s32 devId = HcclGetThreadDeviceId();
+    if (devId == INVALID_INT) {
+        HCCL_WARNING("[HcclDevMemAcquire] thread device id is unavailable, DPUTAG devId unset");
+    }
+    hccl::ThreadMgr* threadMgr = collComm->GetThreadMgr();
+    CHK_PTR_NULL(threadMgr);
+    hccl::CpuThreadService* cpuService = threadMgr->GetCpuThreadService();
+    CHK_PTR_NULL(cpuService);
+    return cpuService->AcquireCpuTagShmem(
+        collComm->GetCommunicatorV2(), static_cast<uint32_t>(devId), size, addr, newCreated);
 }

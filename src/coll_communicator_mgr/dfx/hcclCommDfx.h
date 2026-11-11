@@ -12,6 +12,7 @@
 #define HCCL_COMM_DFX_H
 
 #include <memory>
+#include <atomic>
 #include "mirror_task_manager.h"
 #include "hcclCommProfiling.h"
 #include "global_mirror_tasks.h"
@@ -21,7 +22,8 @@
 #include <mutex>
 #include "buffer.h"
 #include "common.h"
-#include "hcclCommOp.h"
+#include "task_param.h"
+#include "task_info.h"
 #include <array>
 #include <atomic>
 #include "dpu_comm_dfx.h"
@@ -46,7 +48,7 @@ public:
 
     HcclResult ReportAllTasks(bool cachedReq);
     HcclResult ReportOp(uint64_t beginTime, bool cachedReq, bool isOpBase);
-    void ReportMc2CommInfo(const Mc2CommInfo& mc2CommInfo);
+    HcclResult ReportMc2CommInfo(const Mc2CommInfo& mc2CommInfo);
     HcclResult UpdateProfStat();
 
     static void AddChannelRemoteRankId(const std::string& commTag, u64 handle, u32 remoteRankId);
@@ -56,7 +58,8 @@ public:
         uint64_t beginTime, const std::string& commTag, const std::string& kernelName, uint32_t threadId,
         bool cachedReq);
     HcclResult GetOpModeFlags(bool& isOpBase, bool& isCached);
-    u64 GetGroupNameHash() const { return groupNameHash_; }
+    u64 GetGroupNameHash() const { return groupNameHash_.load(std::memory_order_relaxed); }
+    void RefreshGroupNameHash();
 
     // DPU 专属接口
     HcclResult AddDpuTaskInfoCallback(const Hccl::TaskParam& taskParam, u64 handle);
@@ -72,7 +75,8 @@ private:
     static std::unordered_map<u32, u32> streamIdToTaskId_;
     static std::shared_mutex baseLock_;
     std::string commTag_{};
-    u64 groupNameHash_{0};
+    std::atomic<u64> groupNameHash_{0};
+    uint64_t lastRefreshedVersion_{0};
     u32 deviceId_{0};
     u32 myRankId_{0};
     std::function<HcclResult(u32, u32, const Hccl::TaskParam&, u64)> setAddTaskCallback_{};

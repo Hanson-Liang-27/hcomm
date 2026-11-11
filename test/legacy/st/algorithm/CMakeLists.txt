@@ -83,12 +83,10 @@ set(legacy_framework_include_list
     ${HCOMM_LEGACY_FRAMEWORK}/resource_manager/buffer
     ${HCOMM_LEGACY_FRAMEWORK}/resource_manager/socket
     ${HCOMM_LEGACY_FRAMEWORK}/resource_manager/connection
-    ${HCOMM_LEGACY_FRAMEWORK}/resource_manager/connection/ub_ci_updater
     ${HCOMM_LEGACY_FRAMEWORK}/resource_manager/notify
     ${HCOMM_LEGACY_FRAMEWORK}/resource_manager/stream
     ${HCOMM_LEGACY_FRAMEWORK}/resource_manager/transport
 
-    ${HCOMM_LEGACY_FRAMEWORK}/misc/mask_event
     ${HCOMM_LEGACY_FRAMEWORK}/misc/json_parser
     ${HCOMM_LEGACY_FRAMEWORK}/misc/op_info
 
@@ -96,6 +94,8 @@ set(legacy_framework_include_list
 
     ${HCOMM_LEGACY_FRAMEWORK}/communicator
     ${HCOMM_LEGACY_FRAMEWORK}/communicator/aicpu
+    # HostDpu 共享类型头（dpu_types.h 等）已收敛到 base_comm 的 legacy_dpu_thread 目录，ST 侧须显式补该路径
+    ${HCOMM_ROOT_PATH}/src/base_comm/resources/comm_engine_res/threads/cpu_thread/legacy_dpu_thread
     ${HCOMM_LEGACY_FRAMEWORK}/dfx/common
     ${HCOMM_LEGACY_FRAMEWORK}/dfx/aicpu
     ${HCOMM_LEGACY_FRAMEWORK}/dfx/aicpu/common
@@ -155,7 +155,6 @@ set(legacy_platform_include_list
     ${HCOMM_LEGACY_PLATFORM}/resource/connection/aicpu
     ${HCOMM_LEGACY_PLATFORM}/resource/socket
     ${HCOMM_LEGACY_PLATFORM}/resource/notify
-    ${HCOMM_LEGACY_PLATFORM}/resource/connection/ub_ci_updater
     ${HCOMM_LEGACY_PLATFORM}/resource/transport
     ${HCOMM_LEGACY_PLATFORM}/external_system
     ${HCOMM_DIR}/src/legacy/ascend910/pub_inc/new

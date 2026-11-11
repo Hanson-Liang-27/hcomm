@@ -174,9 +174,9 @@ std::function<void()> CommManager::GetPrintChannelInfoCallback()
 
 HcclCommInfoV2& GetCommInfoV2(void)
 {
-    std::lock_guard<std::mutex> lock(g_commInfoV2CtxMutex);
     s32 logicDevId = 0;
     aclError ret = aclrtGetDevice(&logicDevId);
+    std::lock_guard<std::mutex> lock(g_commInfoV2CtxMutex);
     if (ret == ACL_SUCCESS && (static_cast<u32>(logicDevId) < ::MAX_MODULE_DEVICE_NUM)) {
         /* 当前线程获取到deviceId, 如果是首次使用该deviceId的HcomInfo, 先判断之前是否已经配置过 */
         HcclCommInfoV2& commInfoV2 = CommManager::GetInstance(logicDevId).GetCommInfoV2();
@@ -800,8 +800,8 @@ HcclResult CommManager::SetCommAcceleratorV2(Hccl::HcclCommunicator* communicato
 {
     CHK_PTR_NULL(communicator);
     if (accelerator < static_cast<int32_t>(HcclAccelerator::DEFAULT)
-        || accelerator > static_cast<int32_t>(HcclAccelerator::AICPU)) {
-        HCCL_ERROR("[SetCommAcceleratorV2] Invalid accelerator value [%d], valid range is [0,7]", accelerator);
+        || accelerator > static_cast<int32_t>(HcclAccelerator::CCU_SCHED_ONLY)) {
+        HCCL_ERROR("[SetCommAcceleratorV2] Invalid accelerator value [%d], valid range is [0,9]", accelerator);
         return HCCL_E_NOT_SUPPORT;
     }
     HcclAccelerator hcclAccelerator = static_cast<HcclAccelerator::Value>(accelerator);
@@ -809,7 +809,8 @@ HcclResult CommManager::SetCommAcceleratorV2(Hccl::HcclCommunicator* communicato
     HcclCommInfoV2& opbasedCommInfoV2 = GetCommInfoV2();
     // 通过进程锁看护，避免多个通信域同时占用CCU_MS
     std::unique_lock<std::mutex> lock(opbasedCommInfoV2.groupParamsLock);
-    if ((hcclAccelerator == HcclAccelerator::CCU_MS || hcclAccelerator == HcclAccelerator::CCU_SCHED)
+    if ((hcclAccelerator == HcclAccelerator::CCU_MS || hcclAccelerator == HcclAccelerator::CCU_SCHED
+         || hcclAccelerator == HcclAccelerator::CCU_MS_ONLY || hcclAccelerator == HcclAccelerator::CCU_SCHED_ONLY)
         && !isCcuAvailable) {
         HCCL_WARNING("CCU not support reuse in single device multi-process services, accelerator fallback AICPU_TS");
         hcclAccelerator = HcclAccelerator::AICPU_TS;

@@ -221,10 +221,8 @@ profile_cann_channel() { profile_row "$1" | cut -d'|' -f5; }   # CANN 下载通�
 show_help() {
     echo "HCCL-VM 一键安装脚本 $(version_line)"
     echo ""
-    echo "新手直接运行，无需任何参数（依赖自动安装；需确认的操作有终端时提示、超时按默认继续）:"
-    echo "  curl -fsSL https://raw.gitcode.com/cann/hcomm/raw/master/test/hccl_vm/hccl_vm_installer | bash"
-    echo "  curl -fsSL <URL> | bash -s -- --workspace /root/hvm   # 一键并指定工作目录"
-    echo "  （或下载后本地运行: bash hccl_vm_installer）"
+    echo "取得完整 CheckerL2 源码后，在仓库根目录直接运行:"
+    echo "  bash ./hccl_vm_installer"
     echo ""
     echo "脚本将自动完成以下 9 步："
     echo "  1-3. 检查环境、磁盘、安装依赖"
@@ -383,7 +381,7 @@ apply_defaults() {
     ASCEND_PATH=${ASCEND_PATH:-/usr/local/Ascend}
     HCOMM_PATH=${HCOMM_PATH:-${WORKSPACE}/hcomm}
     HCCL_PATH=${HCCL_PATH:-${WORKSPACE}/hccl}
-    CHECKER_PATH=${CHECKER_PATH:-${HCOMM_PATH}/test/hccl_vm}
+    CHECKER_PATH=${CHECKER_PATH:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)}
     # 路径统一绝对化：相对路径会在后续 cd 与 precheck_cann_path 的 dirname 回溯中出错
     WORKSPACE="$(to_abs "${WORKSPACE}")"
     ASCEND_PATH="$(to_abs "${ASCEND_PATH}")"
@@ -568,8 +566,6 @@ check_disk() {
     fi
 }
 
-# 选可用的 qemu 用户态模拟包名：默认传统名 qemu-user-static（22.04/24.04/25.04 均有）；
-# 新版 Ubuntu（26.04+）该名变虚拟包无安装候选，仅当 apt-cache 确认此情形时回退到 qemu-user-binfmt。
 pick_qemu_pkg() {
     command -v apt-cache >/dev/null 2>&1 || { echo qemu-user-static; return; }
     # 命令替换取值 + || true + 判空；不在 pipefail 管道里用 grep -q（-q 早退致上游 SIGPIPE 会误判失败）
@@ -590,7 +586,7 @@ pick_qemu_pkg() {
 dependency_list() {
     local deps=()
     if [ "${PKG_MGR}" = "apt" ]; then
-        deps=("git" "sudo" "build-essential" "cmake" "libsqlite3-dev" "libboost-all-dev" "rdma-core" "libibverbs-dev" "pkg-config" "python3" "python3-yaml")
+        deps=("git" "sudo" "build-essential" "cmake" "libboost-all-dev" "rdma-core" "libibverbs-dev" "pkg-config" "python3" "python3-yaml")
         [ "${SKIP_HCCL_TEST}" = false ] && deps+=("openmpi-bin" "libopenmpi-dev")
         # curl 列举镜像/取头、wget 下载 .run；仅下载 CANN 时需要（keep 从不下载）
         [ "${CANN_MODE}" != keep ]      && deps+=("curl" "wget" "python3-pip")
@@ -601,7 +597,7 @@ dependency_list() {
         fi
     elif [ "${PKG_MGR}" = "dnf" ]; then
         # HCE/openEuler/EulerOS：gcc gcc-c++ make 替代 build-essential；-devel 替代 -dev
-        deps=("git" "sudo" "gcc" "gcc-c++" "make" "cmake" "sqlite-devel" "boost-devel" "rdma-core" "libibverbs-devel" "pkgconf-pkg-config" "python3" "python3-pyyaml")
+        deps=("git" "sudo" "gcc" "gcc-c++" "make" "cmake" "boost-devel" "rdma-core" "libibverbs-devel" "pkgconf-pkg-config" "python3" "python3-pyyaml")
         [ "${SKIP_HCCL_TEST}" = false ] && deps+=("mpich" "mpich-devel")
         [ "${CANN_MODE}" != keep ]      && deps+=("curl" "wget" "python3-pip")
         # aarch64 在 HCE 上本机编译，无需交叉链；x86_64 在 HCE 上的交叉链包名暂不内置
@@ -610,7 +606,7 @@ dependency_list() {
 }
 
 # 确保 universe 源已启用（仅 apt 系）：精简/被裁过的 Ubuntu 只留 main 时，libboost-all-dev、openmpi-bin、
-# libopenmpi-dev、qemu-user-static 等（均在 universe 组件）会报 "Unable to locate package"。
+# libopenmpi-dev 等（均在 universe 组件）会报 "Unable to locate package"。
 # dnf 系（HCE/openEuler）所有包均在官方源，无需额外启用；调用时自动跳过。
 # 装依赖前调用；启用后不在此 apt-get update，交由 install_deps 紧接着的 update 统一刷新。
 ensure_universe_enabled() {
@@ -1239,11 +1235,41 @@ resolve_cann() {
 
 # 清理 third_party 下载缓存：build.sh 的第三方 cmake 按"文件是否存在"判定是否重下，
 # 一次下载失败留下的半包会被下次直接复用导致持续失败。编译失败时清掉下载归档，让重跑重新下载。
+# 覆盖两处下载归档：根 third_party/，以及各存储后端模块自己的 third_party/
+#（src/storage_backends/<模块>/third_party/——模块专属依赖配方同样只按存在性复用归档，
+# 例如 SQLite amalgamation zip；不硬编码模块名，只枚举实际存在的一级模块目录）。
+# 只删下载归档文件：不递归删除已解压源码目录，不动 build/install 与数据库文件；
+# 归档为符号链接且最终目标越出源码树时跳过（不跟随越界链接）；目录缺失/无匹配不报错。
 clean_thirdparty_dl_cache() {
     local tp="${CHECKER_PATH}/third_party"
-    [ -d "${tp}" ] || return 0
-    rm -f "${tp}"/*.tar.gz "${tp}"/*.tgz "${tp}"/*.zip 2>/dev/null || true
-    info "已清理 ${tp} 下的第三方下载归档（重跑本脚本会重新下载，规避半包缓存）。"
+    if [ -d "${tp}" ]; then
+        rm -f "${tp}"/*.tar.gz "${tp}"/*.tgz "${tp}"/*.zip 2>/dev/null || true
+        info "已清理 ${tp} 下的第三方下载归档（重跑本脚本会重新下载，规避半包缓存）。"
+    fi
+    local real_checker
+    real_checker="$(cd "${CHECKER_PATH}" 2>/dev/null && pwd -P)" || real_checker="${CHECKER_PATH}"
+    local mod_tp archive real_archive removed
+    for mod_tp in "${CHECKER_PATH}"/src/storage_backends/*/third_party; do
+        [ -d "${mod_tp}" ] || continue
+        removed=0
+        for archive in "${mod_tp}"/*.tar.gz "${mod_tp}"/*.tgz "${mod_tp}"/*.zip; do
+            [ -f "${archive}" ] || continue
+            real_archive="$(readlink -f "${archive}" 2>/dev/null)"
+            if [ -z "${real_archive}" ]; then
+                warn "跳过无法解析的缓存归档: ${archive}"
+                continue
+            fi
+            case "${real_archive}" in
+                "${real_checker}"/*) ;;
+                *) warn "跳过最终目标越出源码树的缓存归档: ${archive}"; continue ;;
+            esac
+            rm -f "${archive}"
+            removed=$((removed + 1))
+        done
+        if [ "${removed}" -gt 0 ]; then
+            info "已清理 ${mod_tp} 下的后端模块下载归档 x${removed}（重跑本脚本会重新下载，规避半包缓存）。"
+        fi
+    done
 }
 
 # 编译 HCCL-VM 工具（对应 README §3.1 的 bash ./build.sh --full）
@@ -1314,10 +1340,10 @@ build_hcomm_hccl_pkg() {
     info "编译日志: ${pkg_log}"
     local rc=0
     if [ "${VERBOSE}" = true ]; then
-        bash "${pkg_script}" --tool_path "${CHECKER_PATH}" 2>&1 | tee "${pkg_log}" || rc=${PIPESTATUS[0]}
+        HCCL_VM_PATH="${CHECKER_PATH}" bash "${pkg_script}" --tool_path "${CHECKER_PATH}" 2>&1 | tee "${pkg_log}" || rc=${PIPESTATUS[0]}
     else
         info "开始执行 build_pkg.sh。实时日志: tail -f ${pkg_log}"
-        bash "${pkg_script}" --tool_path "${CHECKER_PATH}" > "${pkg_log}" 2>&1 &
+        HCCL_VM_PATH="${CHECKER_PATH}" bash "${pkg_script}" --tool_path "${CHECKER_PATH}" > "${pkg_log}" 2>&1 &
         local pkg_pid=$!
         spin_on_pid "${pkg_pid}" "编译子包中"
         wait "${pkg_pid}" || rc=$?

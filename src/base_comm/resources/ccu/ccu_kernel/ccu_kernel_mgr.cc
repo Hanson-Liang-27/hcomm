@@ -9,6 +9,7 @@
  */
 
 #include "ccu_kernel_mgr.h"
+#include "ccu_device.h"
 
 #include <cstdint>
 
@@ -23,6 +24,7 @@
 #include "ccu_ins_generator_v1.h"
 #include "ccu_ins_generator_v2.h"
 #include "ccu_dev_mgr_imp.h"
+#include "base_comm_node_accessors.h"
 
 #include "ccu_rep_base_v1.h"
 #include "ccu_rep_block_v1.h"
@@ -33,6 +35,8 @@
 #include "ccu_log.h"
 #include "ccu_kernel_func.h"
 #include "config_plf_log_v2.h"
+
+#include "adapter_rts_common.h"
 
 namespace hcomm {
 
@@ -51,7 +55,21 @@ HcclResult GetHcclVersionForCcuKernelMgr(int& hcclVersion)
 
 constexpr int MAX_HCCL_VERSION_USING_CCU_RES_STATIC_ALLOC = 90100000;
 
+static void UnloadRes(CcuKernel& kernel, CcuResPack& resPack);
 static HcclResult ComputeKernelInstrRegionSize(CcuKernel* kernel, const int32_t userDevId, uint32_t& regionSize);
+
+namespace {
+    // 上层注入的级联计数器块解析回调：进程内共享，以 userDevId 区分设备，call_once 保证仅首次生效
+    CcuKernelMgr::CascCntResolver g_cascCntResolver = nullptr;
+    std::once_flag g_cascCntResolverOnce;
+} // namespace
+
+void CcuKernelMgr::SetCascCntResolver(CascCntResolver resolver)
+{
+    std::call_once(g_cascCntResolverOnce, [resolver]() {
+        g_cascCntResolver = resolver;
+    });
+}
 
 CcuKernelMgr::~CcuKernelMgr()
 {
@@ -69,25 +87,12 @@ CcuKernelMgr::~CcuKernelMgr()
     (void)Deinit();
 }
 
-CcuKernelMgr& CcuKernelMgr::GetInstance(const int32_t userDevId)
-{
-    static CcuKernelMgr kernelManager[MAX_MODULE_DEVICE_NUM + 1];
-
-    int32_t validUserDevId = userDevId;
-    if (validUserDevId < 0 || static_cast<uint32_t>(validUserDevId) >= MAX_MODULE_DEVICE_NUM) {
-        HCCL_WARNING(
-            "[CcuKernelMgr][%s] use the backup device, userDevId[%d] should be "
-            "less than %u.",
-            __func__, validUserDevId, MAX_MODULE_DEVICE_NUM);
-        validUserDevId = MAX_MODULE_DEVICE_NUM; // 使用备份设备
-    }
-
-    kernelManager[validUserDevId].userDevId_ = validUserDevId;
-    return kernelManager[validUserDevId];
-}
-
 HcclResult CcuKernelMgr::Init()
 {
+    // owner 须在 Init 前设定 userDevId_（窄访问器不再回写）；未设定即 Init 属非法调用，显式报错暴露
+    CHK_PRT_RET(
+        userDevId_ < 0, HCCL_ERROR("[CcuKernelMgr][%s] userDevId_[%d] not set before Init.", __func__, userDevId_),
+        HcclResult::HCCL_E_PARA);
     std::unique_lock<std::mutex> lock(kernelMapMutex_);
     if (initializedFlag_) {
         return HcclResult::HCCL_SUCCESS;
@@ -133,7 +138,49 @@ HcclResult CcuKernelMgr::Deinit()
     kernelMap_.clear();
     translators.clear();
     referenceMgrs.clear();
+    funcAddrs_.clear();
     return HcclResult::HCCL_SUCCESS;
+}
+
+// 级联计数器句柄可能由其他实例分配, 因此统一由实例管理器按句柄归属实例解析, 不能直接取注册实例的快照。
+// 解析能力由上层注入(见 SetCascCntResolver): 本模块不反向依赖实例管理模块, 避免双向编译期耦合。
+// 块内 totalCntXn/expectedCntXn/wishCntXns 均为 die 内索引, 故块归属 die 必须与 kernel 落定的 die 一致,
+// 否则翻译出的索引会指向错误的计数器, 这里显式拦截。
+// 解析结果在注册成功后固化为 kernel 快照, 后续下发不再回查实例管理器, 因此句柄所属实例(跨实例引用时
+// 可能不是注册实例)必须在 kernel 整个使用周期内存活; 若该实例先被销毁, 其块会被回收并可能被他人复用,
+// kernel 仍按旧快照翻译会等待/清零他人的计数器。
+static CcuResult ResolveCascCntBlocks(const int32_t userDevId, CcuKernel& kernel)
+{
+    const uint32_t kernelDieId = kernel.GetDieId();
+    std::unordered_map<HcommCcuCascCntHandle, CntXnBlock> cascCntBlocks{};
+    for (const HcommCcuCascCntHandle cntHandle : kernel.GetCascCntHandles()) {
+        CntXnBlock cascCntBlock{};
+        if (g_cascCntResolver == nullptr) {
+            HCCL_ERROR(
+                "[CcuKernelMgr][%s] failed, userDevId[%d], casc cnt block resolver is not injected.", __func__,
+                userDevId);
+            return CcuResult::CCU_E_INTERNAL;
+        }
+        CcuResult ret = g_cascCntResolver(userDevId, cntHandle, cascCntBlock);
+        if (ret != CcuResult::CCU_SUCCESS) {
+            HCCL_ERROR(
+                "[CcuKernelMgr][%s] failed, userDevId[%d] dieId[%u] to get casc cnt block by handle[%llu], ret[%d].",
+                __func__, userDevId, kernelDieId, static_cast<unsigned long long>(cntHandle),
+                static_cast<int32_t>(ret));
+            return ret;
+        }
+        if (static_cast<uint32_t>(cascCntBlock.dieId) != kernelDieId) {
+            HCCL_ERROR(
+                "[CcuKernelMgr][%s] failed, casc cnt handle[%llu] belongs to dieId[%u], but kernel dieId[%u], "
+                "userDevId[%d].",
+                __func__, static_cast<unsigned long long>(cntHandle), cascCntBlock.dieId, kernelDieId, userDevId);
+            return CcuResult::CCU_E_PARA;
+        }
+        cascCntBlocks.emplace(cntHandle, cascCntBlock);
+    }
+
+    kernel.SetCascCntBlock(cascCntBlocks);
+    return CcuResult::CCU_SUCCESS;
 }
 
 CcuResult CcuKernelMgr::Register(
@@ -163,6 +210,27 @@ CcuResult CcuKernelMgr::Register(
     kernelMap_[kernelId_] = std::move(currKernel_);
 
     kernelHandle = kernelId_;
+
+    CcuKernel* kernel = kernelMap_[kernelHandle].get();
+    // 解析级联计数器块需访问实例管理器, 必须提前释放 kernelMapMutex_:
+    // CcuInstanceMgr::Destroy 持 insMapMutex_ 销毁实例时会回调 UnRegister 取 kernelMapMutex_,
+    // 持锁反向调用两者会形成 AB-BA 死锁。
+    lock.unlock();
+    CcuResult resolveRet = ResolveCascCntBlocks(userDevId_, *kernel);
+    if (resolveRet != CcuResult::CCU_SUCCESS) {
+        // 回滚: 先把已转移至 kernel 的资源记录归还 resPack, 再注销 kernel 释放指令空间。
+        // UnRegister 失败时 kernel 仍残留在 kernelMap_ 且指令空间未释放, 至少记录日志便于定位泄漏。
+        UnloadRes(*kernel, resPack);
+        HcclResult unregisterRet = static_cast<HcclResult>(UnRegister(kernelHandle));
+        if (unregisterRet != HcclResult::HCCL_SUCCESS) {
+            HCCL_ERROR(
+                "[CcuKernelMgr][%s] rollback failed, userDevId[%d] kernelHandle[%llu] "
+                "resolveRet[%d] unregisterRet[%u].",
+                __func__, userDevId_, static_cast<unsigned long long>(kernelHandle), static_cast<int32_t>(resolveRet),
+                unregisterRet);
+        }
+        return resolveRet;
+    }
     return CcuResult::CCU_SUCCESS;
 }
 
@@ -198,7 +266,11 @@ CcuResult CcuKernelMgr::BuildKernel(
         // 按需创建的 ccu instance，校验所有 channel 使用相同的 die，然后将资源占用从 die 0 迁移到指定 die
         CCU_CHK_RET(currKernel_->ValidateAndApplyDie(dieId));
     }
-    CCU_CHK_RET(PrepareConstValueResources()); // 记录翻译过程所需常量并申请对应资源
+    // die 已落定，把该 die 的 func Addr 共享传参回填给命名 func 入口与间接调用点
+    const auto addrIt = funcAddrs_.find(static_cast<uint16_t>(currKernel_->GetDieId()));
+    CCU_CHK_RET(currKernel_->BindFuncAddr(addrIt == funcAddrs_.end() ? nullptr : &addrIt->second));
+    CCU_CHK_RET(PrepareConstValueResources());        // 记录翻译过程所需常量并申请对应资源
+    currKernel_->UpdateAddressableFuncPreludeCount(); // 常量已确定，回填可寻址func序言的指令数
     return CcuResult::CCU_SUCCESS;
 }
 
@@ -394,7 +466,33 @@ static void LoadRes(std::unique_ptr<CcuKernel>& kernel, CcuResPack& resPack)
     }
 
     kernel->SetResRepository(kernelResRepo);
-    kernel->SetCascCntBlock(resPack.GetCascCntBlocks());
+}
+
+// 与 LoadRes 对称：把已从 resPack 转移至 kernel 的资源记录原样归还，
+// 用于 Register 失败回滚，避免 kernel 销毁后这批资源记录从实例可用资源中永久丢失
+static void UnloadRes(CcuKernel& kernel, CcuResPack& resPack)
+{
+    CcuResRepository& totalResRepo = resPack.GetCcuResRepo();
+    CcuResRepository& kernelResRepo = kernel.GetResRepository();
+
+    auto restore = [](std::vector<ResInfo>& dest, std::vector<ResInfo>& source) {
+        dest.insert(dest.end(), source.begin(), source.end());
+        source.clear();
+    };
+
+    for (uint8_t i = 0; i < CCU_MAX_IODIE_NUM; i++) {
+        restore(totalResRepo.loopEngine[i], kernelResRepo.loopEngine[i]);
+        restore(totalResRepo.blockLoopEngine[i], kernelResRepo.blockLoopEngine[i]);
+        restore(totalResRepo.ms[i], kernelResRepo.ms[i]);
+        restore(totalResRepo.blockMs[i], kernelResRepo.blockMs[i]);
+        restore(totalResRepo.cke[i], kernelResRepo.cke[i]);
+        restore(totalResRepo.blockCke[i], kernelResRepo.blockCke[i]);
+        restore(totalResRepo.blockXn[i], kernelResRepo.blockXn[i]);
+        restore(totalResRepo.xn[i], kernelResRepo.xn[i]);
+        restore(totalResRepo.gsa[i], kernelResRepo.gsa[i]);
+        restore(totalResRepo.blockGsa[i], kernelResRepo.blockGsa[i]);
+        restore(totalResRepo.mission.mission[i], kernelResRepo.mission.mission[i]);
+    }
 }
 
 // 指令空间区域大小的唯一计算入口:
@@ -474,7 +572,8 @@ CcuResult CcuKernelMgr::PrepareConstValueResources()
         // 遍历每个rep，包括repBlock中的每个rep，将常量资源需求记录在currkernel中
         CCU_CHK_RET(insGenePtr->PrepareConstValue(curRepPtr, transDep, currKernel_.get()));
         if (curRepType == CcuRep::CcuRepType::BLOCK || curRepType == CcuRep::CcuRepType::FUNC_BLOCK
-            || curRepType == CcuRep::CcuRepType::LOOP_BLOCK) {
+            || curRepType == CcuRep::CcuRepType::LOOP_BLOCK
+            || curRepType == CcuRep::CcuRepType::ADDRESSABLE_FUNC_BLOCK) {
             CcuRep::CcuRepBlock* curRepBlockPtr = static_cast<CcuRep::CcuRepBlock*>(curRepPtr);
             CCU_CHK_PTR_NULL(curRepBlockPtr);
             for (const auto& repInBlock : curRepBlockPtr->GetReps()) {
@@ -828,10 +927,20 @@ HcclResult CcuKernelMgr::InstantiationTranslator(const uint16_t dieId)
         // 统计&合并refManager和translator所有资源REQ
         auto refMangerResReq = CcuRep::CcuRepReferenceManager::GetResReq(dieId);
         CcuResReq transLatorResReq;
-        CHK_RET(CcuRep::CcuRepTranslator::GetResReq(userDevId_, dieId, transLatorResReq));
+        CHK_RET(static_cast<HcclResult>(CcuRep::CcuRepTranslator::GetResReq(userDevId_, dieId, transLatorResReq)));
         MergeCcuResReq(totalResReq, refMangerResReq);
         MergeCcuResReq(totalResReq, transLatorResReq);
     }
+
+    // 跨kernel调用的传参与返回地址寄存器：caller与callee分属不同kernel和mission，必须落在同一批物理Xn上，
+    // 因此按die分配一份，不随mission划分。代价是同一die上同时只能有一条跨kernel调用链在执行。
+    // funcAddrs_ 与 translators/referenceMgrs 生命周期一致，在 Deinit 中同步 clear
+    auto& addr = funcAddrs_[dieId];
+    addr.argVars.resize(CCU_FUNC_XKERNEL_ARG_MAX);
+    CcuResReq addrResReq{};
+    addrResReq.xnReq[dieId] = CCU_FUNC_XKERNEL_ARG_MAX + 2; // 传参寄存器 + 返回地址寄存器 + 跳转暂存寄存器
+    MergeCcuResReq(totalResReq, addrResReq);
+
     DumpResReqInfo(totalResReq);
 
     // 为refManager和translator申请物理资源
@@ -844,6 +953,12 @@ HcclResult CcuKernelMgr::InstantiationTranslator(const uint16_t dieId)
         referenceMgrs[dieId][i]->GetRes(translatorRepRes);
         translators[dieId][i]->GetRes(translatorRepRes);
     }
+    // Addr 共享传参与离散Xn一起绑定物理资源；Variable拷贝共用同一个phyRes，Reset后各持有方都能看到物理Id
+    for (const auto& argVar : addr.argVars) {
+        translatorRepRes.variable[dieId].push_back(argVar);
+    }
+    translatorRepRes.variable[dieId].push_back(addr.retVar);
+    translatorRepRes.variable[dieId].push_back(addr.jumpScratch);
 
     CcuResRepository totalResRepository;
     CHK_RET(GetResPackTotalResRepository(translatorResPack, totalResRepository));

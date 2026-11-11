@@ -41,6 +41,8 @@
 #include "ccu_repeat_v1.h"
 #include "ccu_condition_v1.h"
 #include "ccu_rep_funcblock_v1.h"
+#include "ccu_rep_addr_funcblock_v1.h"
+#include "ccu_rep_addr_funccall_v1.h"
 #include "ccu_loopblock_v1.h"
 #include "ccu_loopcall_v1.h"
 #include "ccu_assist_pub.h"
@@ -70,6 +72,14 @@ struct CcuKernelInfo {
     uint32_t maxTaskArgsNum{0}; // taskArgs数组所需的元素个数，注册期间由LoadArg的argId推算: max(argId)+1，空则为0
 };
 
+// 跨kernel调用命名func时caller与callee共用的寄存器。两侧分属不同kernel与mission，各自私有的
+// 传参池和per-mission返回地址寄存器物理Id并不相同，必须统一到这批按die分配的共享Xn上。
+struct CcuFuncAddr {
+    std::vector<CcuRep::Variable> argVars; // 传参寄存器，下标即参数序号
+    CcuRep::Variable retVar;               // 返回地址寄存器
+    CcuRep::Variable jumpScratch;          // 调用点承载目标 pc 的跳转暂存寄存器
+};
+
 class CcuKernel : public CcuRep::CcuRepContext {
 public:
     CcuKernel() = default;
@@ -87,6 +97,9 @@ public:
 
     void SetResRepository(const CcuResRepository& resRepo);
     void SetCascCntBlock(const std::unordered_map<HcommCcuCascCntHandle, CntXnBlock>& cascCntBlocks);
+    // 记录 rep 序列引用到的级联计数器句柄, 供注册期按句柄归属实例解析出具体 block
+    void AddCascCntHandle(HcommCcuCascCntHandle cntHandle);
+    std::unordered_set<HcommCcuCascCntHandle> GetCascCntHandles();
     void SetInstrId(uint32_t instrId);
     HcclResult GetCascCntBlock(HcommCcuCascCntHandle cntHandle, CntXnBlock& cascCntBlock);
     uint32_t GetInstrId() const;
@@ -101,6 +114,9 @@ public:
     // 后续读者补 (CCU_XN_RAW_LATENCY - 1) 条 NOP. 仅 CCU_V2 生效.
     uint32_t GetLsxRepReserveCount() const;
     void SetCcuInstrInfo(const CcuRep::CcuInstrInfo& instrInfo);
+    // 获取下发硬件的最终指令信息 (V2 场景为后端优化后的序列). DFX 异常回查需据此把硬件 currentIns
+    // (优化后坐标) 通过 optToRawLocalIndex 翻译回 Rep 区间 (优化前坐标).
+    const CcuRep::CcuInstrInfo& GetCcuInstrInfo() const { return instrInfo_; }
 
     CcuResult GeneTaskParams(const uint64_t* taskArgs, uint32_t argsNum, std::vector<CcuTaskParam>& taskParams);
 
@@ -126,7 +142,9 @@ public:
 
     // process const values
     std::unordered_map<uint64_t, CcuRep::Variable>& GetConstValue2VarMap() { return constValue2VarMap; }
-    HcclResult Add2ConstValue2VarMap(std::vector<uint64_t>& values);
+    HcclResult
+    Add2ConstValue2VarMap(const std::vector<uint64_t>& values, const std::vector<uint64_t>& secretValues = {});
+    bool IsSecConstValue(uint64_t value) const;
 
     const std::unordered_set<ChannelHandle>& GetChannels() { return channels_; }
 
@@ -318,12 +336,26 @@ public:
     CcuResult FuncBlockEnd(uint64_t handle);
     CcuResult FuncDefineInArg(uint64_t handle, CcuVariableHandle formal);
     CcuResult FuncCall(uint64_t handle, const CcuVariableHandle* inArgs, uint32_t numIn);
+    // 命名 func 在声明处即绑定到当前 kernel，name 就是它在本 kernel 内的唯一身份
+    CcuResult FuncBlockBeginNamed(const char* name, uint64_t* outHandle);
+    CcuResult FuncCallByAddr(CcuVariableHandle funcPc, const CcuVariableHandle* inArgs, uint32_t numIn);
+    // 按 func 名查询入口指令 id，须在翻译之后调用
+    CcuResult GetFuncPc(const char* name, uint64_t* pc) const;
+    // 把本 die 的 func Addr 共享传参回填到组装期登记的命名 func 与间接调用点。
+    // 组装期 die 尚未确定（资源先记在 die 0），因此必须等 die 落定后再绑定。
+    CcuResult BindFuncAddr(const CcuFuncAddr* addr);
+    // 常量寄存器确定后，把可寻址 func 自包含序言的指令数告知其 FuncBlock，供指令空间统计
+    void UpdateAddressableFuncPreludeCount();
 
 private:
     CcuResult GetVariableByHandle(CcuVariableHandle varHandle, CcuRep::Variable** variable);
     CcuResult GetEventByHandle(CcuEventHandle eventHandle, CcuRep::CompletedEvent** event);
     CcuResult LatchBodyError(CcuResult err);
     CcuResult EnsureLoopEnginePool(uint32_t maxLoopNum);
+    // 登记一个要走 Addr 共享传参的调用点或命名 func 入口，入参个数超上限直接失败。
+    CcuResult RegisterAddrUser(uint32_t numIn);
+    // 新建 FuncBlock 并把录制点切进它，返回 handle；funcPtr 为空表示不按对象地址索引
+    uint64_t OpenFuncBlock(const void* funcPtr);
 
     CcuResult ValidateTaskArgs(const uint64_t* taskArgs, uint32_t argsNum) const;
     void FillTaskParam(
@@ -518,6 +550,7 @@ private:
 
     std::mutex cascCntBlockMutex_;
     std::unordered_map<HcommCcuCascCntHandle, CntXnBlock> cascCntBlocks_{};
+    std::unordered_set<HcommCcuCascCntHandle> cascCntHandles_{};
 
     std::unordered_set<ChannelHandle> channels_{};
 
@@ -543,6 +576,8 @@ private:
 
     // 记录每个kernel所需常量，适用于A6场景
     std::unordered_map<uint64_t, CcuRep::Variable> constValue2VarMap;
+    // 记录常量表中属于敏感信息(token)的值，装载到寄存器时用于打 secFlag 标记
+    std::unordered_set<uint64_t> secConstValueSet_;
 
     struct LoopDescriptor {
         std::string label;
@@ -573,9 +608,12 @@ private:
     struct FuncDescriptor {
         const void* funcPtr{nullptr};
         std::string label;
+        // 原 callfunc<>（匿名 func）用 repFuncBlock；命名 / 可寻址 func 用 repAddrFuncBlock，两条链路互不交叉
         std::shared_ptr<CcuRep::CcuRepFuncBlock> repFuncBlock;
+        std::shared_ptr<CcuRep::CcuRepAddressableFuncBlock> repAddrFuncBlock;
         std::shared_ptr<CcuRep::CcuRepBlock> prevActiveBlock;
         bool bodyDefined{false};
+        std::string name; // 非空即可被间接调用：入参改走中转寄存器，且可按名字查 pc
     };
 
     std::unordered_map<CcuLoop, LoopDescriptor> loopMap_;
@@ -589,6 +627,10 @@ private:
 
     std::unordered_map<uint64_t, FuncDescriptor> funcMap_;
     std::unordered_map<const void*, uint64_t> funcInstanceMap_;
+    std::unordered_map<std::string, uint64_t> funcNameMap_;
+    // 组装期登记、die 落定后统一回填 Addr 共享传参的命名 func 入口与间接调用点
+    std::vector<std::shared_ptr<CcuRep::CcuRepAddressableFuncBlock>> addrFuncBlocks_;
+    std::vector<std::shared_ptr<CcuRep::CcuRepAddrFuncCall>> addrFuncCalls_;
     uint64_t funcHandleCounter_{0};
     bool inFuncBody_{false};
     // loop/func body 内首个非法错误的粘性闩，退出 body 时上抛（void body 无法直接回传）。

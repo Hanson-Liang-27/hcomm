@@ -76,6 +76,11 @@ extern void RaHdcLitePeriodPollCqe(struct RaRdmaHandle* rdmaHandle);
 extern int RaHdcLiteCtxInit(struct RaRdmaHandle* rdmaHandle, unsigned int phyId, unsigned int rdevIndex);
 extern int RaIsFirstUsed(int insId);
 extern int RaIsLastUsed(int insId);
+extern struct HdcInfo gRaHdc[];
+extern int DlHalHdcGetSessionAttr(HDC_SESSION session, int attr, int* value);
+extern hdcError_t
+DlHalHdcRecv(HDC_SESSION session, struct drvHdcMsg* pMsg, int bufLen, UINT64 flag, int* recvBufCount, UINT32 timeout);
+extern int MsgHeadCheck(struct MsgHead* sendRcvHead, unsigned int opcode, int rsRet, unsigned int msgDataLen);
 
 struct MsgHead gMsgTmp;
 DLLEXPORT hdcError_t stub_drvHdcGetMsgBuffer_pid_error(struct drvHdcMsg* msg, int index, char** pBuf, int* pLen)
@@ -759,6 +764,84 @@ void TcHdcSendWrlist()
     TcHdcSendWrlistV2();
 }
 
+extern void RaHdcGetAllOpcodeVersion(unsigned int phyId);
+extern struct OpcodeInterfaceInfo gRaInterfaceInfoList[];
+int StubRaHdcProcessMsgAllVersionFail(unsigned int opcode, unsigned int deviceId, char* data, unsigned int dataSize)
+{
+    (void)opcode;
+    (void)deviceId;
+    (void)data;
+    (void)dataSize;
+    return -1;
+}
+int StubRaHdcGetOpcodeVersionOk(unsigned int phyId, unsigned int interfaceOpcode, unsigned int* interfaceVersion)
+{
+    (void)phyId;
+    (void)interfaceOpcode;
+    *interfaceVersion = 1;
+    return 0;
+}
+int StubRaHdcProcessMsgBatchOk(unsigned int opcode, unsigned int deviceId, char* data, unsigned int dataSize)
+{
+    (void)deviceId;
+    (void)dataSize;
+    if (opcode == RA_RS_GET_INTERFACE_VERSION) {
+        union OpGetVersionData* verInfo = (union OpGetVersionData*)data;
+        verInfo->rxData.version = 1;
+    } else if (opcode == RA_RS_BATCH_GET_INTERFACE_VERSION) {
+        union OpBatchGetVersionData* verInfo = (union OpBatchGetVersionData*)data;
+        verInfo->rxData.opcodeNum = verInfo->txData.opcodeNum;
+        for (unsigned int i = 0; i < verInfo->rxData.opcodeNum; i++) {
+            verInfo->rxData.version[i] = 2;
+        }
+    }
+    return 0;
+}
+int StubRaHdcProcessMsgBatchMismatch(unsigned int opcode, unsigned int deviceId, char* data, unsigned int dataSize)
+{
+    (void)deviceId;
+    (void)dataSize;
+    if (opcode == RA_RS_GET_INTERFACE_VERSION) {
+        union OpGetVersionData* verInfo = (union OpGetVersionData*)data;
+        verInfo->rxData.version = 1;
+    } else if (opcode == RA_RS_BATCH_GET_INTERFACE_VERSION) {
+        union OpBatchGetVersionData* verInfo = (union OpBatchGetVersionData*)data;
+        verInfo->rxData.opcodeNum = verInfo->txData.opcodeNum + 1;
+    }
+    return 0;
+}
+void TcRaHdcGetAllOpcodeVersionFallback()
+{
+    mocker_clean();
+    mocker_invoke((stub_fn_t)RaHdcProcessMsg, (stub_fn_t)StubRaHdcProcessMsgAllVersionFail, 1);
+    mocker_invoke((stub_fn_t)RaHdcGetOpcodeVersion, (stub_fn_t)StubRaHdcGetOpcodeVersionOk, 200);
+
+    RaHdcGetAllOpcodeVersion(0);
+
+    EXPECT_INT_EQ(gRaInterfaceInfoList[0].version, 1);
+    mocker_clean();
+}
+void TcRaHdcGetAllOpcodeVersionBatchSuccess()
+{
+    mocker_clean();
+    mocker_invoke((stub_fn_t)RaHdcProcessMsg, (stub_fn_t)StubRaHdcProcessMsgBatchOk, 10);
+
+    RaHdcGetAllOpcodeVersion(0);
+
+    EXPECT_INT_EQ(gRaInterfaceInfoList[0].version, 2);
+    mocker_clean();
+}
+void TcRaHdcGetAllOpcodeVersionBatchMismatch()
+{
+    mocker_clean();
+    mocker_invoke((stub_fn_t)RaHdcProcessMsg, (stub_fn_t)StubRaHdcProcessMsgBatchMismatch, 200);
+
+    RaHdcGetAllOpcodeVersion(0);
+
+    EXPECT_INT_EQ(gRaInterfaceInfoList[0].version, 1);
+    mocker_clean();
+}
+
 void TcHdcSendWr()
 {
     mocker_clean();
@@ -1278,6 +1361,114 @@ void TcHdcSocketRecvFail()
     EXPECT_INT_EQ(ret, -10);
     mocker((stub_fn_t)RaHdcSessionClose, 10, 0);
     TcHdcTestEnvDeinit();
+}
+
+void TcHdcSendRecvPktRecvCheckFail()
+{
+    mocker_clean();
+    TcHdcTestEnvInit();
+
+    mocker_invoke((stub_fn_t)drvHdcGetMsgBuffer, (stub_fn_t)stub_drvHdcGetMsgBuffer, 10);
+    struct MsgHead* testHead = (struct MsgHead*)gDrvRecvMsg;
+    union OpGetSecRandomData data = {0};
+    gDrvRecvMsgLen = 0;
+    int ret;
+
+    testHead->ret = 0;
+    ret = RaHdcProcessMsg(RA_RS_GET_SEC_RANDOM, gDevid, (char*)&data, sizeof(union OpGetSecRandomData));
+    EXPECT_INT_EQ(ret, -EPIPE);
+
+    testHead->ret = -EACCES;
+    ret = RaHdcProcessMsg(RA_RS_GET_SEC_RANDOM, gDevid, (char*)&data, sizeof(union OpGetSecRandomData));
+    EXPECT_INT_EQ(ret, -EAGAIN);
+
+    testHead->ret = -EPROTONOSUPPORT;
+    ret = RaHdcProcessMsg(RA_RS_GET_SEC_RANDOM, gDevid, (char*)&data, sizeof(union OpGetSecRandomData));
+    EXPECT_INT_EQ(ret, -EPROTONOSUPPORT);
+
+    testHead->ret = -EPERM;
+    ret = RaHdcProcessMsg(RA_RS_GET_SEC_RANDOM, gDevid, (char*)&data, sizeof(union OpGetSecRandomData));
+    EXPECT_INT_EQ(ret, -EPERM);
+
+    TcHdcTestEnvDeinit();
+}
+
+static DLLEXPORT drvError_t stub_drvHdcGetMsgBufferNullSession(struct drvHdcMsg* msg, int index, char** pBuf, int* pLen)
+{
+    gRaHdc[gDevid].session = NULL;
+    *pBuf = gDrvRecvMsg;
+    *pLen = gDrvRecvMsgLen;
+    return 0;
+}
+
+static int gDfxAttrQueryCnt = 0;
+static DLLEXPORT int stub_DlHalHdcGetSessionAttr(HDC_SESSION session, int attr, int* value)
+{
+    (void)session;
+    (void)attr;
+    gDfxAttrQueryCnt++;
+    if (value != NULL) {
+        *value = 0;
+    }
+    return 0;
+}
+
+void TcHdcSendRecvPktRecvCheckNullSession()
+{
+    mocker_clean();
+    TcHdcTestEnvInit();
+
+    // 取包时置空会话，命中 NULL 守卫分支；stub 仅作用于本次调用
+    mocker_invoke((stub_fn_t)drvHdcGetMsgBuffer, (stub_fn_t)stub_drvHdcGetMsgBufferNullSession, 1);
+    mocker_invoke((stub_fn_t)DlHalHdcGetSessionAttr, (stub_fn_t)stub_DlHalHdcGetSessionAttr, 10);
+    gDfxAttrQueryCnt = 0;
+
+    struct MsgHead* testHead = (struct MsgHead*)gDrvRecvMsg;
+    union OpGetSecRandomData data = {0};
+    gDrvRecvMsgLen = 0;
+    testHead->ret = 0;
+
+    int ret = RaHdcProcessMsg(RA_RS_GET_SEC_RANDOM, gDevid, (char*)&data, sizeof(union OpGetSecRandomData));
+    EXPECT_INT_EQ(ret, -EPIPE);
+    // NULL 场景下不得调用 DFX 查询，否则守卫形同虚设
+    EXPECT_INT_EQ(gDfxAttrQueryCnt, 0);
+
+    // session 保持为 NULL：deinit 时 HdcSendRecvPkt 在入口短路返回，不依赖上方 mock
+    TcHdcTestEnvDeinit();
+}
+
+void TcHdcSendRecvPktRecvTimeout()
+{
+    mocker_clean();
+    TcHdcTestEnvInit();
+
+    // 让 recv 层返回超时（DlHalHdcRecv 未被 init 打桩，可直接覆盖），命中 HDC broken 分支
+    mocker((stub_fn_t)DlHalHdcRecv, 10, -DRV_ERROR_WAIT_TIMEOUT);
+
+    union OpGetSecRandomData data = {0};
+    int ret = RaHdcProcessMsg(RA_RS_GET_SEC_RANDOM, gDevid, (char*)&data, sizeof(union OpGetSecRandomData));
+    EXPECT_INT_EQ(ret, -DRV_ERROR_WAIT_TIMEOUT);
+    EXPECT_INT_EQ(gRaHdc[gDevid].lastRecvStatus, -DRV_ERROR_WAIT_TIMEOUT);
+
+    gRaHdc[gDevid].lastRecvStatus = 0;
+    TcHdcTestEnvDeinit();
+}
+
+void TcHdcMsgHeadCheckMismatch()
+{
+    struct MsgHead head = {0};
+
+    head.ret = 0;
+    head.opcode = RA_RS_GET_SEC_RANDOM;
+    head.msgDataLen = 0;
+    EXPECT_INT_EQ(MsgHeadCheck(&head, RA_RS_GET_SEC_RANDOM, 0, 0), 0);
+
+    head.opcode = RA_RS_SOCKET_SEND;
+    EXPECT_INT_EQ(MsgHeadCheck(&head, RA_RS_GET_SEC_RANDOM, 0, 0), -EPERM);
+
+    head.opcode = RA_RS_GET_SEC_RANDOM;
+    head.msgDataLen = sizeof(union OpGetSecRandomData);
+    EXPECT_INT_EQ(MsgHeadCheck(&head, RA_RS_GET_SEC_RANDOM, 0, 0), -EPERM);
 }
 
 extern void RaHdcSendWrlistExtInitV2(

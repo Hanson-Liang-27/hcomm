@@ -16,15 +16,14 @@
 #include <string>
 #include <algorithm>
 #include "json_parser.h"
-#include "invalid_params_exception.h"
 #include "exception_util.h"
 #include "adapter_error_manager_pub.h"
 #include "rank_table_report_macro.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 
 namespace Hccl {
 
-void RankTableInfo::Check()
+HcclResult RankTableInfo::Check()
 {
     if (version != "2.0") {
         HCCL_ERROR(
@@ -33,8 +32,7 @@ void RankTableInfo::Check()
         RPT_INPUT_ERR(
             true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
             std::vector<std::string>({version, "version", "2.0"}));
-        THROW<InvalidParamsException>(
-            StringFormat("[RankTableInfo::%s] failed with version is not \"2.0\" in ranktable file.", __func__));
+        return HCCL_E_PARA;
     }
 
     if (rankCount > MAX_RANKCOUNT) {
@@ -45,9 +43,7 @@ void RankTableInfo::Check()
         HCCL_ERROR(
             "[%s][%s] errNo[0x%016llx] rankCount[%u] exceeds maximum limit[%u]", LOG_KEYWORDS_INIT_GROUP.c_str(),
             LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rankCount, MAX_RANKCOUNT);
-        THROW<InvalidParamsException>(StringFormat(
-            "[RankTableInfo::%s] failed with rankCount [%u] exceeds maximum limit of [%u]", __func__, rankCount,
-            MAX_RANKCOUNT));
+        return HCCL_E_PARA;
     }
 
     if (rankCount == 0) {
@@ -57,8 +53,7 @@ void RankTableInfo::Check()
         HCCL_ERROR(
             "[%s][%s] errNo[0x%016llx] rankCount is 0", LOG_KEYWORDS_INIT_GROUP.c_str(),
             LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA));
-        THROW<InvalidParamsException>(StringFormat(
-            "[RankTableInfo::%s] failed with rankCount [%u] exceeds minimum limit of [%u]", __func__, rankCount, 0));
+        return HCCL_E_PARA;
     }
 
     if (rankCount != ranks.size()) {
@@ -70,10 +65,7 @@ void RankTableInfo::Check()
         HCCL_ERROR(
             "[%s][%s] errNo[0x%016llx] rankCount[%u] != ranks.size[%zu]", LOG_KEYWORDS_INIT_GROUP.c_str(),
             LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rankCount, ranks.size());
-        THROW<InvalidParamsException>(StringFormat(
-            "[RankTableInfo::%s] failed with rankCount is not equal "
-            "to rank_list size. version[%s], rankCount[%u], ranks.size[%u]",
-            __func__, version.c_str(), rankCount, ranks.size()));
+        return HCCL_E_PARA;
     }
 
     std::unordered_set<u32> rankIdSet;
@@ -88,10 +80,7 @@ void RankTableInfo::Check()
             HCCL_ERROR(
                 "[%s][%s] errNo[0x%016llx] rankId[%d] out of range [0,%u)", LOG_KEYWORDS_INIT_GROUP.c_str(),
                 LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rank.rankId, rankCount);
-            THROW<InvalidParamsException>(StringFormat(
-                "[Parse][ClusterInfo][RankTableInfo::%s] failed with rank_id is "
-                "out of range. version[%s], rankCount[%u], rank_id[%d]",
-                __func__, version.c_str(), rankCount, rank.rankId));
+            return HCCL_E_PARA;
         }
         if (rankIdSet.count(rank.rankId) > 0) {
             RPT_INPUT_ERR(
@@ -100,10 +89,7 @@ void RankTableInfo::Check()
             HCCL_ERROR(
                 "[%s][%s] errNo[0x%016llx] rankId[%d] is repeat", LOG_KEYWORDS_INIT_GROUP.c_str(),
                 LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rank.rankId);
-            THROW<InvalidParamsException>(StringFormat(
-                "[Parse][ClusterInfo][RankTableInfo::%s] failed with rank_id is "
-                "repeat. version[%s], rankCount[%u], rank_id[%d]",
-                __func__, version.c_str(), rankCount, rank.rankId));
+            return HCCL_E_PARA;
         }
         rankIdSet.insert(rank.rankId);
 
@@ -117,10 +103,7 @@ void RankTableInfo::Check()
                 "[%s][%s] errNo[0x%016llx] replacedLocalId[%u] != localId[%u]", LOG_KEYWORDS_INIT_GROUP.c_str(),
                 LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rank.replacedLocalId,
                 rank.localId);
-            THROW<InvalidParamsException>(StringFormat(
-                "[Parse][ClusterInfo][RankTableInfo::Check] "
-                "failed with replacedLocalId[%u] not equal to localId[%u].",
-                rank.replacedLocalId, rank.localId));
+            return HCCL_E_PARA;
         } else if (rank.localId == BACKUP_LOCAL_ID) {
             if (recordedReplaceLocalId == UNDEFIEND_LOCAL_ID) {
                 recordedReplaceLocalId = rank.replacedLocalId;
@@ -131,8 +114,7 @@ void RankTableInfo::Check()
                 HCCL_ERROR(
                     "[%s][%s] errNo[0x%016llx] multiple replaced rank is configured", LOG_KEYWORDS_INIT_GROUP.c_str(),
                     LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA));
-                THROW<InvalidParamsException>(StringFormat("[Parse][ClusterInfo][RankTableInfo::Check] "
-                                                           "multiple replaced rank is configured"));
+                return HCCL_E_PARA;
             }
         } else {
             localIdSet.emplace(rank.localId);
@@ -147,17 +129,14 @@ void RankTableInfo::Check()
             HCCL_ERROR(
                 "[%s][%s] errNo[0x%016llx] rankId[%u] is not continuous", LOG_KEYWORDS_INIT_GROUP.c_str(),
                 LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rankRange);
-            THROW<InvalidParamsException>(StringFormat(
-                "[Parse][ClusterInfo][RankTableInfo::%s] failed with rank_id is "
-                "not continuous. version[%s], rankCount[%u], rankRange[%d]",
-                __func__, version.c_str(), rankCount, rankRange));
+            return HCCL_E_PARA;
         }
     }
 
     std::vector<std::unordered_map<std::string, u32>> verifyRankAddr;
     for (auto& rank : ranks) {
         for (auto& levelInfo : rank.rankLevelInfos) {
-            InsertToRank(levelInfo.netInstId, levelInfo.rankAddrs.size(), verifyRankAddr, levelInfo.netLayer);
+            CHK_RET(InsertToRank(levelInfo.netInstId, levelInfo.rankAddrs.size(), verifyRankAddr, levelInfo.netLayer));
         }
     }
 
@@ -171,83 +150,96 @@ void RankTableInfo::Check()
             "[%s][%s] errNo[0x%016llx] configuring same local_id[%u] with replaced one simultaneously",
             LOG_KEYWORDS_INIT_GROUP.c_str(), LOG_KEYWORDS_RANKTABLE_CHECK.c_str(),
             HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), recordedReplaceLocalId);
-        THROW<InvalidParamsException>(StringFormat(
-            "[Parse][ClusterInfo][RankTableInfo::%s] failed with configuring "
-            "same local_id[%u] with replaced one simultaneously",
-            __func__, recordedReplaceLocalId));
+        return HCCL_E_PARA;
     }
+    return HCCL_SUCCESS;
 }
 
-void RankTableInfo::Deserialize(const nlohmann::json& rankTableInfoJson, bool isCheck, RankTableSource source)
+HcclResult RankTableInfo::Deserialize(const nlohmann::json& rankTableInfoJson, bool isCheck, RankTableSource source)
 {
     source_ = source;
-    std::string msgVersion = "error occurs when parser object of propName \"version\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgVersion, (version = GetJsonProperty(rankTableInfoJson, "version")),
-        rankTableInfoJson, "version", "non-empty string", source_);
-    std::string msgStatus = "error occurs when parser object of propName \"status\"";
+    HcclResult ret = GetJsonProperty(rankTableInfoJson, "version", true, version);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(rankTableInfoJson, "version", "non-empty string", source_);
+        return ret;
+    }
 
     std::string detourStr;
-    std::string msgDetour = "error occurs when parser object of propName \"detour\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgDetour, (detourStr = GetJsonProperty(rankTableInfoJson, "detour", false)),
-        rankTableInfoJson, "detour", "non-empty string", source_);
+    ret = GetJsonProperty(rankTableInfoJson, "detour", false, detourStr);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(rankTableInfoJson, "detour", "non-empty string", source_);
+        return ret;
+    }
     if (detourStr == "true") {
         detour = true;
     } else if (detourStr == "false" || detourStr == "") {
         detour = false;
     } else {
-        THROW<InvalidParamsException>(StringFormat("Invalid detour value [%s]", detourStr.c_str()));
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>({detourStr, "detour", "\"true\" or \"false\""}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] invalid detour value[%s]", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), detourStr.c_str());
+        return HCCL_E_PARA;
     }
 
-    std::string msgRankcount = "error occurs when parser object of propName \"rank_count\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgRankcount, (rankCount = GetJsonPropertyUInt(rankTableInfoJson, "rank_count")),
-        rankTableInfoJson, "rank_count", "0 ~ UINT32_MAX", source_);
+    ret = GetJsonPropertyUInt(rankTableInfoJson, "rank_count", true, 0, rankCount);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(rankTableInfoJson, "rank_count", "0 ~ UINT32_MAX", source_);
+        return ret;
+    }
 
     nlohmann::json rankJsons;
-    std::string msgRanklist = "error occurs when parser object of propName \"rank_list\"";
-    TRY_CATCH_THROW_REPORT(
-        InvalidParamsException, msgRanklist, (GetJsonPropertyList(rankTableInfoJson, "rank_list", rankJsons)),
-        rankTableInfoJson, "rank_list", "array", source_);
+    ret = GetJsonPropertyList(rankTableInfoJson, "rank_list", rankJsons);
+    if (ret != HCCL_SUCCESS) {
+        ReportJsonConfigError(rankTableInfoJson, "rank_list", "array", source_);
+        return ret;
+    }
     for (auto& rankJson : rankJsons) {
         NewRankInfo rankInfo;
-        rankInfo.Deserialize(rankJson, source_);
+        CHK_RET(rankInfo.Deserialize(rankJson, source_));
         ranks.emplace_back(rankInfo);
     }
 
     // check
     if (isCheck) {
-        Check();
+        CHK_RET(Check());
     }
     // 排序后保证 ranks[i].rankId == i，RankGraphBuilder::AddFabricInfo 等用
     // rankId 做数组下标访问 ranks[rankId] 时不会错位。
     std::sort(ranks.begin(), ranks.end(), [](const NewRankInfo& a, const NewRankInfo& b) {
         return a.rankId < b.rankId;
     });
+    return HCCL_SUCCESS;
 }
 
-void RankTableInfo::CheckAndInsert(
+HcclResult RankTableInfo::CheckAndInsert(
     const std::string& levelId, u32 rankAddrSize, std::unordered_map<std::string, u32>& idRankSizeMap) const
 {
     if (idRankSizeMap.find(levelId) != idRankSizeMap.end() && idRankSizeMap[levelId] != rankAddrSize) {
-        THROW<InvalidParamsException>(StringFormat(
-            "[RankTableInfo::%s] failed with the size of "
-            "rank_addrs with the same id is different. leveId[%s],"
-            "rankAddrSize[%u]",
-            __func__, levelId.c_str(), rankAddrSize));
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>({std::to_string(rankAddrSize), levelId, std::to_string(idRankSizeMap[levelId])}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] rank_addrs size[%u] for id[%s] is different from existing[%u]",
+            LOG_KEYWORDS_INIT_GROUP.c_str(), LOG_KEYWORDS_RANKTABLE_CHECK.c_str(),
+            HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), rankAddrSize, levelId.c_str(), idRankSizeMap[levelId]);
+        return HCCL_E_PARA;
     }
     idRankSizeMap[levelId] = rankAddrSize;
+    return HCCL_SUCCESS;
 }
 
-void RankTableInfo::InsertToRank(
+HcclResult RankTableInfo::InsertToRank(
     const std::string& levelId, u32 rankAddrSize, std::vector<std::unordered_map<std::string, u32>>& rankLists,
     u32 levelNum) const
 {
     if (rankLists.size() <= levelNum) {
         rankLists.resize(levelNum + 1);
     }
-    CheckAndInsert(levelId, rankAddrSize, rankLists[levelNum]);
+    CHK_RET(CheckAndInsert(levelId, rankAddrSize, rankLists[levelNum]));
+    return HCCL_SUCCESS;
 }
 
 std::string RankTableInfo::Describe() const
@@ -282,28 +274,32 @@ RankTableInfo::RankTableInfo(BinaryStream& binaryStream)
     binaryStream >> detour;
 }
 
-void RankTableInfo::GetBinStream(bool isContainLocId, BinaryStream& binaryStream) const
+HcclResult RankTableInfo::GetBinStream(bool isContainLocId, BinaryStream& binaryStream) const
 {
     if (ranks.size() == 0) {
-        std::string msg = StringFormat("ranks size is zero.");
-        THROW<InvalidParamsException>(msg);
+        RPT_INPUT_ERR(
+            true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>({"0", "ranks", "non-empty"}));
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] ranks size is zero", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA));
+        return HCCL_E_PARA;
     }
     HCCL_INFO("[%s] version[%s] rankCount[%u] ranks size[%u]", __func__, version.c_str(), rankCount, ranks.size());
 
     binaryStream << version << rankCount;
     binaryStream << ranks.size();
     for (auto& it : ranks) {
-        it.GetBinStream(isContainLocId, binaryStream);
+        CHK_RET(it.GetBinStream(isContainLocId, binaryStream));
     }
     binaryStream << detour;
+    return HCCL_SUCCESS;
 }
 
 vector<char> RankTableInfo::GetUniqueId(bool isContainLocId) const
 {
-    if (ranks.size() == 0) {
-        std::string msg = StringFormat("ranks size is zero.");
-        THROW<InvalidParamsException>(msg);
-    }
+    CHK_PRT_THROW(
+        ranks.empty(), HCCL_ERROR("[%s] ranks size is zero.", __func__), InvalidParamsException, "ranks size is zero");
     std::vector<char> result(0);
 
     BinaryStream binaryStream;
@@ -312,42 +308,61 @@ vector<char> RankTableInfo::GetUniqueId(bool isContainLocId) const
     u32 ranksSize = ranks.size();
     binaryStream << ranksSize;
     for (auto& it : ranks) {
-        it.GetBinStream(isContainLocId, binaryStream);
+        CHK_RET_THROW(
+            InvalidParamsException, "[RankTableInfo::GetUniqueId] NewRankInfo GetBinStream failed",
+            it.GetBinStream(isContainLocId, binaryStream));
     }
 
     binaryStream.Dump(result);
     return result;
 }
 
-void RankTableInfo::UpdateRankTable(const RankTableInfo& localRankInfo)
+HcclResult RankTableInfo::UpdateRankTable(const RankTableInfo& localRankInfo)
 {
     // version
     if (detour) {
-        CHK_PRT_THROW(
-            localRankInfo.detour != true, HCCL_ERROR("[%s] detour cfg is not same with other ranks.", __func__),
-            InvalidParamsException, "updateRankTableInfo error");
+        RPT_INPUT_ERR(
+            localRankInfo.detour != true, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>({"false", "detour", "true"}));
+        CHK_PRT_RET(
+            localRankInfo.detour != true,
+            HCCL_ERROR(
+                "[%s][%s] errNo[0x%016llx] detour config is not consistent", LOG_KEYWORDS_INIT_GROUP.c_str(),
+                LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA)),
+            HCCL_E_PARA);
     }
     detour = localRankInfo.detour;
     if (rankCount == 0) {
         version = localRankInfo.version;
     } else {
-        CHK_PRT_THROW(
+        RPT_INPUT_ERR(
+            version != localRankInfo.version, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+            std::vector<std::string>({version, "version", localRankInfo.version}));
+        CHK_PRT_RET(
             version != localRankInfo.version,
             HCCL_ERROR(
-                "[%s] version[%s] error, local version[%s] .", __func__, version.c_str(),
-                localRankInfo.version.c_str()),
-            InvalidParamsException, "updateRankTableInfo error");
+                "[%s][%s] errNo[0x%016llx] version[%s] is not consistent with local version[%s]",
+                LOG_KEYWORDS_INIT_GROUP.c_str(), LOG_KEYWORDS_RANKTABLE_CHECK.c_str(),
+                HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), version.c_str(), localRankInfo.version.c_str()),
+            HCCL_E_PARA);
     }
 
     // ranks size
-    CHK_PRT_THROW(
-        localRankInfo.ranks.size() == 0, HCCL_ERROR("[%s] ranks size is zero.", __func__), InvalidParamsException,
-        "updateRankTableInfo error");
+    RPT_INPUT_ERR(
+        localRankInfo.ranks.size() == 0, "EI0014", std::vector<std::string>({"value", "variable", "expect"}),
+        std::vector<std::string>({"0", "ranks", "non-empty"}));
+    CHK_PRT_RET(
+        localRankInfo.ranks.size() == 0,
+        HCCL_ERROR(
+            "[%s][%s] errNo[0x%016llx] ranks size is zero", LOG_KEYWORDS_INIT_GROUP.c_str(),
+            LOG_KEYWORDS_RANKTABLE_CHECK.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA)),
+        HCCL_E_PARA);
 
     ranks.insert(ranks.end(), localRankInfo.ranks.begin(), localRankInfo.ranks.end());
     rankCount++;
 
     HCCL_INFO("[%s] success, current rankTableInfo[%s]", __func__, Describe().c_str());
+    return HCCL_SUCCESS;
 }
 
 std::unordered_map<u32, std::unordered_map<IpAddress, u32>> RankTableInfo::GetRankDeviceListenPortMap()

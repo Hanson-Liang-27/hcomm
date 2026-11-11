@@ -28,9 +28,15 @@ namespace CcuRep {
         constexpr uint8_t URMA_DMA_OP_READ = 0x6;  // UB URMA WQEBB opcode: read
         constexpr uint8_t URMA_DMA_OP_WRITE = 0x3; // UB URMA WQEBB opcode: write
         constexpr uint8_t URMA_DMA_OP_WRITE_WITH_CNT_INC
-            = 0x1A;                                   // UB URMA WQEBB opcode: write with cascade counter increase
-        constexpr uint8_t SPLIT_MODE_PACKET = 1;      // TransMem按包为单位切分
-        constexpr uint32_t REL_JMP_INSTR_NUM = 9;     // RelJmp生成的指令数
+            = 0x1A;                              // UB URMA WQEBB opcode: write with cascade counter increase
+        constexpr uint8_t SPLIT_MODE_PACKET = 1; // TransMem按包为单位切分
+        constexpr uint16_t TRANSMEM_LEN_GUARD_SKIP_OFFSET = 6; // Jump落点: 跳过超限分支 5 条, 落到正常路径的 TransMem
+        constexpr uint32_t REL_JMP_INSTR_NUM = 9; // RelJmp生成的指令数
+        // commXn的最后一个，对应translator里的var[XN_NUM - 1]（见 CcuRepTranslator::BindResource）
+        constexpr uint32_t COMM_XN_LAST_INDEX = 2;
+        static_assert(
+            COMM_XN_LAST_INDEX == sizeof(TransDep::commXn) / sizeof(TransDep::commXn[0]) - 1,
+            "COMM_XN_LAST_INDEX must point at the last element of TransDep::commXn");
         constexpr uint32_t FUNC_CALL_JMP_OFFSET = 11; // RelJmp+Jump+Nop
         constexpr uint32_t FUNC_CALL_RET_OFFSET = 12; // FUNC_CALL_JMP_OFFSET + 1
         // loopParamVar 布局：iterNum[12:0] gsaOffset[44:13] ctxId[52:45]
@@ -38,6 +44,7 @@ namespace CcuRep {
         constexpr uint32_t LOOP_GSA_OFFSET_SHIFT = 13;
         constexpr uint64_t LOOP_GSA_OFFSET_MASK = 0xFFFFFFFFULL;
         constexpr uint64_t LOOP_FIELD_MASK = 0x7FULL;
+        constexpr uint64_t LSX_NUM_GUARD_JMP_OFFSET = 2; // 护栏跳距: 从 Jump 跳过陷阱 Wait 落到 lsx
 
         template <typename T>
         void LoadAddrArg(CcuInstr*& instr, const T& dst, const T& src)
@@ -220,7 +227,7 @@ namespace CcuRep {
         auto tokenInfo = GetToken(tokenId, tokenValue, 1);
 
         CcuV2::LoadImdToXn(instr++, repRemMem->GetRem().addr.Id(), addr);
-        CcuV2::LoadImdToXn(instr++, repRemMem->GetRem().token.Id(), tokenInfo);
+        CcuV2::LoadImdToXn(instr++, repRemMem->GetRem().token.Id(), tokenInfo, CCU_LOAD_TO_XN_SEC_INFO);
 
         return HcclResult::HCCL_SUCCESS;
     }
@@ -231,7 +238,7 @@ namespace CcuRep {
         CHK_PTR_NULL(ccuRepLocCpy);
         if (ccuRepLocCpy->GetReduceFlag() == 0 && ccuRepLocCpy->GetUseCcuBuffer() == true) {
             uint16_t firstBufId;
-            CHK_RET(ccuRepLocCpy->GetFirstBufId(firstBufId));
+            CHK_RET(static_cast<HcclResult>(ccuRepLocCpy->GetFirstBufId(firstBufId)));
             CcuV2::CacheConfig cacheConfig{0x0, 0x0};
             CcuV2::TransLocMemToLocMem(
                 instr++, ccuRepLocCpy->GetDstAddrId(), ccuRepLocCpy->GetDstTokenId(), ccuRepLocCpy->GetSrcAddrId(),
@@ -491,11 +498,16 @@ namespace CcuRep {
             uint64_t ckeAddr = dep.xnBaseAddr[ccuRepRecordSharedNotify->GetNotify().DieId()]
                                + CCU_RESOURCE_XN_V2_RESERVE_SIZE
                                + (ccuRepRecordSharedNotify->GetNotify().Id() * CCU_RESOURCE_CKE_PER_SIZE);
+            // ckeAddr 依赖 imported notify 的真实 (Id, DieId)，二者在 RegisterEnd 的
+            // ProcessInterCtxRes 链接后才确定，构建期常量登记时仍是默认值，不能走
+            // kernel 常量表。翻译期链接已完成，此处直接以立即数写入公共 XN(commXn[2],
+            // V2 中无其他读者)，StoreXToMem 随后读取该 XN 作为对端 cke 地址。
+            CcuV2::AssignI(instr++, dep.commXn[2], ckeAddr);
             const auto& constValue2VarMap = ccuKernel->GetConstValue2VarMap();
             CcuV2::CacheConfig cacheConfig{0x0, 0x0};
             CcuV2::StoreXToMem(
                 instr++,
-                constValue2VarMap.at(ckeAddr).Id(),                             // 对端cke xn
+                dep.commXn[2],                                                  // 对端cke xn
                 constValue2VarMap.at(dep.memTokenInfo).Id(),                    // 对端cke xn token
                 constValue2VarMap.at(ccuRepRecordSharedNotify->GetMask()).Id(), // cke mask
                 constValue2VarMap.at(CCU_RESOURCE_CKE_MASK_LENGTH).Id(),        // cke mask，2字节
@@ -506,6 +518,9 @@ namespace CcuRep {
         } else {
             CcuV2::SetCKE(
                 instr++, ccuRepRecordSharedNotify->GetNotify().Id(), ccuRepRecordSharedNotify->GetMask(), 0, 0, 1);
+            // 补 Nop 对齐条数至 V2_RECORD_SHARED_NOTIFY_INSTR_NUM(3)
+            CcuV2::Nop(instr++);
+            CcuV2::Nop(instr++);
         }
 
         return HcclResult::HCCL_SUCCESS;
@@ -860,6 +875,22 @@ namespace CcuRep {
         return HcclResult::HCCL_SUCCESS;
     }
 
+    // 可寻址 func 的容器 kernel 通常不被 Launch，mission 序言不会执行，func 入口必须自己把保留资源和
+    // 常量寄存器初始化一遍，否则被别的 kernel 跳进来执行时这些寄存器是未定义的。
+    void CcuInsGeneratorV2::GenAddressableFuncPrelude(
+        CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, const TransDep& dep) const
+    {
+        CcuV2::AssignI(instr++, dep.reserveXnId, 0);
+        CcuV2::AssignI(instr++, dep.commXn[COMM_XN_LAST_INDEX], 0); // mission 序言里对应 var[XN_NUM - 1]
+        SetCKEInstr(instr++, dep.reserveCkeId, 0xffff, 0, 0, 1);
+        curInstrId += FUNC_PRELUDE_FIXED_INSTR_NUM;
+        for (const auto& elem : ccuKernel->GetConstValue2VarMap()) {
+            uint16_t secFlag = ccuKernel->IsSecConstValue(elem.first) ? CCU_LOAD_TO_XN_SEC_INFO : 0;
+            CcuV2::LoadImdToXn(instr++, elem.second.Id(), elem.first, secFlag);
+            curInstrId++;
+        }
+    }
+
     HcclResult CcuInsGeneratorV2::CcuRepFuncBlockTranslate(
         [[maybe_unused]] CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepFuncBlock* funcBlockPtr,
         const TransDep& dep, uint32_t step)
@@ -906,6 +937,49 @@ namespace CcuRep {
             curInstrId++;
         } else {
             HCCL_ERROR("Unsupported step[%d] for CcuRepFuncBlockTranslate", step);
+            return HCCL_E_PARA;
+        }
+        return HcclResult::HCCL_SUCCESS;
+    }
+
+    // 新 callfunc 链路：命名 func 定义块的翻译。入口紧跟一段自包含序言，把跨 kernel 共用的中转寄存器
+    // 拷进本 func 的形参；尾声取共享返回地址寄存器跳回调用点。
+    HcclResult CcuInsGeneratorV2::CcuRepAddressableFuncBlockTranslate(
+        CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepAddressableFuncBlock* funcBlockPtr,
+        const TransDep& dep, uint32_t step)
+    {
+        CHK_PTR_NULL(funcBlockPtr);
+        if (step == 0) {
+            // 函数入口为nop
+            CcuV2::Nop(instr++);
+            curInstrId++;
+            // 命名 func 从中转寄存器取回形参，序言必须紧跟入口指令，入口指令的 instrId 才是对外发布的 pc
+            GenAddressableFuncPrelude(ccuKernel, instr, curInstrId, dep);
+            const std::vector<Variable> formalIns = funcBlockPtr->GetInArgVars();
+            const std::vector<Variable>& transferIns = funcBlockPtr->GetTransferInVars();
+            CHK_PRT_RET(
+                formalIns.size() != transferIns.size(),
+                HCCL_ERROR(
+                    "[AddressableFuncBlock] transfer arg count %zu mismatch formal count %zu", transferIns.size(),
+                    formalIns.size()),
+                HCCL_E_PARA);
+            for (uint32_t i = 0; i < formalIns.size(); i++) {
+                CcuV2::Add(instr++, formalIns[i].Id(), transferIns[i].Id(), dep.reserveXnId);
+                curInstrId++;
+            }
+        } else if (step == 1) {
+            // 返回调用处：可寻址 func 的调用方可能是别的 kernel，返回地址取共享寄存器
+            const Variable* sharedRet = funcBlockPtr->GetSharedRetVar();
+            CHK_PTR_NULL(sharedRet);
+            uint16_t retXnId = sharedRet->Id();
+            uint32_t relJmpInstrNum = REL_JMP_INSTR_NUM; // relJmp需要9条指令
+            CcuV2::RelJmp(instr, retXnId, curInstrId + relJmpInstrNum, dep.commXn[0], dep.commXn[1]);
+            instr += relJmpInstrNum;
+            curInstrId += relJmpInstrNum;
+            CcuV2::Jump(instr++, retXnId, dep.reserveXnId, dep.reserveXnId, 0);
+            curInstrId++;
+        } else {
+            HCCL_ERROR("Unsupported step[%d] for CcuRepAddressableFuncBlockTranslate", step);
             return HCCL_E_PARA;
         }
         return HcclResult::HCCL_SUCCESS;
@@ -992,6 +1066,47 @@ namespace CcuRep {
 
         uint32_t extraInstrNum = GetInstrCount(funcCallPtr->Type());
         LoadFuncCallOutArgs(funcInstr, inArgCount + extraInstrNum, outArgs, funcManager, dep.reserveXnId);
+        return HcclResult::HCCL_SUCCESS;
+    }
+
+    // 新 callfunc 链路：命名 func 按 pc 的调用。实参统一写入中转寄存器，返回地址写进
+    // 共享返回寄存器，被调 func 入口序言再把中转寄存器拷进形参。
+    HcclResult CcuInsGeneratorV2::CcuRepAddrFuncCallTranslate(
+        [[maybe_unused]] CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepAddrFuncCall* funcCallPtr,
+        const TransDep& dep)
+    {
+        (void)instr;
+        (void)curInstrId;
+
+        AddrFuncCallContext ctx;
+        CHK_RET(PrepareAddrFuncCallContext(funcCallPtr, ctx));
+
+        std::vector<CcuRepArg>& inArgs = funcCallPtr->GetInArgs();
+        uint32_t inArgCount = ctx.inArgCount;
+        CcuInstr* funcInstr = ctx.instr;
+        std::vector<Variable>& formalIns = ctx.formalIns;
+        Variable funcAddrVar = funcCallPtr->GetFuncAddrVar();
+        uint16_t instrId = funcCallPtr->StartInstrId();
+        LoadFuncCallInArgs(funcInstr, inArgs, formalIns, dep.reserveXnId);
+
+        // 目标 pc 装进共享跳转暂存寄存器，再跳过去；寄存器全部来自按 die 的 Addr 共享资源
+        const Variable* jumpScratch = funcCallPtr->GetJumpScratchVar();
+        CHK_PTR_NULL(jumpScratch);
+        uint32_t locId = 0;
+        CcuV2::Add(funcInstr + inArgCount + locId++, jumpScratch->Id(), funcAddrVar.Id(), dep.reserveXnId);
+        // 被调 func 可能在别的 kernel，返回地址必须写进两侧共用的寄存器
+        const Variable* sharedRet = funcCallPtr->GetSharedRetVar();
+        CHK_PTR_NULL(sharedRet);
+        CcuV2::LoadImdToXn(
+            funcInstr + inArgCount + locId++, sharedRet->Id(),
+            instrId + inArgCount + FUNC_CALL_RET_OFFSET); // 需要指向函数返回位置
+        CcuV2::RelJmp(
+            funcInstr + inArgCount + locId, jumpScratch->Id(),
+            instrId + inArgCount + FUNC_CALL_JMP_OFFSET, // Jmp的目标指令为其后11条指令
+            dep.commXn[0], dep.commXn[1]);
+        locId += REL_JMP_INSTR_NUM; // relJmp需要9条指令
+        CcuV2::Jump(funcInstr + inArgCount + locId++, jumpScratch->Id(), dep.reserveXnId, dep.reserveXnId, 0);
+        CcuV2::Nop(funcInstr + inArgCount + locId++);
         return HcclResult::HCCL_SUCCESS;
     }
 
@@ -1365,10 +1480,30 @@ namespace CcuRep {
         notify.xnId = writeCntIncPtr->GetIncCntAddrId();
         notify.xntId = writeCntIncPtr->GetIncCntTokenId();
         notify.value = 1;
-        CcuV2::TransMem(
-            instr++, writeCntIncPtr->GetRemAddrId(), writeCntIncPtr->GetRemTokenId(), writeCntIncPtr->GetLocAddrId(),
-            writeCntIncPtr->GetLocTokenId(), writeCntIncPtr->GetLenId(), writeCntIncPtr->GetChannelVarId(), notify,
-            reduce, config, 0, 0);
+
+        const uint16_t lenId = writeCntIncPtr->GetLenId();
+        const uint16_t lenLimitXnId = dep.commXn[0];
+        const uint16_t skipOffsetXnId = dep.commXn[1];
+        auto emitTransMem = [&]() {
+            CcuV2::TransMem(
+                instr++, writeCntIncPtr->GetRemAddrId(), writeCntIncPtr->GetRemTokenId(),
+                writeCntIncPtr->GetLocAddrId(), writeCntIncPtr->GetLocTokenId(), lenId,
+                writeCntIncPtr->GetChannelVarId(), notify, reduce, config, 0, 0);
+        };
+
+        // 超限分支自带一份 TransMem 并以陷阱 Wait 收尾: TransMem 异步执行, 若放行到后续指令, 可能在它报错前
+        // 整个 mission 已跑完, 或后续指令改写 len/token 等寄存器导致 DFX 回读失真. 陷阱 Wait 同寄存器
+        // NOT_EQUAL 恒不成立, 卡到 TransMem 报错或硬件超时. 正常路径直接跳到第二份 TransMem, 不增加开销.
+        CcuV2::LoadImdToXn(instr++, lenLimitXnId, CCU_WRITE_CNT_INC_LEN_LIMIT);
+        CcuV2::LoadImdToXn(instr++, skipOffsetXnId, TRANSMEM_LEN_GUARD_SKIP_OFFSET);
+        CcuV2::Jump(instr++, skipOffsetXnId, lenId, lenLimitXnId, static_cast<uint16_t>(ConditionType::LESS_EQUAL));
+        CcuV2::Assign(instr++, writeCntIncPtr->GetOrigLenId(), lenId);
+        CcuV2::LoadImdToXn(instr++, writeCntIncPtr->GetLocTokenId(), CCU_GUARD_TOKEN_INVALID_VALUE);
+        CcuV2::LoadImdToXn(instr++, lenId, CCU_WRITE_CNT_INC_LEN_LIMIT);
+        emitTransMem();
+        CcuV2::Wait(instr++, lenLimitXnId, lenLimitXnId, static_cast<uint16_t>(ConditionType::NOT_EQUAL));
+
+        emitTransMem();
         return HcclResult::HCCL_SUCCESS;
     }
 
@@ -1380,7 +1515,7 @@ namespace CcuRep {
         (void)curInstrId;
         (void)dep;
 
-        CntXnBlock cascCntBlock;
+        CntXnBlock cascCntBlock{};
         CHK_RET(ccuKernel->GetCascCntBlock(cascCntWaitPtr->GetCntHandle(), cascCntBlock));
         cascCntWaitPtr->SetCascCntBlock(cascCntBlock);
 
@@ -1400,7 +1535,7 @@ namespace CcuRep {
         (void)curInstrId;
         (void)dep;
 
-        CntXnBlock cascCntBlock;
+        CntXnBlock cascCntBlock{};
         CHK_RET(ccuKernel->GetCascCntBlock(cascCntClearPtr->GetCntHandle(), cascCntBlock));
         cascCntClearPtr->SetCascCntBlock(cascCntBlock);
 
@@ -1411,6 +1546,18 @@ namespace CcuRep {
         return HcclResult::HCCL_SUCCESS;
     }
 
+    // 硬件不校验 LoadX/StoreX 的 offset 边界, offset >= arraySize 时会读写到数组外的寄存器.
+    // 陷阱是一条同寄存器 NOT_EQUAL 的 Wait: 条件恒不成立, 越界时卡死等硬件超时中断.
+    // 跳距为编译期常量, 后端在 Jump 与 lsx 之间补 NOP 时由 FixPlainJumpOffset 按真实距离改写.
+    void CcuInsGeneratorV2::EmitLsxBoundGuard(
+        CcuInstr*& instr, uint16_t offsetXnId, uint16_t arraySize, const TransDep& dep) const
+    {
+        CcuV2::LoadImdToXn(instr++, dep.commXn[0], arraySize);
+        CcuV2::LoadImdToXn(instr++, dep.commXn[1], LSX_NUM_GUARD_JMP_OFFSET);
+        CcuV2::Jump(instr++, dep.commXn[1], offsetXnId, dep.commXn[0], static_cast<uint16_t>(ConditionType::LESS_THAN));
+        CcuV2::Wait(instr++, dep.commXn[0], dep.commXn[0], static_cast<uint16_t>(ConditionType::NOT_EQUAL));
+    }
+
     HcclResult CcuInsGeneratorV2::CcuRepLoadAddImmTranslate(
         CcuKernel* ccuKernel, CcuInstr*& instr, uint16_t& curInstrId, CcuRepLoadAddImm* loadAddImmPtr,
         const TransDep& dep)
@@ -1418,8 +1565,8 @@ namespace CcuRep {
         CHK_PTR_NULL(loadAddImmPtr);
         (void)ccuKernel;
         (void)curInstrId;
-        (void)dep;
 
+        EmitLsxBoundGuard(instr, loadAddImmPtr->GetSrcOffsetId(), loadAddImmPtr->GetSrcNum(), dep);
         CcuV2::LoadX(
             instr++, loadAddImmPtr->GetDstId(), loadAddImmPtr->GetSrcId(), loadAddImmPtr->GetSrcOffsetId(),
             loadAddImmPtr->GetImmAddValue(), 0, 0, 0);
@@ -1433,8 +1580,8 @@ namespace CcuRep {
         CHK_PTR_NULL(storeAddImmPtr);
         (void)ccuKernel;
         (void)curInstrId;
-        (void)dep;
 
+        EmitLsxBoundGuard(instr, storeAddImmPtr->GetDstOffsetId(), storeAddImmPtr->GetDstNum(), dep);
         CcuV2::StoreX(
             instr++, storeAddImmPtr->GetDstId(), storeAddImmPtr->GetSrcId(), storeAddImmPtr->GetImmAddValue(),
             storeAddImmPtr->GetDstOffsetId(), 0, 0, 0);
@@ -1484,7 +1631,7 @@ namespace CcuRep {
         CHK_PTR_NULL(loadPtr);
         std::vector<uint64_t> values
             = {loadPtr->GetAddr(), dep.memTokenInfo, CCU_RESOURCE_XN_PER_SIZE * loadPtr->GetNum()};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {dep.memTokenInfo});
     }
 
     HcclResult
@@ -1493,7 +1640,7 @@ namespace CcuRep {
         CcuRepLoadVar* loadVarPtr = dynamic_cast<CcuRepLoadVar*>(repPtr);
         CHK_PTR_NULL(loadVarPtr);
         std::vector<uint64_t> values = {dep.memTokenInfo, CCU_RESOURCE_XN_PER_SIZE * loadVarPtr->GetNum()};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {dep.memTokenInfo});
     }
 
     HcclResult
@@ -1503,7 +1650,7 @@ namespace CcuRep {
         CHK_PTR_NULL(storePtr);
         std::vector<uint64_t> values
             = {storePtr->GetAddr(), dep.memTokenInfo, CCU_RESOURCE_XN_PER_SIZE * storePtr->GetNum()};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {dep.memTokenInfo});
     }
 
     HcclResult
@@ -1512,10 +1659,12 @@ namespace CcuRep {
         CcuRepStoreVar* storeVarPtr = dynamic_cast<CcuRepStoreVar*>(repPtr);
         CHK_PTR_NULL(storeVarPtr);
         std::vector<uint64_t> values = {CCU_RESOURCE_XN_PER_SIZE * storeVarPtr->GetNum()};
+        std::vector<uint64_t> secretValues;
         if (!storeVarPtr->GetHscbFlag()) {
             values.push_back(dep.memTokenInfo);
+            secretValues.push_back(dep.memTokenInfo);
         }
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, secretValues);
     }
 
     HcclResult CcuInsGeneratorV2::PrepareRemPostSemConstValue(
@@ -1536,7 +1685,7 @@ namespace CcuRep {
         uint64_t rmtToken{};
         CHK_RET(GetRmtToken(channelImpl, rmtToken));
         std::vector<uint64_t> values = {channelImpl->GetChannelId(), rmtSignalAddr, rmtToken};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {rmtToken});
     }
 
     HcclResult CcuInsGeneratorV2::PrepareRemPostVarConstValue(
@@ -1565,7 +1714,7 @@ namespace CcuRep {
         uint64_t rmtToken{};
         CHK_RET(GetRmtToken(channelImpl, rmtToken));
         std::vector<uint64_t> values = {channelImpl->GetChannelId(), rmtSignalAddr, rmtToken, rmtVarAddr};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {rmtToken});
     }
 
     HcclResult CcuInsGeneratorV2::PrepareWriteConstValue(
@@ -1578,7 +1727,7 @@ namespace CcuRep {
         uint64_t rmtToken{};
         CHK_RET(GetRmtToken(channelImpl, rmtToken));
         std::vector<uint64_t> values = {channelImpl->GetChannelId(), rmtToken};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {rmtToken});
     }
 
     HcclResult CcuInsGeneratorV2::PrepareReadConstValue(
@@ -1602,7 +1751,7 @@ namespace CcuRep {
         uint64_t rmtToken{};
         CHK_RET(GetRmtToken(channelImpl, rmtToken));
         std::vector<uint64_t> values = {channelImpl->GetChannelId(), rmtToken, dep.ccuResSpaceTokenInfo};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {rmtToken, dep.ccuResSpaceTokenInfo});
     }
 
     HcclResult
@@ -1613,7 +1762,7 @@ namespace CcuRep {
         CcuUrmaChannel* channelImpl{};
         CHK_RET(GetUrmaChannel(repBufReadPtr->GetChannel(), channelImpl));
         std::vector<uint64_t> values = {channelImpl->GetChannelId(), dep.ccuResSpaceTokenInfo};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        return ccuKernel->Add2ConstValue2VarMap(values, {dep.ccuResSpaceTokenInfo});
     }
 
     HcclResult
@@ -1630,11 +1779,11 @@ namespace CcuRep {
     {
         CcuRepRecordSharedNotify* sharedNotifyPtr = dynamic_cast<CcuRepRecordSharedNotify*>(repPtr);
         CHK_PTR_NULL(sharedNotifyPtr);
-        uint64_t ckeAddr = dep.xnBaseAddr[sharedNotifyPtr->GetNotify().DieId()] + CCU_RESOURCE_XN_V2_RESERVE_SIZE
-                           + (sharedNotifyPtr->GetNotify().Id() * CCU_RESOURCE_CKE_PER_SIZE);
-        std::vector<uint64_t> values
-            = {ckeAddr, dep.memTokenInfo, CCU_RESOURCE_CKE_MASK_LENGTH, sharedNotifyPtr->GetMask()};
-        return ccuKernel->Add2ConstValue2VarMap(values);
+        // ckeAddr 不入常量表: 其取值依赖 imported notify 的真实 (Id, DieId)，要到
+        // RegisterEnd 的 ProcessInterCtxRes 链接后才确定，构建期登记会用默认值算出
+        // 错误地址。翻译期改经 commXn[2] 立即数加载(见 CcuRepRecordSharedNotifyTranslate)。
+        std::vector<uint64_t> values = {dep.memTokenInfo, CCU_RESOURCE_CKE_MASK_LENGTH, sharedNotifyPtr->GetMask()};
+        return ccuKernel->Add2ConstValue2VarMap(values, {dep.memTokenInfo});
     }
 
     HcclResult CcuInsGeneratorV2::LoopConfigTranslate(

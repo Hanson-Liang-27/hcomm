@@ -17,6 +17,7 @@
 #include "ra_hdc_rdma.h"
 #include "ra_hdc_socket.h"
 #include "ra_peer.h"
+#include "ra_rs_err.h"
 #include "config_log.h"
 
 extern struct RaSocketOps gRaPeerSocketOps;
@@ -50,6 +51,28 @@ int RaHdcGetIfaddrsStub(unsigned int phyId, struct IfaddrInfo ifaddrInfos[], uns
 int RaGetInterfaceVersionStub(unsigned int phyId, unsigned int interfaceOpcode, unsigned int* interfaceVersion)
 {
     *interfaceVersion = gInterfaceVersion;
+    return 0;
+}
+
+static unsigned int gStubIfnum;
+static unsigned int gStubIfaddrFamily;
+static unsigned int gStubIfaddrIp;
+
+int RaGetIfnumStub(struct RaGetIfattr* config, unsigned int* num)
+{
+    (void)config;
+    *num = gStubIfnum;
+    return 0;
+}
+
+int RaGetIfaddrsStub(struct RaGetIfattr* config, struct InterfaceInfo interfaceInfos[], unsigned int* num)
+{
+    (void)config;
+    *num = gStubIfnum;
+    if (gStubIfnum > 0) {
+        interfaceInfos[0].family = (int)gStubIfaddrFamily;
+        interfaceInfos[0].ifaddr.ip.addr.s_addr = gStubIfaddrIp;
+    }
     return 0;
 }
 
@@ -92,6 +115,58 @@ void TcIfaddr()
     mocker(calloc, 10, 0);
     ret = RaIfaddrInfoConverter(0, isAll, interfaceInfos, &ifaddrNum);
     EXPECT_INT_EQ(-22, ret);
+    mocker_clean();
+
+    return;
+}
+
+void TcRaRdevInitCheckIp()
+{
+    struct rdev rdevInfo = {0};
+    char localIp[MAX_IP_LEN] = {0};
+    int ret;
+
+    rdevInfo.phyId = 0;
+    rdevInfo.family = AF_INET;
+
+    gStubIfnum = 1;
+    gStubIfaddrFamily = AF_INET;
+    gStubIfaddrIp = inet_addr("192.168.1.2");
+    strncpy_s(localIp, sizeof(localIp), "192.168.1.1", sizeof("192.168.1.1") - 1);
+    mocker(RaGetInterfaceVersion, 10, -1);
+    mocker_invoke(RaGetIfaddrs, RaGetIfaddrsStub, 10);
+    ret = RaRdevInitCheckIp(NETWORK_OFFLINE, rdevInfo, localIp);
+    EXPECT_INT_EQ(-EINVALIDIP, ret);
+    mocker_clean();
+
+    gStubIfaddrFamily = AF_INET6;
+    mocker(RaGetInterfaceVersion, 10, -1);
+    mocker_invoke(RaGetIfaddrs, RaGetIfaddrsStub, 10);
+    ret = RaRdevInitCheckIp(NETWORK_OFFLINE, rdevInfo, localIp);
+    EXPECT_INT_EQ(-EINVALIDIP, ret);
+    mocker_clean();
+
+    gStubIfaddrFamily = AF_INET;
+    strncpy_s(localIp, sizeof(localIp), "192.168.1.2", sizeof("192.168.1.2") - 1);
+    mocker(RaGetInterfaceVersion, 10, -1);
+    mocker_invoke(RaGetIfaddrs, RaGetIfaddrsStub, 10);
+    ret = RaRdevInitCheckIp(NETWORK_OFFLINE, rdevInfo, localIp);
+    EXPECT_INT_EQ(0, ret);
+    mocker_clean();
+
+    gStubIfaddrIp = inet_addr("192.168.1.2");
+    strncpy_s(localIp, sizeof(localIp), "192.168.1.1", sizeof("192.168.1.1") - 1);
+    mocker_invoke(RaGetIfnum, RaGetIfnumStub, 10);
+    mocker_invoke(RaGetIfaddrs, RaGetIfaddrsStub, 10);
+    ret = RaRdevInitCheckIp(NETWORK_PEER_ONLINE, rdevInfo, localIp);
+    EXPECT_INT_EQ(-EINVALIDIP, ret);
+    mocker_clean();
+
+    strncpy_s(localIp, sizeof(localIp), "192.168.1.2", sizeof("192.168.1.2") - 1);
+    mocker_invoke(RaGetIfnum, RaGetIfnumStub, 10);
+    mocker_invoke(RaGetIfaddrs, RaGetIfaddrsStub, 10);
+    ret = RaRdevInitCheckIp(NETWORK_PEER_ONLINE, rdevInfo, localIp);
+    EXPECT_INT_EQ(0, ret);
     mocker_clean();
 
     return;
@@ -1439,6 +1514,31 @@ void TcRaGetLbMax(void)
     EXPECT_INT_EQ(0, ret);
 }
 
+void TcRaRdevGetAttr(void)
+{
+    struct RaRdmaHandle rdmaHandle = {0};
+    struct RaRdmaOps rdmaOps = {0};
+    struct RdevAttr attr = {0};
+    int ret = 0;
+
+    ret = RaRdevGetAttr(NULL, &attr);
+    EXPECT_INT_EQ(128103, ret);
+
+    ret = RaRdevGetAttr(&rdmaHandle, NULL);
+    EXPECT_INT_EQ(128103, ret);
+
+    ret = RaRdevGetAttr(&rdmaHandle, &attr);
+    EXPECT_INT_EQ(128103, ret);
+
+    rdmaHandle.rdmaOps = &rdmaOps;
+    ret = RaRdevGetAttr(&rdmaHandle, &attr);
+    EXPECT_INT_EQ(128103, ret);
+
+    rdmaHandle.rdmaOps->raRdevGetAttr = RaPeerRdevGetAttr;
+    ret = RaRdevGetAttr(&rdmaHandle, &attr);
+    EXPECT_INT_EQ(0, ret);
+}
+
 void TcRaSetQpLbValue(void)
 {
     struct RaQpHandle qpHandle = {0};
@@ -1558,3 +1658,10 @@ void TcRaSetDebugConfig()
 }
 
 void TcHccpOpCtxQpCreateSync() { EXPECT_INT_EQ(HCCP_OP_CTX_QP_CREATE, RA_RS_CTX_QP_CREATE); }
+
+void TcHccpOpCodeMirrorSync()
+{
+    EXPECT_INT_EQ(HCCP_OP_LMEM_REG, RA_RS_LMEM_REG);
+    EXPECT_INT_EQ(HCCP_OP_CTX_QP_IMPORT, RA_RS_CTX_QP_IMPORT);
+    EXPECT_INT_EQ(HCCP_OP_GET_TP_INFO_LIST, RA_RS_GET_TP_INFO_LIST);
+}

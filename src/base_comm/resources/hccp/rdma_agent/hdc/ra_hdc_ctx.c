@@ -826,26 +826,6 @@ int RaHdcCtxBatchSendWr(struct RaCtxQpHandle *qpHandle, struct SendWrData wrList
     return ret;
 }
 
-int RaHdcCtxUpdateCi(struct RaCtxQpHandle *qpHandle, uint16_t ci)
-{
-    unsigned int phyId = qpHandle->phyId;
-    union OpCtxUpdateCiData opData = {0};
-    int ret;
-
-    opData.txData.phyId = phyId;
-    opData.txData.devIndex = qpHandle->devIndex;
-    opData.txData.jettyId = qpHandle->id;
-    opData.txData.ci = ci;
-
-    ret = RaHdcProcessMsg(RA_RS_CTX_UPDATE_CI, phyId, (char *)&opData, sizeof(union OpCtxUpdateCiData));
-    CHK_PRT_RETURN(ret,
-        hccp_err("[update][ra_qp]hdc message process failed ret[%d], phyId[%u] devIndex[%u]", ret, phyId,
-            qpHandle->devIndex),
-        ret);
-
-    return 0;
-}
-
 int RaHdcCtxQpQueryBatch(unsigned int phyId, unsigned int devIndex, unsigned int ids[], struct JettyAttr attr[],
     unsigned int *num)
 {
@@ -949,6 +929,10 @@ int RaHdcCtxNotifyEvent(struct RaCtxHandle *ctxHandle, struct CtxNotifyEvent *ev
     opData.txData.devIndex = ctxHandle->devIndex;
     (void)memcpy_s(&opData.txData.event, sizeof(struct CtxNotifyEvent), event, sizeof(struct CtxNotifyEvent));
     ret = RaHdcProcessMsg(RA_RS_CTX_NOTIFY_EVENT, phyId, (char *)&opData, sizeof(union OpCtxNotifyEventData));
+    CHK_PRT_RETURN(ret == -EBUSY,
+        hccp_warn_rma("[notify][event]hdc message process unsuccessful ret[%d], phyId[%u] devIndex[0x%x]", ret, phyId,
+            ctxHandle->devIndex),
+        ret);
     CHK_PRT_RETURN(ret != 0,
         hccp_err("[notify][event]hdc message process failed ret[%d], phyId[%u] devIndex[0x%x]", ret, phyId,
             ctxHandle->devIndex),

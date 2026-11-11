@@ -16,7 +16,6 @@ hcclvm_apply_common_flags(common)
 
 target_include_directories(common PRIVATE
     ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/include/runnerdb
     ${PROJECT_SOURCE_DIR}/include/store
 
     ${HCCL_VM_SRC}
@@ -24,7 +23,6 @@ target_include_directories(common PRIVATE
     ${HCCL_VM_SRC}/plugin
     ${HCCL_VM_SRC}/cmd
     ${HCCL_VM_SRC}/store
-    ${HCCL_VM_SRC}/runnerdb
     ${THRID_PARTY_DIR}/nlohmann_json
 
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc
@@ -38,11 +36,15 @@ target_include_directories(common PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime/runtime/rts
-
-    ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
 )
+if(NOT BUILD_LEVEL1_ONLY)
+    target_include_directories(common PRIVATE
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+    )
+endif()
 
 target_link_libraries(common PRIVATE
     log
-    runnerdb
+    runtime_state
+    operation_data
 )

@@ -1,3 +1,4 @@
+#include "ccu_device.h"
 /**
  * Copyright (c) 2025 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
@@ -24,10 +25,10 @@
 #include "ccu_task_arg_v1.h"
 #include "string_util.h"
 #include "task_param.h"
-#include "channel_process.h"
+#include "endpoint_pair/channel/channel_process_pub.h"
 #include "hcomm_c_adpt.h"
 #include "local_notify_impl.h"
-#include "aicpu_launch_manager.h"
+#include "comm_engine/aicpu_launch_manager_pub.h"
 #include "llt_hccl_stub_rank_graph.h"
 #include "hccl_api_base_test.h"
 #include "ccu_kernel_mgr.h"
@@ -186,11 +187,29 @@ protected:
     CcuProfilingInfo invalidChannelProfInfo;
 };
 
+// 构造 CCU 任务 TaskInfo（dfxOpInfo_ 默认空；withDfxOpInfo 时带空 DfxOpInfo）
+static Hccl::TaskInfo CreateCcuTaskInfo(bool withDfxOpInfo = false)
+{
+    Hccl::ParaCcu paraCcu = {};
+    Hccl::TaskParam taskParam
+        = {.taskType = Hccl::TaskParamType::TASK_CCU,
+           .beginTime = 0,
+           .endTime = 0,
+           .isMaster = false,
+           .taskPara = {.Ccu = paraCcu},
+           .ccuDetailInfo = nullptr};
+    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    if (withDfxOpInfo) {
+        taskInfo.dfxOpInfo_ = std::make_shared<Hccl::DfxOpInfo>();
+    }
+    return taskInfo;
+}
+
 TEST_F(CcuKernelTest, AddCcuProfilingInfo_Normal)
 {
     EndpointHandle locEndpointHandle;
     HcommChannelDesc channelDesc;
-    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc);
+    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc, COMM_ENGINE_RESERVED);
     void* channelHandle = static_cast<void*>(channel);
     void** handle{nullptr};
     handle = &channelHandle;
@@ -208,7 +227,7 @@ TEST_F(CcuKernelTest, AddProfilingInfo_Normal)
 {
     EndpointHandle locEndpointHandle;
     HcommChannelDesc channelDesc;
-    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc);
+    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc, COMM_ENGINE_RESERVED);
     void* channelHandle = static_cast<void*>(channel);
     void** handle{nullptr};
     handle = &channelHandle;
@@ -382,16 +401,7 @@ TEST_F(HcommDfxTaskExceptionTest, ProccessCcuException_Normal)
 
 TEST_F(HcommDfxTaskExceptionTest, GetGroupRankInfo_Normal)
 {
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
-    taskInfo.dfxOpInfo_ = std::make_shared<Hccl::DfxOpInfo>();
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo(true);
     hccl::ManagerCallbacks callbacks;
     callbacks.getAicpuCommState = []() {
         return true;
@@ -416,15 +426,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetGroupRankInfo_Normal)
 
 TEST_F(HcommDfxTaskExceptionTest, GetGroupRankInfo_Nullptr)
 {
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
     taskInfo.dfxOpInfo_ = nullptr;
     std::string result = CcuTaskException::GetGroupRankInfo(taskInfo);
     EXPECT_EQ(result, "");
@@ -644,7 +646,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_Normal)
     baseInfo.status = 0x0102;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -652,17 +655,9 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_Normal)
 
 TEST_F(HcommDfxTaskExceptionTest, GetRankIdByChannelId_Normal)
 {
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
-    RankId rankId = CcuTaskException::GetRankIdByChannelId(101, taskInfo, 0);
+    u32 rankId = CcuTaskException::GetRankIdByChannelId(101, taskInfo, 0);
 
     // 验证输出
     EXPECT_TRUE(true);
@@ -670,15 +665,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetRankIdByChannelId_Normal)
 
 TEST_F(HcommDfxTaskExceptionTest, GetAddrPairByChannelId_Normal)
 {
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     auto addrPair = CcuTaskException::GetAddrPairByChannelId(101, taskInfo, 0);
 
@@ -706,7 +693,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_UnsupportedOpcode)
     baseInfo.status = 0x0100;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -722,7 +710,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_LocalOpError)
     baseInfo.status = 0x0201;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -738,7 +727,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_RemoteOpError)
     baseInfo.status = 0x0301;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -754,7 +744,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_TransactionRetryExceeded)
     baseInfo.status = 0x0400;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -771,7 +762,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_TransactionAckTimeout)
     baseInfo.status = 0x0500;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -786,7 +778,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_JettyWorkRequestFlushed)
     baseInfo.status = 0x0600;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -801,7 +794,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_CCUAAlgTaskError)
     baseInfo.status = 0x0700;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -816,7 +810,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_MemoryECCError)
     baseInfo.status = 0x0800;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -831,7 +826,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_CCUMExecuteError)
     baseInfo.status = 0x0901;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -847,7 +843,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_CCUAExecuteError)
     baseInfo.status = 0x0A02;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -863,7 +860,8 @@ TEST_F(HcommDfxTaskExceptionTest, GenStatusInfo_HighPartNotInMap)
     baseInfo.status = 0x1100;
 
     vector<CcuErrorInfo> errorInfo;
-    CcuTaskException::GenStatusInfo(baseInfo, errorInfo);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
+    CcuTaskException::GenStatusInfo(baseInfo, taskInfo, errorInfo);
 
     EXPECT_EQ(errorInfo.size(), 1u);
     EXPECT_EQ(errorInfo[0].type, CcuErrorType::MISSION);
@@ -884,15 +882,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgLoop_DefaultValues)
     ccuErrorInfo.msg.loop.loopCurrentCnt = 5;
     ccuErrorInfo.msg.loop.addrStride = 256;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgLoop(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -911,15 +901,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgLoopGroup_DefaultValues)
     ccuErrorInfo.msg.loopGroup.expandOffset = 1;
     ccuErrorInfo.msg.loopGroup.expandCnt = 4;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgLoopGroup(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -939,15 +921,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgLocPostSem_DefaultValues)
     ccuErrorInfo.msg.waitSignal.paramId = 1;
     ccuErrorInfo.msg.waitSignal.paramValue = 12345;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgLocPostSem(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -965,15 +939,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgLocWaitEvent_DefaultValues)
     ccuErrorInfo.msg.waitSignal.signalMask = 0x0F;
     ccuErrorInfo.msg.waitSignal.signalValue = 0x05;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgLocWaitEvent(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -988,15 +954,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgLocWaitNotify_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 7;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgLocWaitNotify(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1011,15 +969,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgRemPostSem_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 8;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgRemPostSem(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1034,15 +984,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgRemWaitSem_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 9;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgRemWaitSem(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1057,15 +999,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgRemPostVar_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 11;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgRemPostVar(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1080,15 +1014,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgPostSharedSem_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 12;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgPostSharedSem(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1109,15 +1035,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgRead_DefaultValues)
     ccuErrorInfo.msg.transMem.len = 1024;
     ccuErrorInfo.msg.transMem.channelId = 101;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgRead(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1138,15 +1056,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgWrite_DefaultValues)
     ccuErrorInfo.msg.transMem.len = 2048;
     ccuErrorInfo.msg.transMem.channelId = 102;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgWrite(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1161,15 +1071,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgLocalCpy_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 15;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgLocalCpy(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1184,15 +1086,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgLocalReduce_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 16;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgLocalReduce(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1211,15 +1105,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgBufRead_DefaultValues)
     ccuErrorInfo.msg.bufTransMem.len = 512;
     ccuErrorInfo.msg.bufTransMem.channelId = 103;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgBufRead(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1238,15 +1124,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgBufWrite_DefaultValues)
     ccuErrorInfo.msg.bufTransMem.len = 256;
     ccuErrorInfo.msg.bufTransMem.channelId = 104;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgBufWrite(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1261,15 +1139,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgBufLocRead_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 19;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgBufLocRead(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1284,15 +1154,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgBufLocWrite_DefaultValues)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 21;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgBufLocWrite(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1311,15 +1173,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgBufReduce_DefaultValues)
     ccuErrorInfo.msg.bufReduce.outputDataType = 0;
     ccuErrorInfo.msg.bufReduce.opType = 0;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgBufReduce(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1334,15 +1188,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgByType_MISSION)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 0;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgByType(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1357,15 +1203,7 @@ TEST_F(HcommDfxTaskExceptionTest, GetCcuErrorMsgByType_DefaultType)
     ccuErrorInfo.missionId = 1;
     ccuErrorInfo.instrId = 0;
 
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo();
 
     string result = CcuTaskException::GetCcuErrorMsgByType(ccuErrorInfo, taskInfo, 0);
     EXPECT_FALSE(result.empty());
@@ -1474,16 +1312,7 @@ TEST_F(HcommDfxTaskExceptionTest, ProcessCcuException_CleanDieCkesFail)
 
 TEST_F(HcommDfxTaskExceptionTest, GetGroupRankInfo_WithValidComm)
 {
-    Hccl::ParaCcu paraCcu = {};
-    Hccl::TaskParam taskParam
-        = {.taskType = Hccl::TaskParamType::TASK_CCU,
-           .beginTime = 0,
-           .endTime = 0,
-           .isMaster = false,
-           .taskPara = {.Ccu = paraCcu},
-           .ccuDetailInfo = nullptr};
-    Hccl::TaskInfo taskInfo(1, 2, 3, taskParam, nullptr, false);
-    taskInfo.dfxOpInfo_ = std::make_shared<Hccl::DfxOpInfo>();
+    Hccl::TaskInfo taskInfo = CreateCcuTaskInfo(true);
     hccl::ManagerCallbacks callbacks;
     callbacks.getAicpuCommState = []() {
         return true;
@@ -2421,7 +2250,7 @@ TEST_F(CcuRepContextTest, AddProfilingchannel_Normal)
     uint32_t signalIndex = 0;
     EndpointHandle locEndpointHandle;
     HcommChannelDesc channelDesc;
-    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc);
+    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc, COMM_ENGINE_RESERVED);
     ChannelHandle channelHandle = reinterpret_cast<ChannelHandle>(channel);
     void** handle{nullptr};
     void* voidHandle = reinterpret_cast<void*>(channelHandle);
@@ -2450,7 +2279,7 @@ TEST_F(CcuRepContextTest, AddProfilingchannelNum_Normal)
     uint32_t num = 1;
     EndpointHandle locEndpointHandle;
     HcommChannelDesc channelDesc;
-    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc);
+    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc, COMM_ENGINE_RESERVED);
     ChannelHandle channelHandle = reinterpret_cast<ChannelHandle>(channel);
     void** handle{nullptr};
     void* voidHandle = reinterpret_cast<void*>(channelHandle);
@@ -2474,7 +2303,7 @@ TEST_F(CcuRepContextTest, AddProfilingchannelNumMuch_Normal)
     uint32_t num = 1;
     EndpointHandle locEndpointHandle;
     HcommChannelDesc channelDesc;
-    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc);
+    Channel* channel = new (std::nothrow) CcuUrmaChannel(locEndpointHandle, channelDesc, COMM_ENGINE_RESERVED);
     ChannelHandle channelHandle = reinterpret_cast<ChannelHandle>(channel);
     void** handle{nullptr};
     void* voidHandle = reinterpret_cast<void*>(channelHandle);

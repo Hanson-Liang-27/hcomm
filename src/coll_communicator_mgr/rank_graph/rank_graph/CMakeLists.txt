@@ -13,11 +13,11 @@ set(src_list
     ${CMAKE_CURRENT_SOURCE_DIR}/rank_graph.cc
 )
 
-if(TARGET hcomm)
-    target_sources(hcomm PRIVATE
+if(TARGET hcomm_coll_comm_obj)
+    target_sources(hcomm_coll_comm_obj PRIVATE
         ${src_list}
     )
-    target_include_directories(hcomm PRIVATE
+    target_include_directories(hcomm_coll_comm_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()
@@ -33,12 +33,6 @@ endif()
 
 if(TARGET hccl_v2)
     target_include_directories(hccl_v2 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-    )
-endif()
-
-if(TARGET hcomm_base_obj)
-    target_include_directories(hcomm_base_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()

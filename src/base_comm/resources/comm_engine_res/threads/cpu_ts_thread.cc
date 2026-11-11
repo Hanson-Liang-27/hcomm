@@ -9,9 +9,10 @@
  */
 
 #include "cpu_ts_thread.h"
+#include "common/dev_type_utils_pub.h"
 #include "hccl_common.h"
 #include "adapter_rts.h"
-#include "dfx_dlprof_function.h"
+#include "dfx/prof_utils_pub.h"
 
 namespace hccl {
 const std::unordered_map<HcclDataType, aclDataType> hccl2rtDataTypeMap = {
@@ -51,16 +52,27 @@ HcclResult CpuTsThread::Init()
     // Host 侧初始化
     CHK_RET(GetRunSideIsDevice(isDeviceSide_));
     CHK_RET(hrtGetDeviceType(devType_));
+    auto isGe950 = hcomm::EqualToOrGreaterThan950();
+    CHK_PRT_RET(!isGe950.has_value(), HCCL_ERROR("[%s] get device type failed.", __func__), HCCL_E_RUNTIME);
     if (!isDeviceSide_) {
         s32 deviceLogicId;
         CHK_RET(hrtGetDevice(&deviceLogicId));
         CHK_RET(hrtGetDevicePhyIdByIndex(static_cast<uint32_t>(deviceLogicId), devId_));
         if (streamType_ == StreamType::STREAM_TYPE_DEVICE || notifyLoadType_ == NotifyLoadType::DEVICE_NOTIFY) {
+            HCCL_ERROR(
+                "[CpuTsThread::%s] not supported, streamType_[%d], notifyLoadType_[%d].", __func__, streamType_,
+                notifyLoadType_);
             return HCCL_E_NOT_SUPPORT;
         }
         if (rtStream_ == nullptr) {
             stream_.reset(new (std::nothrow) Stream(streamType_));
             CHK_SMART_PTR_NULL(stream_);
+            // 流创建/初始化失败时 Stream 构造函数仅打日志不置失败态（内部 rtStream 为空），须显式拦截
+            CHK_PRT_RET(
+                stream_->ptr() == nullptr,
+                HCCL_ERROR(
+                    "[%s] create stream failed, ptr is null, streamType[%d]", __func__, static_cast<s32>(streamType_)),
+                HCCL_E_RUNTIME);
             rtStream_ = stream_->ptr();
         } else {
             stream_.reset(new (std::nothrow) Stream(rtStream_));
@@ -70,6 +82,7 @@ HcclResult CpuTsThread::Init()
             // GE保序注入：借用引用已在构造时拷贝至injectedNotifys_（对象所有权始终归管理器，
             // 本线程不销毁不delete）；GetNotify/序列化经借用数组读取。管理器注销/失效销毁
             // 对象后不得再经本线程使用
+            HCCL_INFO("[CpuTsThread::%s] %s, isDeviceSide[%d].", __func__, FormatThreadInfo().c_str(), isDeviceSide_);
             return HCCL_SUCCESS;
         }
         notifys_.reserve(notifyNum_);
@@ -78,20 +91,46 @@ HcclResult CpuTsThread::Init()
             notifys_[idx].reset(new (std::nothrow) LocalNotify());
             CHK_SMART_PTR_NULL(notifys_[idx]);
             CHK_RET(notifys_[idx]->Init(notifyLoadType_));
-            if (devType_ != DevType::DEV_TYPE_950 && devType_ != DevType::DEV_TYPE_960) {
+            if (!(*isGe950)) {
                 CHK_RET(notifys_[idx]->SetIpc());
             }
         }
+        HCCL_INFO("[CpuTsThread::%s] %s, isDeviceSide[%d].", __func__, FormatThreadInfo().c_str(), isDeviceSide_);
         return HCCL_SUCCESS;
     } else {
+        HCCL_ERROR("[CpuTsThread::%s] device side not supported.", __func__);
         return HCCL_E_NOT_SUPPORT;
     }
+}
+
+#ifndef CCL_KERNEL_AICPU
+HcclResult CpuTsThread::PreAllocThreadEntity(ThreadHandle& handle, CommEngine targetEngine)
+{
+    return PreAllocThreadEntityCommon(*this, threadHandleMap_, handle, targetEngine);
+}
+
+ThreadEntityResources* CpuTsThread::GetThreadEntityResources(CommEngine targetEngine) const
+{
+    return GetThreadEntityResourcesCommon(threadHandleMap_, targetEngine);
+}
+#endif
+
+HcclResult CpuTsThread::GetExportRtsqInfo(int32_t& streamId, uint32_t& sqId)
+{
+    streamId = 0;
+    sqId = 0;
+    CHK_PRT_RET(fakeDeviceRes_, HCCL_ERROR("[%s] fake device thread has no export RTSQ", __func__), HCCL_E_NOT_SUPPORT);
+    CHK_RET(EnsureExportStream());
+    streamId = streamDevice_->id();
+    sqId = streamDevice_->sqId();
+    return HCCL_SUCCESS;
 }
 
 HcclResult CpuTsThread::DeInit() { return DeInitImpl(); }
 
 HcclResult CpuTsThread::DeInitImpl()
 {
+    HCCL_INFO("[CpuTsThread::%s] %s.", __func__, FormatThreadInfo().c_str());
     streamType_ = StreamType::STREAM_TYPE_RESERVED;
     notifyNum_ = 0;
     stream_ = nullptr;
@@ -129,11 +168,9 @@ std::string& CpuTsThread::UpdateUniqueId()
         oss.write(reinterpret_cast<const char_t*>(&streamParam), sizeof(streamParam));
     } else {
         // 临时申请一条流，用于在device侧资源展开时initStream
-        if (streamDevice_ == nullptr) {
-            streamDevice_.reset(new (std::nothrow) Stream(streamType));
-        }
-        if (streamDevice_ == nullptr) {
-            HCCL_ERROR("[CpuTsThread][%s]reset stream failed, stream type[%d]", __func__, streamType);
+        int32_t streamId = 0;
+        uint32_t sqId = 0;
+        if (GetExportRtsqInfo(streamId, sqId) != HCCL_SUCCESS) {
             return uniqueIdStr_;
         }
 
@@ -152,8 +189,8 @@ std::string& CpuTsThread::UpdateUniqueId()
         }
 
         HcclStreamParam streamParam;
-        streamParam.streamInfo.streamIds = streamDevice_->id();
-        streamParam.streamInfo.sqIds = streamDevice_->sqId();
+        streamParam.streamInfo.streamIds = streamId;
+        streamParam.streamInfo.sqIds = sqId;
         streamParam.streamInfo.cqIds = streamDevice_->cqId();
         streamParam.streamInfo.logicCqids = streamDevice_->logicCqId();
         streamParam.sqCqContextAddr = reinterpret_cast<uint64_t>(sqCqeContext_.ptr());
@@ -188,22 +225,43 @@ std::string& CpuTsThread::UpdateUniqueId()
     return uniqueIdStr_;
 }
 
+HcclResult CpuTsThread::EnsureExportStream()
+{
+    const StreamType streamType = fakeDeviceRes_ ? StreamType::STREAM_TYPE_ONLINE : StreamType::STREAM_TYPE_DEVICE;
+    if (streamDevice_ == nullptr) {
+        streamDevice_.reset(new (std::nothrow) Stream(streamType));
+    }
+    if (streamDevice_ == nullptr) {
+        HCCL_ERROR("[CpuTsThread][%s]reset stream failed, stream type[%d]", __func__, streamType);
+        return HCCL_E_PTR;
+    }
+    // 流创建失败时 Stream 构造函数仅打日志不置失败态，须显式拦截，防止序列化出空流 uid。
+    if (streamDevice_->ptr() == nullptr) {
+        HCCL_ERROR("[CpuTsThread][%s]create device stream failed, ptr is null, stream type[%d]", __func__, streamType);
+        return HCCL_E_PTR;
+    }
+    return HCCL_SUCCESS;
+}
+
 uint32_t CpuTsThread::GetNotifyNum() const { return notifyNum_; }
+
+size_t CpuTsThread::GetNotifySize() const
+{
+    return !injectedNotifys_.empty() ? injectedNotifys_.size() : notifys_.size();
+}
 
 LocalNotify* CpuTsThread::GetNotify(uint32_t index) const
 {
-    if (index >= notifyNum_) {
+    bool useInjected = !injectedNotifys_.empty();
+    size_t notifySize = useInjected ? injectedNotifys_.size() : notifys_.size();
+    if (index >= notifySize) {
         HCCL_ERROR(
-            "[CpuTsThread][GetNotify] notifyNum[%u], index[%u] out of range[0, %u]", notifyNum_, index, notifyNum_ - 1);
+            "[CpuTsThread][GetNotify] notifySize[%zu], index[%u] out of range, useInjected[%d]", notifySize, index,
+            useInjected);
         return nullptr;
     }
-    if (!injectedNotifys_.empty()) {
-        return injectedNotifys_[index]; // GE保序借用：对象归管理器，仅返回引用
-    }
-    return notifys_[index].get();
+    return useInjected ? injectedNotifys_[index] : notifys_[index].get();
 }
-
-bool CpuTsThread::IsDeviceA5() const { return devType_ == DevType::DEV_TYPE_950 || devType_ == DevType::DEV_TYPE_960; }
 
 // A3 Stream
 Stream* CpuTsThread::GetStream() const { return stream_.get(); }
@@ -213,6 +271,8 @@ void* CpuTsThread::GetStreamLitePtr() const
 {
     return nullptr; // Not implemented
 }
+
+s32 CpuTsThread::GetStreamId() const { return stream_ ? stream_->id() : -1; }
 
 void CpuTsThread::LaunchTask() const { return; }
 
@@ -239,11 +299,12 @@ HcclResult
 CpuTsThread::LocalNotifyRecord([[maybe_unused]] ThreadHandle dstThread, [[maybe_unused]] uint32_t dstNotifyIdx) const
 {
 #ifndef CCL_KERNEL_AICPU
-    u64 beginTime = Hccl::DfxDlProfFunction::GetInstance().dlMsprofSysCycleTime();
+    u64 beginTime = hcomm::GetProfCycleTime();
     HCCL_INFO("[%s]dstThread[0x%llu], dstNotifyIdx[%u].", __func__, dstThread, dstNotifyIdx);
     CHK_PRT_RET(
-        !IsDeviceA5(), HCCL_ERROR("[CpuTsThread][%s]only support A5", __func__),
-        HCCL_E_NOT_SUPPORT); // 只支持A5, 其他场景调用HcclLocalNotifyRecord
+        !hcomm::EqualToOrGreaterThan950().value_or(false),
+        HCCL_ERROR("[CpuTsThread][%s]only supports DEV_TYPE_950 and later", __func__),
+        HCCL_E_NOT_SUPPORT); // 只支持950及后续代际, 其他场景调用HcclLocalNotifyRecord
 
     Stream* stream = GetStream();
     CHK_PTR_NULL(stream);
@@ -267,11 +328,12 @@ CpuTsThread::LocalNotifyRecord([[maybe_unused]] ThreadHandle dstThread, [[maybe_
 HcclResult CpuTsThread::LocalNotifyWait([[maybe_unused]] uint32_t notifyIdx, [[maybe_unused]] uint32_t timeOut) const
 {
 #ifndef CCL_KERNEL_AICPU
-    u64 beginTime = Hccl::DfxDlProfFunction::GetInstance().dlMsprofSysCycleTime();
+    u64 beginTime = hcomm::GetProfCycleTime();
     HCCL_INFO("[%s]notifyIdx[%u], timeOut[%u]s.", __func__, notifyIdx, timeOut);
     CHK_PRT_RET(
-        !IsDeviceA5(), HCCL_ERROR("[CpuTsThread][%s]only support A5", __func__),
-        HCCL_E_NOT_SUPPORT); // 只支持A5, 其他场景调用HcclLocalNotifyWait
+        !hcomm::EqualToOrGreaterThan950().value_or(false),
+        HCCL_ERROR("[CpuTsThread][%s]only supports DEV_TYPE_950 and later", __func__),
+        HCCL_E_NOT_SUPPORT); // 只支持950及后续代际, 其他场景调用HcclLocalNotifyWait
 
     Stream* stream = GetStream();
     CHK_PTR_NULL(stream);
@@ -293,11 +355,12 @@ HcclResult CpuTsThread::LocalCopy(
     [[maybe_unused]] void* dst, [[maybe_unused]] const void* src, [[maybe_unused]] uint64_t sizeByte) const
 {
 #ifndef CCL_KERNEL_AICPU
-    u64 beginTime = Hccl::DfxDlProfFunction::GetInstance().dlMsprofSysCycleTime();
+    u64 beginTime = hcomm::GetProfCycleTime();
     HCCL_INFO("[%s]dst[%p], src[%p], sizeByte[%llu].", __func__, dst, src, sizeByte);
     CHK_PRT_RET(
-        !IsDeviceA5(), HCCL_ERROR("[CpuTsThread][%s]only support A5", __func__),
-        HCCL_E_NOT_SUPPORT); // 只支持A5, 其他场景调用HcclLocalCopy
+        !hcomm::EqualToOrGreaterThan950().value_or(false),
+        HCCL_ERROR("[CpuTsThread][%s]only supports DEV_TYPE_950 and later", __func__),
+        HCCL_E_NOT_SUPPORT); // 只支持950及后续代际, 其他场景调用HcclLocalCopy
 
     if (sizeByte == 0 || src == dst) {
         HCCL_INFO("[CpuTsThread][%s]skip, dst[%p] equals src[%p] or len[%llu] equals 0", __func__, dst, src, sizeByte);
@@ -319,13 +382,14 @@ HcclResult CpuTsThread::LocalReduce(
     [[maybe_unused]] HcommDataType dataType, [[maybe_unused]] HcommReduceOp reduceOp) const
 {
 #ifndef CCL_KERNEL_AICPU
-    u64 beginTime = Hccl::DfxDlProfFunction::GetInstance().dlMsprofSysCycleTime();
+    u64 beginTime = hcomm::GetProfCycleTime();
     HCCL_INFO(
         "[%s]dst[%p], src[%p], sizeByte[%llu], dataType[%d], reduceOp[%d].", __func__, dst, src, sizeByte, dataType,
         reduceOp);
     CHK_PRT_RET(
-        !IsDeviceA5(), HCCL_ERROR("[CpuTsThread][%s]only support A5", __func__),
-        HCCL_E_NOT_SUPPORT); // 只支持A5, 其他场景调用HcclLocalCopyReduce
+        !hcomm::EqualToOrGreaterThan950().value_or(false),
+        HCCL_ERROR("[CpuTsThread][%s]only supports DEV_TYPE_950 and later", __func__),
+        HCCL_E_NOT_SUPPORT); // 只支持950及后续代际, 其他场景调用HcclLocalCopyReduce
 
     auto dataTypeIt = hccl2rtDataTypeMap.find(static_cast<HcclDataType>(dataType));
     if (dataTypeIt == hccl2rtDataTypeMap.end()) {
@@ -375,7 +439,7 @@ HcclResult CpuTsThread::SupplementNotify(uint32_t notifyNum)
         notifys_[idx].reset(new (std::nothrow) LocalNotify());
         CHK_SMART_PTR_NULL(notifys_[idx]);
         CHK_RET(notifys_[idx]->Init(notifyLoadType_));
-        if (devType_ != DevType::DEV_TYPE_950 && devType_ != DevType::DEV_TYPE_960) {
+        if (!hcomm::EqualToOrGreaterThan950().value_or(false)) {
             CHK_RET(notifys_[idx]->SetIpc());
         }
     }

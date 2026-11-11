@@ -14,6 +14,7 @@
 #include "ccu_rep_block_v1.h"
 #include "ccu_rep_funcblock_v1.h"
 #include "ccu_rep_context_v1.h"
+#include "ccu_log.h"
 
 namespace hcomm {
 namespace CcuRep {
@@ -37,9 +38,10 @@ namespace CcuRep {
         }
 
         template <typename T>
-        void DefineOutArg(T&& arg)
+        CcuResult DefineOutArg(T&& arg)
         {
-            repFuncBlock->DefineOutArg(std::forward<T>(arg));
+            CCU_CHK_RET(repFuncBlock->DefineOutArg(std::forward<T>(arg)));
+            return CCU_SUCCESS;
         }
 
     private:

@@ -207,7 +207,7 @@ private:
     HcclResult AdvanceDeviceWaitListPhase(
         const RaUbGetTpInfoParam& param, RequestCtx& reqCtx, ReqQosMap& qosReqMap, ReqQosMap::iterator it,
         std::unique_lock<std::mutex>& reqCtxLock, TpInfo& tpInfo);
-    void StartGetTpInfoListRequest(const RaUbGetTpInfoParam& param, RequestCtx& reqCtx, bool isSync) const;
+    HcclResult StartGetTpInfoListRequest(const RaUbGetTpInfoParam& param, RequestCtx& reqCtx, bool isSync) const;
     HcclResult FindAndGetTpAttr(const TpHandle tpHandle, TpAttrInfo& tpAttrInfo);
     HcclResult
     StartGetTpAttrRequest(const GetTpAttrParam& param, TpAttrRequestCtx& reqCtx, RdmaHandle rdmaHandle) const;
@@ -228,7 +228,9 @@ private:
 };
 
 /// UbConnection 释放 TpInfo：Release 键须与 GetTpInfo 时的业务 QoS 一致
-void ReleaseUbConnectionTp(
+/// @return HCCL_SUCCESS 表示引用已归还（含无引用跳过）；HCCL_E_NOT_FOUND 等非成功码表示缓存
+///         未命中（键漂移类缺陷的审计信号），调用方须记录供定位，TP 条目可能常驻
+HcclResult ReleaseUbConnectionTp(
     int32_t devLogicId, const IpAddress& locAddr, const IpAddress& rmtAddr, TpProtocol tpProtocol, TpInfo& tpInfo,
     uint32_t requestQos);
 

@@ -93,7 +93,7 @@ enum OpType {
     RA_RS_PING_STOP = 75,
     RA_RS_PING_DEL = 76,
     RA_RS_PING_DEINIT = 77,
-    RA_RS_CTX_UPDATE_CI = 78,
+    RA_RS_CTX_UPDATE_CI_DEPRECATED = 78,
     RA_RS_GET_CQE_ERR_INFO_NUM = 79,
     RA_RS_GET_CQE_ERR_INFO_LIST = 80,
     RA_RS_RDEV_INIT_WITH_BACKUP = 81,
@@ -140,6 +140,7 @@ enum OpType {
     RA_RS_CTX_NOTIFY_EVENT = 122,
     RA_RS_SOCKET_CONN_V2 = 123,
     RA_RS_SOCKET_LISTEN_START_V2 = 124,
+    RA_RS_BATCH_GET_INTERFACE_VERSION = 125,
     RA_RS_EXTER_OP_MAX_NUM,
 
     // 上面opcode是对部opcode,下面是内部opcode
@@ -170,9 +171,7 @@ static inline bool RaRsHasCapability(unsigned int capability, unsigned int roceV
         unsigned int roceVersion;
         unsigned int netVersion;
     } capInfoList[] = {
-        {RA_CAP_DRV_SHAREPOOL_NON_PIN, 0, 1},
-        {RA_CAP_UDMA_NOTIFY_EVENT, 0, 2},
-    };
+        {RA_CAP_DRV_SHAREPOOL_NON_PIN, 0, 1}, {RA_CAP_UDMA_NOTIFY_EVENT, 0, 2}, {RA_CAP_NET_DFX_INFO_EVENT, 0, 3}};
 
     if (capability >= RA_CAP_INVALID) {
         return false;

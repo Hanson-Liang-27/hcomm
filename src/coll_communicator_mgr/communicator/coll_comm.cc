@@ -21,23 +21,88 @@
 #include "hcomm_team_c_adpt.h"
 #include "hccl/hccl_channel.h"
 #include "hccl/hccl_rank_graph.h"
-#include "plf_debug_config.h"
+#include "common/debug/plf_debug_config_pub.h"
 #include "coll_comm_mgr.h"
 #include "adapter_rts_common.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <set>
 #include <unordered_set>
+#include <vector>
 #include "launch_aicpu.h"
 #include "launch_device.h"
+#include "flush_manager.h"
 
 namespace hccl {
 namespace {
     std::unordered_map<HcclCommSymWindow, HcclComm> g_hcommWindowCommMap{};
     std::mutex g_hcommWindowCommMapMutex{};
+    // DPUTAG共享内存协议约定，与DPU侧实现（legacy/ascend950/framework/communicator）保持一致：
+    // 工作区大小100MB，前半区为NPU->DPU，后半区为DPU->NPU，flag位于各半区首字节
+    constexpr u64 DPU_SHARE_HBM_MEMORY_SIZE = 100 * 1024 * 1024;
+    constexpr u64 DPU_SHARE_HBM_MEMORY_HALF = DPU_SHARE_HBM_MEMORY_SIZE / 2;
+    // dpu2npu半区flag语义：0=空闲，1=响应就绪，2=对端异常退出（读侧见base_comm/primitives/api_c_adpt下
+    // aicpu_ts_sync_data_c_adpt.cc中的WaitFlagReady
+    constexpr uint8_t DPU2NPU_FLAG_ABORT = 2;
+
+    // 注册本 rank 的 host RDMA flush handle：flush 只在 host 网卡参与通信时才需排空，故只挑 rank graph
+    // 中 HOST 位置且支持 ROCE 的接口。FlushManager 与 CollComm 同处 hcomm.so，直接调用即可。
+    void InitFlushHandle(void* rankGraphV2, s32 deviceLogicId, const std::string& commId)
+    {
+        auto* graph = static_cast<Hccl::RankGraph*>(rankGraphV2);
+        if (graph == nullptr) {
+            return;
+        }
+        auto peer = graph->GetPeer(graph->GetMyRank());
+        if (peer == nullptr) {
+            HCCL_WARNING("[CollComm][InitFlushHandle] peer of my rank is null, skip. commId[%s]", commId.c_str());
+            return;
+        }
+        // 先筛出本 rank 的 host ROCE 接口：devPhyId 取不到时要能报出「0/N 一个都没注册」，
+        // 否则与「本 rank 无该类接口」在日志上无从区分，flush 整体失效会被当成正常
+        std::vector<Hccl::IpAddress> hostRoceIps;
+        for (const auto& iface : peer->GetIfaces()) {
+            if (iface == nullptr || iface->GetPos() != Hccl::AddrPosition::HOST
+                || iface->GetLinkProtocols().count(Hccl::LinkProtocol::ROCE) == 0) {
+                continue;
+            }
+            hostRoceIps.push_back(iface->GetAddr());
+        }
+        // 无 host ROCE 接口的通信域本就无需排空：提前返回，避免下面的取 id 失败被误报成 flush 失效
+        if (hostRoceIps.empty()) {
+            HCCL_INFO(
+                "[CollComm][InitFlushHandle] no host roce iface, nothing to register. commId[%s]", commId.c_str());
+            return;
+        }
+        u32 devPhyId = 0;
+        if (hrtGetDevicePhyIdByIndex(static_cast<u32>(deviceLogicId), devPhyId) != HCCL_SUCCESS) {
+            // Flush() 对 map 内缺失的 ip 无任何动作，此处失败即本通信域 flush 整体失效且不可回补
+            HCCL_ERROR(
+                "[CollComm][InitFlushHandle] get devicePhyId failed, deviceLogicId[%d], 0/%zu host roce iface "
+                "registered, Flush is disabled for this comm, commId[%s]",
+                deviceLogicId, hostRoceIps.size(), commId.c_str());
+            return;
+        }
+        u32 failNum = 0;
+        for (const auto& ip : hostRoceIps) {
+            if (Hccl::FlushManager::GetInstance().initFlushHandle(ip, devPhyId) != HCCL_SUCCESS) {
+                ++failNum;
+            }
+        }
+        // 注册失败不阻断通信域建立（与收编前一致），但须留痕：Flush() 对缺失的 ip 会静默跳过，排空随之失效
+        if (failNum != 0) {
+            HCCL_WARNING(
+                "[CollComm][InitFlushHandle] %u/%zu host roce iface flush register failed, "
+                "Flush() will skip them. commId[%s]",
+                failNum, hostRoceIps.size(), commId.c_str());
+        }
+        HCCL_INFO(
+            "[CollComm][InitFlushHandle] finish. host roce iface[%zu]. commId[%s]", hostRoceIps.size(), commId.c_str());
+    }
 } // namespace
 
 HcclResult RecordHcommWindowOwner(HcclCommSymWindow winHandle, HcclComm comm)
@@ -91,6 +156,11 @@ CollComm::~CollComm()
         return;
     }
 
+    if (dcaInited_) {
+        hccl::CollCommMgr::GetInstance().GetDetectConnectionAnomalies(deviceLogicId_).Deinit();
+        dcaInited_ = false;
+    }
+
     // 先注销TaskException，再销毁通信域资源，防止通信域资源销毁后rts回调TaskException
     hcomm::TaskExceptionHost* handler = hcomm::TaskExceptionHost::GetInstance(deviceLogicId_);
     if (handler != nullptr) {
@@ -121,6 +191,32 @@ CollComm::~CollComm()
         (void)HcommTeamWindowDeregister(win); // 释放 L3 回填资源（remoteMems/sizes）
     }
     HCCL_INFO("[CollComm][~CollComm] collComm deinit");
+    // 先停宿主侧 taskexception 握手再发 DESTROY_AICPU_COMM，否则 device 侧被置 INVALID 后不再回写停止标志，
+    // ~LegacyDpuThread 里的轮询会 10s 超时报 WARNING（非 dpu 场景内部幂等短路）。
+    // 本帧是兜底触发点：权威触发点是 CommunicatorImpl::DestroyImpl（设备侧仍有效时握手）；
+    // 两点共用 LegacyDpuThread::StopTaskexpService 的 taskExpStopped_ 幂等位，谁先到谁做，后者短路。
+    // 此处失败即意味兜底也没握上（多为超时），升级到 WARNING 让 10s 阻塞在外部可观测。
+    ThreadMgr* threadMgr = GetThreadMgr();
+    CpuThreadService* cpuService = (threadMgr == nullptr) ? nullptr : threadMgr->GetCpuThreadService();
+    if (cpuService == nullptr) {
+        // 无 commEngineResMgr_（simpleMode 或 Init 中途失败）即无 dpu 线程，握手从未发起，不算失败
+        HCCL_DEBUG("[CollComm][~CollComm] no dpu service, skip taskexp handshake, commId[%s]", commId_.c_str());
+    } else {
+        HcclResult stopRet = cpuService->StopTaskexpService();
+        if (stopRet != HCCL_SUCCESS) {
+            HCCL_WARNING(
+                "[CollComm][~CollComm] stop taskexp handshake failed, commId[%s], ret[%d]", commId_.c_str(),
+                static_cast<int>(stopRet));
+        }
+        // dfx 成员 hcclCommDfx_ 在成员析构阶段先于 commEngineResMgr_ 释放，而 kernel 错误路径经
+        // getDpuTaskInfoCallback 读 dfx；须先停 kernel 关掉该 UAF 窗口（DeInit 幂等，析构二次进入空转）
+        HcclResult deinitRet = cpuService->StopCpuKernel();
+        if (deinitRet != HCCL_SUCCESS) {
+            HCCL_WARNING(
+                "[CollComm][~CollComm] stop dpu kernel failed, commId[%s], ret[%d]", commId_.c_str(),
+                static_cast<int>(deinitRet));
+        }
+    }
     (void)DestroyAicpuComm();
     HCCL_RUN_INFO("[CollComm][~CollComm] cclBuffer free, commId[%s].", commId_.c_str());
 }
@@ -212,6 +308,11 @@ CollComm::InitFullMode(void* rankGraph, aclrtBinHandle binHandle, HcclMem cclBuf
     Hccl::HcclCommunicator* comV2 = static_cast<Hccl::HcclCommunicator*>(comm_);
     CHK_PTR_NULL(comV2);
     CHK_RET(comV2->GetCclBufferSharedPtr(cclBuffer_));
+    hccl::CollCommMgr::GetInstance().GetDetectConnectionAnomalies(deviceLogicId_).Init();
+    dcaInited_ = true;
+
+    // flush 收编后落在这里：原 CommunicatorImpl::InitFlushHandle 的时机与本函数同属通信域建立期
+    InitFlushHandle(rankGraph, deviceLogicId_, commId_);
 
     EXCEPTION_HANDLE_END
     return HCCL_SUCCESS;
@@ -1061,11 +1162,14 @@ HcclCommStatus CollComm::GetCommStatus() const
 
 HcclResult CollComm::Suspend()
 {
-    HCCL_RUN_INFO("[CollComm][Suspend] commId[%s] start to suspend.", commId_.c_str());
+    HCCL_RUN_INFO("[CollComm][NsRecovery][%s] commId[%s] start to suspend.", __func__, commId_.c_str());
     {
         std::lock_guard<std::mutex> lock(commMutex_);
         if (commStatus_ == HcclCommStatus::HCCL_COMM_STATUS_SUSPENDING) {
-            HCCL_WARNING("[CollComm][Suspend] The current communication has been suspended, no need to suspend again.");
+            HCCL_WARNING(
+                "[CollComm][NsRecovery][%s] commId[%s] The current communication has been suspended, no need to "
+                "suspend again.",
+                __func__, commId_.c_str());
             return HcclResult::HCCL_SUCCESS;
         }
 
@@ -1074,22 +1178,51 @@ HcclResult CollComm::Suspend()
         commStatus_ = HcclCommStatus::HCCL_COMM_STATUS_SUSPENDING;
     }
 
+    // 通信域异常退出时，AICPU侧可能正阻塞在HcommWaitResponse中轮询DPU响应（见WaitFlagReady），
+    // 此处向DPU->NPU半区首字节写入异常退出标志，令其立即结束等待，不再等到自身超时。
+    // 经 CpuThreadService 取地址（只查不拉起，挂起不新建 DPU 线程）。
+    HCCL_INFO("[CollComm][NsRecovery][%s] commId[%s] start to terminate WaitResponse", __func__, commId_.c_str());
+    void* addr{nullptr};
+    ThreadMgr* threadMgr = GetThreadMgr();
+    CpuThreadService* cpuService = (threadMgr == nullptr) ? nullptr : threadMgr->GetCpuThreadService();
+    HcclResult addrRet = (cpuService == nullptr) ? HCCL_E_PTR : cpuService->GetCpuTagAddrIfLaunched(addr);
+    // addr为nullptr说明本通信域未拉起DPU（没有DPUTAG），此时无事可写
+    if (addrRet != HCCL_SUCCESS || addr == nullptr) {
+        // 通知失败不阻断挂起流程，AICPU侧仍会按自身超时退出等待
+        HCCL_RUN_INFO(
+            "[CollComm][NsRecovery][%s] get dpu share mem failed, skip write terminate flag, commId[%s], "
+            "addr[%p], ret[%d]",
+            __func__, commId_.c_str(), addr, addrRet);
+        return myRank_->StopLaunch();
+    }
+    void* dpu2npuFlag = static_cast<uint8_t*>(addr) + DPU_SHARE_HBM_MEMORY_HALF;
+    // 与DPU线程写同一flag的方式保持一致（legacy_dpu_thread/task_service.cc SynchronizeControlInfo为release语义），
+    // 避免对同一字节的原子/非原子混合访问
+    static_cast<std::atomic<uint8_t>*>(dpu2npuFlag)->store(DPU2NPU_FLAG_ABORT, std::memory_order_release);
+    HCCL_RUN_INFO(
+        "[CollComm][NsRecovery][%s] write terminate flag success, commId[%s], flagAddr[%p]", __func__, commId_.c_str(),
+        dpu2npuFlag);
+
     return myRank_->StopLaunch();
 }
 
 HcclResult CollComm::Clean()
 {
-    HCCL_RUN_INFO("[CollComm][Clean] commId[%s] start to clean.", commId_.c_str());
+    HCCL_RUN_INFO("[CollComm][NsRecovery][%s] commId[%s] start to clean.", __func__, commId_.c_str());
     {
         std::lock_guard<std::mutex> lock(commMutex_);
         if (commStatus_ != HcclCommStatus::HCCL_COMM_STATUS_SUSPENDING) {
             HCCL_ERROR(
-                "[CollComm][Clean] The current communication is not suspended, cannot clean, status is [%u]",
-                static_cast<uint32_t>(commStatus_));
+                "[CollComm][NsRecovery][%s] commId[%s] The current communication is not suspended, cannot clean, "
+                "status is [%u]",
+                __func__, commId_.c_str(), static_cast<uint32_t>(commStatus_));
             return HcclResult::HCCL_E_NOT_SUPPORT;
         }
         if (isCleaned_) {
-            HCCL_WARNING("[CollComm][Clean] The current communication has been cleaned, no need to clean again.");
+            HCCL_WARNING(
+                "[CollComm][NsRecovery][%s] commId[%s] The current communication has been cleaned, no need to clean "
+                "again.",
+                __func__, commId_.c_str());
             return HcclResult::HCCL_SUCCESS;
         }
 
@@ -1107,21 +1240,26 @@ HcclResult CollComm::Resume()
     {
         std::lock_guard<std::mutex> lock(commMutex_);
         if (commStatus_ == HcclCommStatus::HCCL_COMM_STATUS_INVALID) {
-            HCCL_ERROR("[CollComm][Resume] Comm has been error, can not resume now!");
+            HCCL_ERROR(
+                "[CollComm][NsRecovery][%s] commId[%s] Comm has been error, can not resume now!", __func__,
+                commId_.c_str());
             return HcclResult::HCCL_E_INTERNAL;
         }
         if (commStatus_ != HcclCommStatus::HCCL_COMM_STATUS_SUSPENDING) {
             HCCL_WARNING(
-                "[CollComm][Resume] The current communication is normal, no need to resume, status is [%u]",
-                static_cast<uint32_t>(commStatus_));
+                "[CollComm][NsRecovery][%s] commId[%s] The current communication is normal, no need to resume, status "
+                "is [%u]",
+                __func__, commId_.c_str(), static_cast<uint32_t>(commStatus_));
             return HcclResult::HCCL_SUCCESS;
         }
 
-        HCCL_INFO("[CollComm][Resume] start to Resume.");
+        HCCL_INFO("[CollComm][NsRecovery][%s] commId[%s] start to Resume.", __func__, commId_.c_str());
         CHK_SMART_PTR_NULL(myRank_);
         auto ret = myRank_->Resume();
         if (ret != HcclResult::HCCL_SUCCESS) {
-            HCCL_ERROR("[CollComm][Resume] %s failed, ret = 0x%016llx", __func__, HCCL_ERROR_CODE(ret));
+            HCCL_ERROR(
+                "[CollComm][NsRecovery][%s] commId[%s] failed, ret = 0x%016llx", __func__, commId_.c_str(),
+                HCCL_ERROR_CODE(ret));
             return ret;
         }
 
@@ -1129,7 +1267,8 @@ HcclResult CollComm::Resume()
             auto notifyRet = commEngineResMgr_->ResetCommLocalNotifies();
             if (notifyRet != HcclResult::HCCL_SUCCESS) {
                 HCCL_ERROR(
-                    "[CollComm][Resume] ResetCommLocalNotifies failed, ret = 0x%016llx", HCCL_ERROR_CODE(notifyRet));
+                    "[CollComm][NsRecovery][%s] commId[%s] ResetCommLocalNotifies failed, ret = 0x%016llx", __func__,
+                    commId_.c_str(), HCCL_ERROR_CODE(notifyRet));
                 return notifyRet;
             }
         }
@@ -1137,7 +1276,7 @@ HcclResult CollComm::Resume()
         commStatus_ = HcclCommStatus::HCCL_COMM_STATUS_READY;
         isCleaned_ = false;
     }
-    HCCL_INFO("[CollComm][Resume] commId[%s] resume success.", commId_.c_str());
+    HCCL_INFO("[CollComm][NsRecovery][%s] commId[%s] resume success.", __func__, commId_.c_str());
     return HcclResult::HCCL_SUCCESS;
 }
 
@@ -1178,14 +1317,21 @@ HcclResult CollComm::GetRankIpPortMap()
     return HCCL_SUCCESS;
 }
 
-HcclResult CollComm::GetHcclBinHandle(aclrtBinHandle& binHcclHandle)
+HcclResult CollComm::GetHcclBinHandle(aclrtBinHandle& binHcclHandle, const std::string& soName)
 {
+    CHK_PRT_RET(soName.empty(), HCCL_ERROR("[%s]soName is empty.", __func__), HCCL_E_PARA);
     std::lock_guard<std::mutex> lock(binHcclmutex_);
     HCCL_DEBUG("[%s] GetHcclBinHandle", __func__);
     if (binHcclHandle_ == nullptr) {
         std::string hcclJsonPath;
         CHK_RET(GetKernelFilePath(hcclJsonPath));
-        hcclJsonPath += "libscatter_aicpu_kernel.json";
+        std::string jsonName = soName;
+        const std::string soSuffix = ".so";
+        if (jsonName.size() > soSuffix.size() && jsonName.rfind(soSuffix) == jsonName.size() - soSuffix.size()) {
+            jsonName.resize(jsonName.size() - soSuffix.size());
+        }
+        jsonName += ".json";
+        hcclJsonPath += jsonName;
         HcclResult ret
             = LoadBinaryFromFile(hcclJsonPath.c_str(), ACL_RT_BINARY_LOAD_OPT_CPU_KERNEL_MODE, 0, binHcclHandle_);
         CHK_PRT_RET(
@@ -1196,8 +1342,8 @@ HcclResult CollComm::GetHcclBinHandle(aclrtBinHandle& binHcclHandle)
             ret);
 
         HCCL_INFO(
-            "[%s]load aicpu file success, path[%s] optionType[%u] cpuKernelMode[%u].", __func__, hcclJsonPath.c_str(),
-            ACL_RT_BINARY_LOAD_OPT_CPU_KERNEL_MODE, 0);
+            "[%s]load aicpu file success, soName[%s] path[%s] optionType[%u] cpuKernelMode[%u].", __func__,
+            soName.c_str(), hcclJsonPath.c_str(), ACL_RT_BINARY_LOAD_OPT_CPU_KERNEL_MODE, 0);
     }
     binHcclHandle = binHcclHandle_;
     return HCCL_SUCCESS;

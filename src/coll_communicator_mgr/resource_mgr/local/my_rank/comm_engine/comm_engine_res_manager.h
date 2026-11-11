@@ -16,7 +16,6 @@
 #include "hccl/hccl_res.h"
 #include "hccl_independent_common.h"
 #include "thread_manager.h"
-#include "notify_manager.h"
 
 namespace hccl {
 class CommEngineResMgr {
@@ -34,22 +33,24 @@ public:
     HcclResult
     HcclThreadAcquireWithStream(CommEngine engine, rtStream_t stream, uint32_t notifyNum, ThreadHandle* thread);
     HcclResult HcclGetNotifyNumInThread(ThreadHandle thread, CommEngine engine, uint32_t* notifyNum);
-    HcclResult HcclAllocNotify(
-        CommEngine commEngine, ::NotifyType notifyType, uint32_t notifyNum, NotifyHandle** notifyHandleList);
-    HcclResult HcommFreeNotify(uint32_t notifyNum, NotifyHandle* notifyHandleList);
     HcclResult HcclThreadExportToCommEngine(
         uint32_t threadNum, const ThreadHandle* threads, CommEngine dstCommEngine, ThreadHandle* exportedThreads);
     HcclResult HcclThreadResGetInfo(ThreadHandle thread, ThreadResType resType, uint32_t infoLen, void** info);
     HcclResult
     HcclDedicatedThreadAcquire(HcclDedicatedThreadType useType, uint32_t notifyNumPerThread, ThreadHandle* thread);
+    HcclResult HcclDedicatedThreadDfx(std::function<HcclResult(u32, u32, const Hccl::TaskParam&, u64)> dfxCallback);
     HcclResult RegisterOrderLaunchThread(ThreadHandle thread);
     HcclResult SetAttachedStream(rtStream_t stream);
     // N秒快恢 Resume：重置 CommEngine 平面上已触发但未消费的 local notify 状态
     HcclResult ResetCommLocalNotifies();
+    /**
+     * @brief 取线程管理器，供收编后的 commId → CollComm → CommEngineResMgr → ThreadMgr 查找链使用
+     * @return ThreadMgr* 线程管理器指针；Init 之前为 nullptr
+     */
+    ThreadMgr* GetThreadMgr() { return threadMgr_.get(); }
 
 private:
     std::unique_ptr<ThreadMgr> threadMgr_;
-    std::unique_ptr<NotifyManager> notifyMgr_;
     std::mutex mtx_;
 };
 } // namespace hccl

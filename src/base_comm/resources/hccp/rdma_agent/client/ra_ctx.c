@@ -42,7 +42,6 @@ struct RaCtxOps gRaHdcCtxOps = {
     .raCtxQpBind = RaHdcCtxQpBind,
     .raCtxQpUnbind = RaHdcCtxQpUnbind,
     .raCtxBatchSendWr = RaHdcCtxBatchSendWr,
-    .raCtxUpdateCi = RaHdcCtxUpdateCi,
     .raCtxQueryQpBatch = RaHdcCtxQpQueryBatch,
     .raCtxGetAuxInfo = RaHdcCtxGetAuxInfo,
     .raCtxNotifyEvent = RaHdcCtxNotifyEvent,
@@ -72,7 +71,6 @@ struct RaCtxOps gRaPeerCtxOps = {
     .raCtxQpBind = RaPeerCtxQpBind,
     .raCtxQpUnbind = RaPeerCtxQpUnbind,
     .raCtxBatchSendWr = NULL,
-    .raCtxUpdateCi = NULL,
     .raCtxQueryQpBatch = NULL,
     .raCtxGetAuxInfo = NULL,
     .raCtxNotifyEvent = NULL,
@@ -990,24 +988,6 @@ HCCP_ATTRI_VISI_DEF int RaBatchSendWr(void *qpHandle, struct SendWrData wrList[]
     return ConverReturnCode(RDMA_OP, ret);
 }
 
-HCCP_ATTRI_VISI_DEF int RaCtxUpdateCi(void *qpHandle, uint16_t ci)
-{
-    struct RaCtxQpHandle *qpHandleTmp = NULL;
-    int ret;
-
-    CHK_PRT_RETURN(qpHandle == NULL, hccp_err("[update][ra_qp]qp_handle is NULL"), ConverReturnCode(RDMA_OP, -EINVAL));
-
-    qpHandleTmp = (struct RaCtxQpHandle *)qpHandle;
-    CHK_PRT_RETURN(qpHandleTmp->ctxHandle == NULL || qpHandleTmp->ctxHandle->ctxOps == NULL ||
-                       qpHandleTmp->ctxHandle->ctxOps->raCtxUpdateCi == NULL,
-        hccp_err("[update][ra_qp]ctx_handle or ctx_ops "
-                 "or ra_ctx_update_ci is NULL"),
-        ConverReturnCode(RDMA_OP, -EINVAL));
-
-    ret = qpHandleTmp->ctxHandle->ctxOps->raCtxUpdateCi(qpHandleTmp, ci);
-    return ConverReturnCode(RDMA_OP, ret);
-}
-
 HCCP_ATTRI_VISI_DEF int RaCtxGetAuxInfo(void *ctxHandle, struct HccpAuxInfoIn *in, struct HccpAuxInfoOut *out)
 {
     struct RaCtxHandle *ctxHandleTmp = NULL;
@@ -1100,19 +1080,9 @@ HCCP_ATTRI_VISI_DEF int RaCtxNotifyEvent(void *ctxHandle, struct CtxNotifyEvent 
     CHK_PRT_RETURN(ctxHandleTmp->ctxOps == NULL || ctxHandleTmp->ctxOps->raCtxNotifyEvent == NULL,
         hccp_err("[notify][event]ctxOps or raCtxNotifyEvent is NULL"), ConverReturnCode(RDMA_OP, -EINVAL));
 
-    if (!RaHdcHasCapability(ctxHandleTmp->attr.phyId, RA_CAP_UDMA_NOTIFY_EVENT)) {
-        hccp_run_warn("[notify][event]capability not support, phyId:%u", ctxHandleTmp->attr.phyId);
-        return ConverReturnCode(RDMA_OP, -ENOTSUPP);
-    }
-
     hccp_run_info("Input parameters: phyId:%u, devIndex:0x%x eventType:%u", ctxHandleTmp->attr.phyId,
         ctxHandleTmp->devIndex, event->eventType);
 
     ret = ctxHandleTmp->ctxOps->raCtxNotifyEvent(ctxHandleTmp, event);
-    CHK_PRT_RETURN(ret != 0,
-        hccp_err("[notify][event]raCtxNotifyEvent failed, ret:%d phyId:%u devIndex:0x%x", ret, ctxHandleTmp->attr.phyId,
-            ctxHandleTmp->devIndex),
-        ConverReturnCode(RDMA_OP, ret));
-
     return ConverReturnCode(RDMA_OP, ret);
 }

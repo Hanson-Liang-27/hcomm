@@ -8,7 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include <iomanip>
+#include <ios>
+#include <sstream>
 #include "aicpu_communicator.h"
 #include "dispatcher.h"
 #include "aicpu_hccl_process.h"
@@ -18,7 +19,7 @@
 #include "executor_tracer.h"
 #include "profiling_manager_device.h"
 #include "utils/aicpu_hdc_utils.h"
-#include "comm_engine_utils.h"
+#include "common/comm_engine_utils_pub.h"
 #include "utils/hccl_aicpu_utils.h"
 #include "framework/aicpu_hdc.h"
 #include "common/aicpu_sqe_context.h"
@@ -31,13 +32,14 @@
 #include "env_config.h"
 #include "config_log.h"
 #include "aicpu_one_side_service.h"
-#include "notify_manager.h"
+#include "local_notify.h"
 #include "dispatcher_aicpu.h"
 #include "dlprof_function.h"
 #include "profiling_command_handle.h"
 #include "dispatcher_ctx.h"
 #include "aicpu_res_package_helper.h"
 #include "aicpu_symmetric_memory.h"
+#include "common/dev_type_utils_pub.h"
 
 namespace hccl {
 constexpr u32 IPC_SIGNAL_MODULUS = 2;
@@ -1611,6 +1613,13 @@ HcclResult HcclCommAicpu::CleanAllRoceResource()
     // 清空备链路资源
     linkRdmaResBackUp_.clear();
     return HCCL_SUCCESS;
+}
+
+HcclResult HcclCommAicpu::ClearCaptureOpUnfoldCache(const uint64_t modelId)
+{
+    // aclgraph图销毁时, 清理该图capture期产生的op-unfold cache entry (按modelId精确匹配)
+    // 注意: 清理cache entry仅操作cacheHashMap_, 与resMap_/linkRes_等tag资源map无交集, 不需要持有preemptMutexForResMap_
+    return aicpuCacheManager_.ClearCaptureOpUnfoldCache(modelId);
 }
 
 HcclResult HcclCommAicpu::ClearOpResource(const std::string& tag)
@@ -5543,21 +5552,26 @@ HcclResult HcclCommAicpu::InitAicpuIndOp(CommAicpuParam* commAicpuParam)
     identifier_ = std::string(commAicpuParam->hcomId);
     topoInfo_.userRankSize = commAicpuParam->userRankSize;
     topoInfo_.userRank = commAicpuParam->userRank;
-    notifys_.reserve(hccl::HCCL_THREAD_NOTIFY_MAX_NUM);
     if (topoInfo_.deviceType == DevType::DEV_TYPE_910_93 || topoInfo_.deviceType == DevType::DEV_TYPE_910B) {
         notifySize_ = NOTIFY_SIZE_FOUR;
     } else {
         notifySize_ = NOTIFY_SIZE_EIGHT;
     }
 
-    CHK_RET(hrtSetWorkModeAicpu(true));
-    CHK_RET(hrtSetlocalDevice(topoInfo_.deviceLogicId));
-    CHK_RET(hrtSetlocalDeviceType(topoInfo_.deviceType));
     CHK_RET(hrtDrvGetLocalDevIDByHostDevID(topoInfo_.devicePhyId, &devId_));
     CHK_RET(taskExecption_.Init(devId_, topoInfo_.userRank, identifier_));
     CHK_RET(RegisterProfCallBack());
 
-    if (topoInfo_.deviceType == DevType::DEV_TYPE_950 || topoInfo_.deviceType == DevType::DEV_TYPE_960) {
+    // 谓词经 hrtSetlocalDeviceType 写入的全局态取数（由 RunAicpuCommInit 入口前置喂入）；原站点按 topoInfo_ 比较，
+    // 失败按 value_or(false) 兜底。独立调用路径下全局态可能为上次 comm 旧值，与本次入参分叉时告警显性化
+    DevType globalDevType = DevType::DEV_TYPE_COUNT;
+    if (hrtGetDeviceType(globalDevType) == HCCL_SUCCESS && globalDevType != topoInfo_.deviceType) {
+        HCCL_WARNING(
+            "[HcclCommAicpu][InitAicpuIndOp] global devType[%s] inconsistent with param deviceType[%s], the caller "
+            "may bypass RunAicpuCommInit.",
+            GetDevTypeStr(globalDevType), GetDevTypeStr(topoInfo_.deviceType));
+    }
+    if (hcomm::EqualToOrGreaterThan950().value_or(false)) {
         HCCL_INFO("[HcclCommAicpu][InitAicpuIndOp] InitAicpuIndOpV2 start");
         indOpCommInitialized_ = true;
         return HCCL_SUCCESS;
@@ -5601,20 +5615,21 @@ HcclResult HcclCommAicpu::InitThreads(ThreadMgrAicpuParam* param)
 {
     CHK_PTR_NULL(param);
     u32 threadNum = param->threadNum;
+    auto** entityList = static_cast<HcommThreadEntity**>(param->deviceHandle);
+    CHK_PTR_NULL(entityList);
+    for (u32 i = 0; i < threadNum; ++i) {
+        CHK_PTR_NULL(entityList[i]);
+    }
     std::vector<std::shared_ptr<Thread>> outThreads;
     outThreads.reserve(threadNum);
     std::string hcomId(param->hcomId);
     for (u32 i = 0; i < threadNum; ++i) {
-        std::string thdUniqueId(param->threadParam[i], THREAD_UNIQUE_ID_MAX_SIZE);
-        if (UNLIKELY(HcclCheckLogLevel(HCCL_LOG_INFO))) {
-            std::ostringstream oss;
-            oss << "threadParam[" << i << "] raw bytes: ";
-            for (u32 j = 0; j < THREAD_UNIQUE_ID_MAX_SIZE; ++j) {
-                oss << std::hex << std::setw(2) << std::setfill('0')
-                    << static_cast<unsigned int>(static_cast<unsigned char>(param->threadParam[i][j])) << " ";
-            }
-            HCCL_INFO("[HcclCommAicpu][%s] %s", __func__, oss.str().c_str());
-        }
+        uint32_t uidLen = 0;
+        const char* uidData = GetThreadUid(param, i, uidLen);
+        CHK_PRT_RET(
+            uidData == nullptr,
+            HCCL_ERROR("[HcclCommAicpu][%s] thread[%u] uid invalid, uidLen[%u]", __func__, i, uidLen), HCCL_E_PARA);
+        std::string thdUniqueId(uidData, uidLen);
         std::shared_ptr<AicpuTsThread> thread;
         EXCEPTION_CATCH((thread = std::make_shared<AicpuTsThread>(thdUniqueId)), return HCCL_E_PTR);
         thread->SetCommEngine(param->engine);
@@ -5628,12 +5643,10 @@ HcclResult HcclCommAicpu::InitThreads(ThreadMgrAicpuParam* param)
         outThreads.emplace_back(thread);
     }
 
-    ThreadHandle* threadArray = static_cast<ThreadHandle*>(param->deviceHandle);
-    // 空指针校验
-    CHK_PTR_NULL(threadArray);
     for (size_t i = 0; i < threadNum; ++i) {
-        threadArray[i] = reinterpret_cast<ThreadHandle>(outThreads[i].get()); // 拷贝裸指针
-        HCCL_INFO("[HcclCommAicpu][%s] threadArray[%u] = [%lu]", __func__, i, threadArray[i]);
+        ThreadHandle rawHandle = reinterpret_cast<ThreadHandle>(outThreads[i].get());
+        entityList[i]->compatThreadHandle = rawHandle;
+        HCCL_INFO("[HcclCommAicpu][%s] threadHandle[%zu] = [%lu]", __func__, i, rawHandle);
     }
     std::unique_lock<std::shared_mutex> rwLock(threadAicpuMutex_);
     threads_.insert(
@@ -5641,7 +5654,9 @@ HcclResult HcclCommAicpu::InitThreads(ThreadMgrAicpuParam* param)
     HCCL_INFO(
         "[HcclCommAicpu][%s] comm identifier[%s], init threads num[%u] success", __func__, hcomId.c_str(), threadNum);
     // 为上报翻转初始化资源
-    if (topoInfo_.deviceType != DevType::DEV_TYPE_950 && topoInfo_.deviceType != DevType::DEV_TYPE_960) {
+    // 原判断 topoInfo_.deviceType（拓扑探测，与谓词同源本机设备）；按用户裁决改用谓词（方案 §2.3 偏差 6），
+    // 取数失败按 950/960 处理（跳过初始化，规则 10 保守侧）
+    if (!hcomm::EqualToOrGreaterThan950().value_or(true)) {
         CHK_RET(InitProfthreadResource(threadNum));
     }
     return HCCL_SUCCESS;
@@ -5943,75 +5958,6 @@ HcclResult HcclCommAicpu::SetChannelRoceNotify(
     }
     roceNotifyNum = channelRoce.singleQPNotifyNum;
     HCCL_DEBUG("[%s]get roceNotify success, roceNotifyNum[%u]", __func__, roceNotifyNum);
-    return HCCL_SUCCESS;
-}
-
-HcclResult HcclCommAicpu::NotifyAlloc(NotifyMgrAicpuParam* param)
-{
-    u32 notifyNum = param->notifyNum;
-    std::string notifysStr = std::string(param->notifyParam, NOTIFY_UNIQUE_ID_MAX_SIZE);
-    std::string hcomId(param->hcomId);
-    size_t notifySize = notifys_.size();
-    HCCL_INFO(
-        "[HcclCommAicpu][%s] comm identifier[%s], alloc notify num[%u] begin, before notifySize[%u]", __func__,
-        hcomId.c_str(), notifyNum, notifySize);
-    if (UNLIKELY(HcclCheckLogLevel(HCCL_LOG_INFO))) {
-        std::ostringstream oss;
-        oss << "notifyParam" << " raw bytes: ";
-        for (u32 i = 0; i < NOTIFY_UNIQUE_ID_MAX_SIZE; ++i) {
-            oss << std::hex << std::setw(2) << std::setfill('0')
-                << static_cast<unsigned int>(static_cast<unsigned char>(param->notifyParam[i])) << " ";
-        }
-        HCCL_INFO("[HcclCommAicpu][%s] %s", __func__, oss.str().c_str());
-    }
-    HcclResult ret = NotifyManager::ParseBinNotifys(notifysStr, notifys_);
-    if (ret != HCCL_SUCCESS) {
-        HCCL_ERROR(
-            "[HcclCommAicpu][%s] comm identifier[%s], alloc notify num[%u] failed %u", __func__, hcomId.c_str(),
-            notifyNum, ret);
-        return ret;
-    }
-    HCCL_INFO(
-        "[HcclCommAicpu][%s] comm identifier[%s], alloc notify num[%u] end, after notifySize[%u]", __func__,
-        hcomId.c_str(), notifyNum, notifys_.size());
-    NotifyHandle* notifyArray = static_cast<NotifyHandle*>(param->deviceHandle);
-    CHK_PTR_NULL(notifyArray);
-    // 空指针校验
-    for (size_t i = 0; i < notifyNum; ++i) {
-        notifyArray[i] = reinterpret_cast<NotifyHandle>(notifys_[i + notifySize].get()); // 拷贝裸指针
-        HCCL_INFO("[HcclCommAicpu][%s] notifyArray[%u] = [%lu]", __func__, i + notifySize, notifyArray[i]);
-    }
-
-    HCCL_INFO(
-        "[HcclCommAicpu][%s] comm identifier[%s], alloc notify num[%u] success", __func__, hcomId.c_str(), notifyNum);
-    return HCCL_SUCCESS;
-}
-
-HcclResult HcclCommAicpu::NotifyFree(NotifyMgrAicpuParam* param)
-{
-    u32 notifyNum = param->notifyNum;
-    NotifyHandle* notifyArray = static_cast<NotifyHandle*>(param->deviceHandle);
-    std::string hcomId(param->hcomId);
-    // 空指针校验
-    CHK_PTR_NULL(notifyArray);
-    for (size_t i = 0; i < notifyNum; ++i) {
-        LocalNotify* notify = reinterpret_cast<LocalNotify*>(notifyArray[i]);
-        HCCL_INFO("[HcclCommAicpu][%s] notifyArray[%u]=[%lu]", __func__, i, notifyArray[i]);
-        auto it = std::find_if(notifys_.begin(), notifys_.end(), [notify](const std::unique_ptr<LocalNotify>& ptr) {
-            return ptr.get() == notify;
-        });
-        if (it != notifys_.end()) {
-            HCCL_INFO(
-                "[HcclCommAicpu][%s] comm identifier[%s], free notify[%u] success", __func__, hcomId.c_str(),
-                notifyArray[i]);
-            notifys_.erase(it);
-        } else {
-            HCCL_RUN_WARNING("[HcclCommAicpu][%s] localNotify[%u] not found in notifys_", __func__, i);
-        }
-    }
-
-    HCCL_INFO(
-        "[HcclCommAicpu][%s] comm identifier[%s], free notify num[%u] success", __func__, hcomId.c_str(), notifyNum);
     return HCCL_SUCCESS;
 }
 

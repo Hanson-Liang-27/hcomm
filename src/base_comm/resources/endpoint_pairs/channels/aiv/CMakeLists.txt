@@ -13,7 +13,8 @@ set(src_list
     aiv_ub_mem_transport.cc
     aiv_urma_channel.cc
     aiv_urma_transport.cc
-    aiv_channel_helper.cc
+    aiv_roce_host_loc_channel.cc
+    aiv_channel_entity.cc
 )
 
 if(TARGET hcomm_base_obj)

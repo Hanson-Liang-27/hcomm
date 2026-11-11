@@ -23,7 +23,6 @@ target_include_directories(cmd PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../plugin
         ${CMAKE_CURRENT_SOURCE_DIR}/../store
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../include/runnerdb
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include/topo
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include/store
         ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/nlohmann_json
@@ -33,9 +32,12 @@ target_include_directories(cmd PRIVATE
         ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/profiling
         ${ASCEND_CANN_PACKAGE_PATH}/include
         ${ASCEND_CANN_PACKAGE_PATH}/include/hccl
-
-        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
 )
+if(NOT BUILD_LEVEL1_ONLY)
+    target_include_directories(cmd PRIVATE
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+    )
+endif()
 
 hcclvm_apply_common_flags(cmd)
 
@@ -44,7 +46,8 @@ target_link_libraries(cmd PRIVATE
         rt
         common
         log
-        runnerdb
+        runtime_state
+        operation_data
         store
         topo
         CLI11::CLI11

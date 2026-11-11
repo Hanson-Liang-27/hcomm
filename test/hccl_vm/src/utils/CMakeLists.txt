@@ -8,8 +8,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-# --- log library (sim_log.cc + sim_yaml_config.cc + sim_common.cpp) ---
-add_library(log STATIC sim_log.cc sim_yaml_config.cc sim_common_api.cc)
+# --- log library (共享日志后端源清单：模式解析/真库转发/device 转换器) ---
+add_library(log STATIC ${HCCLVM_LOG_SOURCES})
 
 target_include_directories(log PUBLIC
         ${CMAKE_SOURCE_DIR}/include
@@ -35,6 +35,8 @@ target_compile_definitions(log PUBLIC HAVE_YAML_CPP)
 hcclvm_apply_common_flags(log)
 
 target_link_libraries(log PRIVATE yaml-cpp::yaml-cpp)
+# cann 模式经 dlopen/dlsym 解析 CANN 日志真库：dl 依赖需向消费方传递。
+target_link_libraries(log PUBLIC ${CMAKE_DL_LIBS})
 
 if(TARGET third_party_yaml_cpp)
     add_dependencies(log third_party_yaml_cpp)
@@ -47,7 +49,6 @@ hcclvm_apply_common_flags(loader)
 
 target_include_directories(loader PRIVATE
     ${PROJECT_SOURCE_DIR}/include
-    ${PROJECT_SOURCE_DIR}/include/runnerdb
     ${PROJECT_SOURCE_DIR}/include/store
 
     ${HCCL_VM_SRC}
@@ -64,13 +65,17 @@ target_include_directories(loader PRIVATE
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime/runtime
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/runtime/runtime/rts
-
-    ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
 )
+if(NOT BUILD_LEVEL1_ONLY)
+    target_include_directories(loader PRIVATE
+        ${HCOMM_CODE_ROOT}/src/base_comm/resources/ccu/ccu_microcode
+    )
+endif()
 
 target_link_libraries(loader PRIVATE
     log
-    runnerdb
+    runtime_state
+    operation_data
     rt
 )
 

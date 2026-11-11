@@ -29,10 +29,12 @@ target_sources(test_aiv_st PRIVATE
     ${CHECKER_SRC}/utils/storage_manager.cc
     ${CHECKER_SRC}/utils/binary_data_operator.cc
     ${CHECKER_SRC}/framework/task_graph_generator_v3/ccu_graph_generator_v3/ccu_all_rank_param_recorder_v3.cc
+    ${CHECKER_SRC}/dfx/ccu_resource_stats_dfx.cc
     ${CHECKER_SRC}/log/log_stub.cc
 )
 
 target_include_directories(test_aiv_st BEFORE PRIVATE
+    ${CHECKER_SRC}
     ${CHECKER_SRC}/utils
     ${CHECKER_SRC}/checker
     ${CHECKER_SRC}/log
@@ -52,7 +54,9 @@ target_include_directories(test_aiv_st BEFORE PRIVATE
 
 target_link_libraries(test_aiv_st PRIVATE
     log
-    runnerdb
+    runtime_state
+    operation_data
+    storage
     ${ASCEND_CANN_PACKAGE_PATH}/${CANN_ARCH_DIR}/lib64/libc_sec.a
 )
 

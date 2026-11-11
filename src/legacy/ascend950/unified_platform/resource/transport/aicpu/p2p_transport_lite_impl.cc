@@ -8,13 +8,14 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
+#include "sal.h"
+#include "device_exec_timeout_pub.h"
 #include <cmath>
 #include "p2p_transport_lite_impl.h"
 #include "binary_stream.h"
 #include "exception_util.h"
-#include "communicator_impl_lite_manager.h"
-#include "res_pub.h"
+#include "dfx/device/dfx_res_pub.h"
 #include "unified_platform/pub_inc/config_plf_log_v2.h"
 
 namespace Hccl {
@@ -211,27 +212,32 @@ P2PTransportLiteImpl::BuildLocRmaBufferLite(const uintptr_t addr, const size_t s
 void P2PTransportLiteImpl::BuildNotifyRecordTask(const StreamLite& stream, u64 rmtNotifyAddr)
 {
     // Post仅需向对端寄存器写入1
+    stream.GetRtsq()->SetCurrentTransportContext(
+        ReinterpretAs<u64>(this), DfxLinkTypeVal::LINK_PCIE,
+        static_cast<u8>(DfxTransportType::DFX_TRANSPORT_TYPE_SDMA));
     stream.GetRtsq()->P2PWriteValue(rmtNotifyAddr, NOTIFY_RECORD_WRITE_VALUE);
 }
 
 void P2PTransportLiteImpl::BuildNotifyWaitTask(const StreamLite& stream, u32 notifyId)
 {
+    stream.GetRtsq()->SetCurrentTransportContext(
+        ReinterpretAs<u64>(this), DfxLinkTypeVal::LINK_PCIE,
+        static_cast<u8>(DfxTransportType::DFX_TRANSPORT_TYPE_SDMA));
     stream.GetRtsq()->NotifyWait(notifyId);
 }
 
-void P2PTransportLiteImpl::BuildP2PRead(const StreamLite& stream, const RmaBufferLite& loc, const Buffer& rmt)
+HcclResult P2PTransportLiteImpl::BuildP2PRead(const StreamLite& stream, const RmaBufferLite& loc, const Buffer& rmt)
 {
     if (UNLIKELY(rmt.GetSize() != loc.GetSize())) {
         HCCL_ERROR(
             "[P2PTransportLiteImpl]%s srcBuffer size[%llu] is not equal to distBuffer size[%llu], return", __func__,
             rmt.GetSize(), loc.GetSize());
-        THROW<InternalException>("[P2PTransportLiteImpl]BuildP2PRead srcBuffer is not equal to distBuffer");
-        return;
+        return HCCL_E_INTERNAL;
     }
 
     if (UNLIKELY(rmt.GetSize() == 0)) {
         HCCL_WARNING("[P2PTransportLiteImpl]%s srcBuffer size is 0, return", __func__);
-        return;
+        return HCCL_SUCCESS;
     }
 
     HCCL_INFO(
@@ -252,6 +258,9 @@ void P2PTransportLiteImpl::BuildP2PRead(const StreamLite& stream, const RmaBuffe
         }
 
         auto taskId = stream.GetRtsq()->GetTaskId();
+        stream.GetRtsq()->SetCurrentTransportContext(
+            ReinterpretAs<u64>(this), DfxLinkTypeVal::LINK_PCIE,
+            static_cast<u8>(DfxTransportType::DFX_TRANSPORT_TYPE_SDMA));
         stream.GetRtsq()->SdmaCopy(src, dst, blockSize, 0);
         HCCL_INFO(
             "P2PTransportLiteImpl::%s, srcA:0x%llx dstA:0x%llx,size=0x%llx, taskId=%u", __func__, src, dst, blockSize,
@@ -286,6 +295,8 @@ void P2PTransportLiteImpl::BuildP2PRead(const StreamLite& stream, const RmaBuffe
         src += offset;
         dst += offset;
     }
+
+    return HCCL_SUCCESS;
 }
 
 void P2PTransportLiteImpl::BuildP2PReadReduce(
@@ -323,6 +334,9 @@ void P2PTransportLiteImpl::BuildP2PReadReduce(
         }
 
         auto taskId = stream.GetRtsq()->GetTaskId();
+        stream.GetRtsq()->SetCurrentTransportContext(
+            ReinterpretAs<u64>(this), DfxLinkTypeVal::LINK_PCIE,
+            static_cast<u8>(DfxTransportType::DFX_TRANSPORT_TYPE_SDMA));
         stream.GetRtsq()->SdmaReduce(src, dst, blockSize, 0, reduceIn);
 
         HCCL_INFO(
@@ -362,16 +376,13 @@ void P2PTransportLiteImpl::BuildP2PReadReduce(
     }
 }
 
-void P2PTransportLiteImpl::Post(u32 index, const StreamLite& stream)
+HcclResult P2PTransportLiteImpl::Post(u32 index, const StreamLite& stream)
 {
     if (UNLIKELY(index >= rmtNotifyVec.size())) {
         HCCL_ERROR(
             "[P2PTransportLiteImpl]%s notify out-of-bounds, notifyNum[%u], index[%u]", __func__, rmtNotifyVec.size(),
             index);
-        THROW<InternalException>(
-            "[P2PTransportLiteImpl]%s notify out-of-bounds, notifyNum[%u], index[%u]", __func__, rmtNotifyVec.size(),
-            index);
-        return;
+        return HCCL_E_INTERNAL;
     }
 
     auto taskId = stream.GetRtsq()->GetTaskId();
@@ -401,18 +412,21 @@ void P2PTransportLiteImpl::Post(u32 index, const StreamLite& stream)
     slot->channelHandle = ReinterpretAs<u64>(this);
     slot->taskPara.Notify.notifyId = rmtNotifyVec[index].id;
     PLF_CONFIG_INFO(Hccl::PLF_TASK, "[%s] %s", __func__, slot->Describe().c_str());
-    return;
+    return HCCL_SUCCESS;
 }
 
 void P2PTransportLiteImpl::Wait(u32 index, const StreamLite& stream)
 {
-    WaitWithTimeout(index, stream, CommunicatorImplLiteMgr::GetInstance().GetEnvConfig().hcclExecTimeout);
+    WaitWithTimeout(index, stream, Hccl::GetDeviceExecTimeout());
 }
 
 void P2PTransportLiteImpl::WaitWithTimeout(u32 index, const StreamLite& stream, u32 timeout)
 {
     auto taskId = stream.GetRtsq()->GetTaskId();
     auto notifyId = locNotifyVec[index]->GetId();
+    stream.GetRtsq()->SetCurrentTransportContext(
+        ReinterpretAs<u64>(this), DfxLinkTypeVal::LINK_PCIE,
+        static_cast<u8>(DfxTransportType::DFX_TRANSPORT_TYPE_SDMA));
     stream.GetRtsq()->NotifyWait(notifyId, timeout);
 
     HCCL_INFO(
@@ -439,9 +453,10 @@ void P2PTransportLiteImpl::WaitWithTimeout(u32 index, const StreamLite& stream, 
     return;
 }
 
-void P2PTransportLiteImpl::Read(const RmaBufferLite& loc, const Buffer& rmt, const StreamLite& stream)
+HcclResult P2PTransportLiteImpl::Read(const RmaBufferLite& loc, const Buffer& rmt, const StreamLite& stream)
 {
-    BuildP2PRead(stream, loc, rmt);
+    CHK_RET(BuildP2PRead(stream, loc, rmt));
+    return HCCL_SUCCESS;
 }
 
 void P2PTransportLiteImpl::ReadReduce(
@@ -464,7 +479,9 @@ void P2PTransportLiteImpl::BatchTransfer(
             THROW<InternalException>("[P2PTransportLiteImpl]BatchTransfer not support WRITE");
         } else if (transferOp[i].transType == TransferType::READ) {
             if (transferOp[i].reduceIn.reduceOp == ReduceOp::INVALID) {
-                BuildP2PRead(stream, loc[i], rmt[i]);
+                CHK_RET_THROW(
+                    InternalException, "[P2PTransportLiteImpl][BatchTransfer]BuildP2PRead failed",
+                    BuildP2PRead(stream, loc[i], rmt[i]));
             } else {
                 BuildP2PReadReduce(stream, loc[i], rmt[i], transferOp[i].reduceIn);
             }

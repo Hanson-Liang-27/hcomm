@@ -99,6 +99,8 @@ function(hcomm_experimental_plugin_common target_name output_name)
         ${HCOMM_SOURCE_DIR}/src/framework/communicator/impl/resource_manager
         ${HCOMM_SOURCE_DIR}/src/framework/communicator/impl/one_sided_service
         ${HCOMM_SOURCE_DIR}/src/framework/op_base/src
+        ${HCOMM_SOURCE_DIR}/src/base_comm
+        ${HCOMM_SOURCE_DIR}/src/base_comm/inc
         ${HCOMM_SOURCE_DIR}/src/base_comm/common
         ${HCOMM_SOURCE_DIR}/src/base_comm/common/device
         ${HCOMM_SOURCE_DIR}/src/base_comm/primitives/api_c_adpt
@@ -125,8 +127,6 @@ function(hcomm_experimental_plugin_common target_name output_name)
         ${HCOMM_SOURCE_DIR}/src/coll_communicator_mgr/resource_mgr/local/my_rank/endpoints
         ${HCOMM_SOURCE_DIR}/src/coll_communicator_mgr/resource_mgr/local/my_rank/comm_engine/engine_ctxs
         ${HCOMM_SOURCE_DIR}/src/coll_communicator_mgr/resource_mgr/remote/rank_pairs
-        ${HCOMM_SOURCE_DIR}/src/base_comm/dfx
-        ${HCOMM_SOURCE_DIR}/src/base_comm/dfx/aicpu
         ${HCOMM_SOURCE_DIR}/src/framework/common/src/h2d_tlv
         ${HCOMM_SOURCE_DIR}/src/common/debug/profiling/inc
         ${HCOMM_SOURCE_DIR}/src/common/debug/profiling/inc/host

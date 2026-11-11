@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
 #include "socket.h"
 
 #include "sal.h"
@@ -92,7 +92,7 @@ SocketStatus Socket::GetStatus(u32 timeout)
     }
 
     RaSocketGetParam param(socketHandle, remoteIp, tag, fdHandle);
-    RaSocketFdHandleParam result(nullptr, 0);
+    RaSocketFdHandleParam result(nullptr, 0, remoteIp);
     TRY_CATCH_PROCESS_THROW(
         NetworkApiException, result = HrtRaBlockGetOneSocket(static_cast<u32>(role), param, timeout),
         "Socket::GetStatus failed", PrintErrorSocketInfo());
@@ -103,6 +103,7 @@ SocketStatus Socket::GetStatus(u32 timeout)
     if (result.status == SOCKET_CONNECTED) {
         socketStatus = SocketStatus::OK;
         isConnected = true;
+        remoteIp = result.remoteIp;
         PLF_CONFIG_INFO(PLF_CHANNEL, "[Socket] link established, [%s].", this->Describe().c_str());
     } else if (result.status == SOCKET_CONNECT_TIMEOUT) {
         socketStatus = SocketStatus::TIMEOUT;
@@ -118,13 +119,17 @@ SocketStatus Socket::GetStatus(u32 timeout)
 
 bool Socket::Send(const void* sendBuf, u32 size) const
 {
+    socketStatus = SocketStatus::SENDING;
     HrtRaSocketBlockSend(fdHandle, sendBuf, size);
+    socketStatus = SocketStatus::OK;
     return true;
 }
 
 bool Socket::Recv(void* recvBuf, u32 size) const
 {
+    socketStatus = SocketStatus::RECVING;
     HrtRaSocketBlockRecv(fdHandle, recvBuf, size);
+    socketStatus = SocketStatus::OK;
     return true;
 }
 
@@ -412,7 +417,7 @@ void Socket::GetOneSocket()
 {
     RaSocketGetParam param(socketHandle, remoteIp, tag, fdHandle);
 
-    RaSocketFdHandleParam fdHandleParam(nullptr, 0);
+    RaSocketFdHandleParam fdHandleParam(nullptr, 0, remoteIp);
     EXCEPTION_CATCH(fdHandleParam = RaGetOneSocket(static_cast<u32>(role), param), return);
     // socket status:0 not connected 1:connected 2:connect timeout 3:connecting
     if (fdHandleParam.status == SOCKET_CONNECTED) {
@@ -420,6 +425,7 @@ void Socket::GetOneSocket()
         fdHandle = fdHandleParam.fdHandle;
         socketStatus = SocketStatus::OK;
         isConnected = true;
+        remoteIp = fdHandleParam.remoteIp;
         lastLogTime = {};
     } else if (fdHandleParam.status == SOCKET_CONNECT_TIMEOUT) {
         socketStatus = SocketStatus::TIMEOUT;
@@ -501,7 +507,7 @@ void Socket::SendAsync(const void* sendBuf, u32 size)
     socketStatus = SocketStatus::SENDING;
 }
 
-void Socket::RecvAsync(u8* recvBuf, u32 size)
+void Socket::RecvAsync(void* recvBuf, u32 size)
 {
     if (!recvBuf) {
         THROW<SocketException>(StringFormat(
@@ -534,7 +540,7 @@ void Socket::RecvAsync(u8* recvBuf, u32 size)
     recvSize = 0;
     totalRecvSize = 0;
     recvLeftSize = size;
-    recvDataBuff = static_cast<void*>(recvBuf);
+    recvDataBuff = recvBuf;
 
     reqHandle = HrtRaSocketRecvAsync(fdHandle, recvDataBuff, recvLeftSize, recvSize);
     HCCL_INFO(
@@ -543,6 +549,43 @@ void Socket::RecvAsync(u8* recvBuf, u32 size)
 
     lastLogTime = {};
     socketStatus = SocketStatus::RECVING;
+}
+
+HcclResult Socket::Accept(const std::string& listenTag, std::shared_ptr<Socket>& acceptedSocket, u32 acceptTimeOut)
+{
+    if (role != SocketRole::SERVER) {
+        HCCL_WARNING("[Socket::%s] role[%s] is not SERVER, skip accept", __func__, role.Describe().c_str());
+        return HCCL_E_PARA;
+    }
+
+    acceptedSocket = nullptr;
+    EXCEPTION_CATCH(
+        acceptedSocket
+        = std::make_shared<Socket>(socketHandle, localIp, listenPort, localIp, listenTag, SocketRole::SERVER, nicType),
+        return HCCL_E_PTR);
+    CHK_SMART_PTR_NULL(acceptedSocket);
+
+    HCCL_INFO(
+        "[Accept]localIp[%s], remoteIp[%s], socketHandle[%p], tag[%s]", localIp.GetIpStr().c_str(),
+        remoteIp.GetIpStr().c_str(), socketHandle, listenTag.c_str());
+
+    SocketStatus status = SocketStatus::INIT;
+    EXCEPTION_CATCH(status = acceptedSocket->GetStatus(acceptTimeOut), acceptedSocket = nullptr;
+                    return HCCL_E_INTERNAL);
+    if (status != SocketStatus::OK) {
+        HCCL_WARNING(
+            "[Socket::%s] accept not established, status[%s], [%s].", __func__, status.Describe().c_str(),
+            Describe().c_str());
+        acceptedSocket = nullptr;
+        return (status == SocketStatus::TIMEOUT) ?
+                   HCCL_E_TIMEOUT :
+                   ((status == SocketStatus::CONNECTING) ? HCCL_E_AGAIN : HCCL_E_TCP_CONNECT);
+    }
+
+    HCCL_DEBUG(
+        "[Accept]socket is established. localIp[%s], remoteIp[%s]", acceptedSocket->GetLocalIp().GetIpStr().c_str(),
+        acceptedSocket->GetRemoteIp().GetIpStr().c_str());
+    return HCCL_SUCCESS;
 }
 
 } // namespace Hccl

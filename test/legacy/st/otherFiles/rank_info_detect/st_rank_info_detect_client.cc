@@ -90,14 +90,14 @@ TEST_F(RankInfoDetectClientTest, st_CheckStatus_When_Normal_Expect_Success)
 {
     MOCKER_CPP(&Socket::GetStatus).stubs().then(returnValue((SocketStatus)SocketStatus::OK));
 
-    EXPECT_NO_THROW(rankInfoDetectClient_->CheckStatus());
+    EXPECT_EQ(rankInfoDetectClient_->CheckStatus(), HCCL_SUCCESS);
 }
 
 TEST_F(RankInfoDetectClientTest, st_SendAgentIdAndRankSize_When_Normal_Expect_Success)
 {
     MOCKER(HrtRaSocketBlockSend).stubs().with(mockcpp::any(), mockcpp::any()).will(returnValue(true));
 
-    EXPECT_NO_THROW(rankInfoDetectClient_->SendAgentIdAndRankSize());
+    EXPECT_EQ(rankInfoDetectClient_->SendAgentIdAndRankSize(), HcclResult::HCCL_SUCCESS);
 }
 
 TEST_F(RankInfoDetectClientTest, st_ConstructSingleRank_When_Normal_Expect_Success)
@@ -125,7 +125,7 @@ TEST_F(RankInfoDetectClientTest, st_ConstructRankTable_When_Normal_Expect_Succes
         .with(mockcpp::any(), outBoundP(const_cast<char*>(testJsonPath.c_str()), testJsonPath.size() + 1))
         .will(returnValue(const_cast<char*>(testJsonPath.c_str())));
 
-    EXPECT_NO_THROW(rankInfoDetectClient_->ConstructRankTable(localRankTable));
+    EXPECT_EQ(rankInfoDetectClient_->ConstructRankTable(localRankTable), HCCL_SUCCESS);
 
     EXPECT_EQ(localRankTable.version, "2.0");
     EXPECT_EQ(localRankTable.rankCount, 2U);
@@ -142,7 +142,7 @@ TEST_F(RankInfoDetectClientTest, st_RecvRankTable_When_Normal_Expect_Success)
     localRankTable.ranks.emplace_back(rankInfo);
 
     BinaryStream binaryStream;
-    localRankTable.GetBinStream(true, binaryStream);
+    EXPECT_EQ(localRankTable.GetBinStream(true, binaryStream), HCCL_SUCCESS);
     binaryStream << rankInfoDetectClient_->currentStep_;
 std:
     string temp = "";
@@ -165,7 +165,7 @@ std:
     u64& revMsgLen = msgLen;
     MOCKER_CPP(&SocketAgent::RecvMsg).stubs().with(outBound(msg), outBound(revMsgLen)).will(returnValue(true));
 
-    MOCKER_CPP(&RankInfoDetectClient::VerifyRankTable).stubs().will(ignoreReturnValue());
+    MOCKER_CPP(&RankInfoDetectClient::VerifyRankTable).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
 
-    EXPECT_NO_THROW(rankInfoDetectClient_->RecvRankTable());
+    EXPECT_EQ(rankInfoDetectClient_->RecvRankTable(), HcclResult::HCCL_SUCCESS);
 }

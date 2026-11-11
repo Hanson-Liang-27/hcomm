@@ -37,7 +37,7 @@
 #include <shared_mutex>
 #include "hccl/hccl_res.h"
 #include "indop_channel_param.h"
-#include "aicpu_launch_manager.h"
+#include "comm_engine/aicpu_launch_manager_pub.h"
 #include "aicpu_ts_thread.h"
 #include "new/hccl_dispatcher_ctx.h"
 #include "aicpu_init_param.h"
@@ -172,6 +172,8 @@ public:
     HcclResult CleanAllRoceResource();
     // aclgraph 销毁时通过 KFC 投递清理 aicpu 端单一 tag 的全部关联资源，配合 host 端 AclgraphCallback 使用
     HcclResult ClearOpResource(const std::string& tag);
+    // aclgraph 销毁时通过 KFC 投递清理 aicpu 端该图 capture 期产生的 op-unfold cache entry (按modelId精确匹配)
+    HcclResult ClearCaptureOpUnfoldCache(const uint64_t modelId);
     HcclResult SwitchNic();
     HcclResult ResumeChangeLink();
     HcclResult ParseHierarchicalAlgOption(u32* ahcConfInfo);
@@ -196,8 +198,6 @@ public:
     HcclResult InitAicpuIndOp(CommAicpuParam* commAicpuParam);
     bool GetIsInitIndOp() { return indOpCommInitialized_; };
     HcclResult InitThreads(ThreadMgrAicpuParam* param);
-    HcclResult NotifyFree(NotifyMgrAicpuParam* param);
-    HcclResult NotifyAlloc(NotifyMgrAicpuParam* param);
 
     HcclResult RegisterOpInfo(void* opInfo, u32 size);
     HcclResult RegOpTaskException(HcommGetOpInfoCallback callback);
@@ -637,7 +637,6 @@ private:
     std::unordered_map<std::string, ChannelHandle> channelHandleMap_;
     std::unordered_map<ChannelHandle, std::shared_ptr<Transport>> linkMap_;
     std::vector<std::shared_ptr<Thread>> threads_;
-    std::vector<std::unique_ptr<LocalNotify>> notifys_;
     TaskException taskExecption_;
 
     // A3消息语义算子展开aicpu cache

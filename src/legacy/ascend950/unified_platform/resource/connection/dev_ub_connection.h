@@ -20,7 +20,7 @@
 #include "stream.h"
 #include "task.h"
 #include "mc2_type.h"
-#include "hcomm/hcomm_res_entity_defs.h"
+#include "hcomm_res_entity_defs.h"
 #include <chrono>
 #include <functional>
 
@@ -52,8 +52,8 @@ public:
     bool Suspend() override;
 
     std::unique_ptr<Serializable> GetExchangeDto() override;
-    void ParseRmtExchangeDto(const Serializable& rmtDto) override;
-    void ImportRmtDto() override;
+    HcclResult ParseRmtExchangeDto(const Serializable& rmtDto) override;
+    HcclResult ImportRmtDto() override;
 
     std::vector<char> GetUniqueId() const override;
 
@@ -89,8 +89,6 @@ public:
         const MemoryBuffer& remoteMemBuf, const MemoryBuffer& localMemBuf, DataType dataType, ReduceOp reduceOp,
         u64 data, const MemoryBuffer& remoteNotifyMemBuf, const SqeConfig& config) override;
 
-    class UbCiUpdater;
-
     void AddNop(const Stream& stream) override;
 
     /**
@@ -98,10 +96,7 @@ public:
      *        构造时 JettyMode::EXTERNAL_INJECT 跳过建 JFC/jetty，预留空位由本方法填充。
      *        状态机据此跳过 JETTY_CREATING 直接进入 JETTY_CREATED。
      * @note 架构说明：本组方法属 base_comm 共享 jetty 特性（IS_SHARED_QUEUE）的实现细节，
-     *       因 DevUbConnection 当前仍位于 legacy/ 而暂置于此。base_comm 侧通过
-     *       shared_jetty_connection_adapter 适配层调用，不直接依赖本类。
-     *       迁移跟踪：DevUbConnection 迁入 base_comm 后本组方法随之脱离 legacy，
-     *       shared_jetty_channel_helper.h 对 legacy 的 include 一并清除。
+     *       base_comm 侧通过 shared_jetty_connection_adapter 适配层调用，不直接依赖本类。
      *       在迁移完成前，本目录仅作过渡技术债承载，禁止继续扩展共享 jetty 新特性。
      */
     HcclResult SetSharedJettyFields(
@@ -114,8 +109,42 @@ public:
      * @brief 分离 jetty 所有权（SELF_CREATE 模式建好 jetty 后调用）：
      *        之后析构不销毁 jetty/JFC，生命周期交由 Endpoint::JettyContext 管理。
      *        仅当 connection 已完成 SetJettyInfo 后调用。
+     * @note TP 引用不随本方法移交：需另行调用 DetachTpOwnership，否则仍随析构 ReleaseTp 释放。
      */
     void DetachJetty();
+
+    /**
+     * @brief TP 引用所有权集合，DetachTpOwnership 输出，供调用方构造释放回调。
+     */
+    struct TpOwnership {
+        int32_t devLogicId{0};
+        IpAddress locAddr{};
+        IpAddress rmtAddr{};
+        TpProtocol tpProtocol{TpProtocol::INVALID};
+        u32 qos{0};
+        TpInfo tpInfo{};
+    };
+
+    /**
+     * @brief 移交 TP 引用所有权（SELF_CREATE 临时 connection 建好 jetty 后、DetachJetty 之后调用）：
+     *        此后析构不再 ReleaseTp，引用由调用方（JettyContext）保管并统一释放。
+     *        背景：临时 connection"申请即析构释放"会使 TpManager 缓存 useCnt 归零被 erase，
+     *        后续 channel 逐个重新申请 TP（get TP list 内核查询），高频建链下内核 URMA 内存
+     *        耗尽。移交后同（地址对 + qos）的 TP 申请全生命周期仅一次。
+     * @param[out] outOwnership 释放该 TP 引用所需的信息（devLogicId/地址对/协议/qos/tpInfo）
+     * @return HCCL_SUCCESS 表示持有有效 tpHandle 已移交；HCCL_E_NOT_FOUND 表示无有效引用
+     *         （tpHandle 为 0，调用方无需接管，析构路径对 tpHandle=0 本就跳过释放）或已移交过
+     *         （幂等防御：重复调用不再产出释放回调，避免 useCnt 重复扣减）
+     */
+    HcclResult DetachTpOwnership(TpOwnership& outOwnership);
+
+    /**
+     * @brief 回滚 DetachTpOwnership 的所有权移交（还原 releaseTpOnDestroy_=true）。
+     *        仅用于调用方在 DetachTpOwnership 成功后、构造释放回调失败（如 bad_alloc）的兜底：
+     *        标志已翻转但回调未产出时，TP 引用将既不随析构释放也无回调接管（useCnt 永久漏扣），
+     *        须还原后退化为临时 connection 析构释放的旧行为。
+     */
+    void RestoreTpOwnershipOnDestroy();
 
     /**
      * @brief jetty 衍生字段集合，供共享模式下提取后填充给主 connection
@@ -145,13 +174,9 @@ public:
     string Describe() const override;
     HcclResult Describe(std::string& dfxMsg) override;
 
-    HrtUbJfcMode GetUbJfcMode() const;
     JettyHandle& GetJettyHandle();
     JettyHandle& GetRemoteJettyHandle();
     RdmaHandle& GetRdmaHandle();
-    u32 GetPiVal() const;
-    u32 GetCiVal() const;
-    u32 GetSqDepth() const;
 
     void SetMaxReadSize(u32 value);
     void SetMaxWriteSize(u32 value);
@@ -220,7 +245,6 @@ private:
     TpInfo tpInfo{};
 
     u32 piVal{0};
-    u32 ciVal{0};
 
     CqCreateInfo cqInfo_{};
 
@@ -279,7 +303,6 @@ private:
         DataType dataType = DataType::INVALID) const;
 
     std::unique_ptr<BaseTask> ConstructTaskUbSend(const HrtRaUbSendWrRespParam& sendWrResp, const SqeConfig& config);
-    void UpdateCiVal(u32 ci);
     HcclResult CalcTotalTimeout(uint32_t& outTotalTimeoutMs);
 };
 
@@ -326,10 +349,6 @@ public:
         CommEngine engine = COMM_ENGINE_RESERVED, u32 sqDepth = UB_SQ_DEPTH_NOT_SET, u32 scqDepth = UB_SQ_DEPTH_NOT_SET,
         JettyMode jettyMode = JettyMode::SELF_CREATE);
 };
-
-std::vector<DevUbConnection*> GetStarsPollUbConns(const std::vector<RmaConnection*>& rmaConns);
-
-bool IfNeedUpdatingUbCi(const std::vector<DevUbConnection*>& ubConns);
 
 } // namespace Hccl
 

@@ -18,6 +18,9 @@ extern "C" {
 #endif
 void TcRsGetDevEidInfoNum();
 void TcRsGetDevEidInfoList();
+void TcRsGetDevEidInfoListOutOfRange();
+void TcRsGetDevEidInfoListStartIndexOverflow();
+void TcRsGetDevEidInfoListStartIndexOffset();
 void TcRsCtxInit();
 void TcRsCtxDeinit();
 void TcRsCtxTokenIdAlloc();
@@ -37,7 +40,6 @@ void TcRsCtxQpUnimport();
 void TcRsCtxQpBind();
 void TcRsCtxQpUnbind();
 void TcRsCtxBatchSendWr();
-void TcRsCtxUpdateCi();
 void TcRsCtxEsched();
 void TcDlCcuApiInit();
 void TcRsGetTpInfoList();

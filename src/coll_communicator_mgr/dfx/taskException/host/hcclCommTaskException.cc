@@ -10,6 +10,7 @@
 
 #include "hcclCommTaskException.h"
 #include <memory>
+#include <chrono>
 #include "log.h"
 #include "coll_comm.h"
 #include "acl/acl_rt.h"
@@ -19,7 +20,7 @@
 #include <adapter_error_manager_pub.h>
 #include "op_type.h"
 #include "task_exception_handler.h"
-#include "ccuTaskException.h"
+#include "comm_engine/ccu/ccu_task_exception_pub.h"
 #include "dpuTaskException.h"
 #include "hccl_types.h"
 
@@ -30,6 +31,7 @@ using namespace std;
 constexpr u32 MAX_MODULE_DEVICE_NUM_V2 = 65;
 constexpr uint32_t TASK_CONTEXT_SIZE = 50;
 constexpr uint32_t TASK_CONTEXT_INFO_SIZE = LOG_TMPBUF_SIZE - 50; // task 执行失败时打印前序task信息的长度限制
+constexpr uint32_t TASK_EXCEPTION_LOCK_TIMEOUT_SECONDS = 5;
 
 // Leaky Singleton: 故意不释放，规避 Static Destruction Order Fiasco，
 // 确保 RTS 回调访问 handlers_ 时内存仍有效
@@ -107,7 +109,7 @@ TaskExceptionHost* TaskExceptionHost::GetInstance(s32 deviceLogicID)
 
 TaskExceptionHost::~TaskExceptionHost()
 {
-    std::unique_lock<std::mutex> lock(taskExceptionMutex_);
+    std::unique_lock<std::timed_mutex> lock(taskExceptionMutex_);
     if (!CommRegisterMap_.empty()) {
         CommRegisterMap_.clear();
         aclError ret = aclrtExceptionInfoCallbackUnregister(ProcessCallback); // 注销注册给rts的TaskException回调
@@ -126,13 +128,16 @@ void TaskExceptionHost::ProcessCallback(rtExceptionInfo_t* exceptionInfo)
 
 HcclResult TaskExceptionHost::Register(u64 commHandle)
 {
-    std::unique_lock<std::mutex> lock(taskExceptionMutex_);
+    std::unique_lock<std::timed_mutex> lock(taskExceptionMutex_);
     if (CommRegisterMap_.empty()) {
         aclError ret = aclrtExceptionInfoCallbackRegister(ProcessCallback);
         CHK_PRT_RET(
             ret != ACL_SUCCESS, HCCL_ERROR("[%s]aclrtExceptionInfoCallbackRegister failed, ret[%d]", __func__, ret),
             HCCL_E_RUNTIME);
-        CHK_RET(Hccl::HrtUnregTaskExceptionCallbackByModule(Hccl::TaskExceptionHandler::Process));
+        HcclResult unregRet = Hccl::HrtUnregTaskExceptionCallbackByModule(Hccl::TaskExceptionHandler::Process);
+        CHK_PRT_CONT(
+            unregRet != HCCL_SUCCESS,
+            HCCL_ERROR("[%s]HrtUnregTaskExceptionCallbackByModule failed, ret[%d]", __func__, unregRet));
         HCCL_RUN_INFO(
             "[%s]aclrtExceptionInfoCallbackRegister set ProcessCallback success and unregister legacy "
             "TaskExceptionHandler::Process callback",
@@ -146,7 +151,7 @@ HcclResult TaskExceptionHost::Register(u64 commHandle)
 
 HcclResult TaskExceptionHost::UnRegister(u64 commHandle)
 {
-    std::unique_lock<std::mutex> lock(taskExceptionMutex_);
+    std::unique_lock<std::timed_mutex> lock(taskExceptionMutex_);
     if (CommRegisterMap_.find(commHandle) == CommRegisterMap_.end()) {
         HCCL_INFO("[%s] commHandle[0x%llx] has not registered, skip", __func__, commHandle);
         return HCCL_SUCCESS;
@@ -261,7 +266,15 @@ void TaskExceptionHost::ProcessHcclTaskException(rtExceptionInfo_t* exceptionInf
     }
 
     // 新流程支持的TaskException打印
-    std::unique_lock<std::mutex> lock(taskExceptionMutex_);
+    std::unique_lock<std::timed_mutex> lock(taskExceptionMutex_, std::defer_lock);
+    if (!lock.try_lock_for(std::chrono::seconds(TASK_EXCEPTION_LOCK_TIMEOUT_SECONDS))) {
+        HCCL_ERROR(
+            "[TaskExceptionHost][%s] try_lock timeout(%u s), skip task exception, deviceid[%u], streamid[%u], "
+            "taskid[%u].",
+            __func__, TASK_EXCEPTION_LOCK_TIMEOUT_SECONDS, exceptionInfo->deviceid, exceptionInfo->streamid,
+            exceptionInfo->taskid);
+        return;
+    }
     u64 commHandle = reinterpret_cast<u64>(curTask->dfxOpInfo_->comm_);
     if (curTask->dfxOpInfo_->comm_ == nullptr || CommRegisterMap_.find(commHandle) == CommRegisterMap_.end()) {
         HCCL_ERROR(
@@ -272,7 +285,7 @@ void TaskExceptionHost::ProcessHcclTaskException(rtExceptionInfo_t* exceptionInf
     }
 
     if (curTask->taskParam_.taskType == Hccl::TaskParamType::TASK_CCU) {
-        CcuTaskException::ProcessCcuException(exceptionInfo, *curTask);
+        ProcessCcuTaskException(exceptionInfo, *curTask);
     } else {
         ProcessException(exceptionInfo, *curTask);
     }
@@ -391,6 +404,8 @@ void TaskExceptionHost::NotifyControlPlaneOnUbError(
         return;
     }
 
+    (void)HccpNotifyDfxSnapshot(rdmaHandle, devPhyId, 0, false);
+
     struct CtxNotifyEvent event = {};
     event.eventType = 0;
     event.eventInfo.serviceErrInfo.serviceType = URMA_TYPE;
@@ -472,8 +487,8 @@ void TaskExceptionHost::HandleHostErrorReport(rtExceptionInfo_t* exceptionInfo, 
     }
     std::string clusterMonitorErrMsg = AicpuGetAndPrintClusterMonitorErr(exceptionInfo);
     HCCL_ERROR(
-        "%s Task run failed, base information is deviceID:[%u], %s.", stageErrInfo.c_str(), exceptionInfo->deviceid,
-        taskInfo.GetIndopBaseInfo().c_str());
+        "%s Task run failed, base information is %s, deviceID:[%u].", stageErrInfo.c_str(),
+        taskInfo.GetIndopBaseInfo().c_str(), exceptionInfo->deviceid);
     HCCL_ERROR("%s Task run failed, para information is %s.", stageErrInfo.c_str(), taskInfo.GetParaInfo().c_str());
     HCCL_ERROR(
         "%s Task run failed, groupRank information is %s.", stageErrInfo.c_str(), GetGroupRankInfo(taskInfo).c_str());

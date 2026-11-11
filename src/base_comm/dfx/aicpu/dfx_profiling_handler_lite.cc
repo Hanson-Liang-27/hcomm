@@ -8,11 +8,11 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "dfx_profiling_handler_lite.h"
-#include "res_pub.h"
+#include "dfx/device/dfx_profiling_handler_lite_pub.h"
+#include "dfx/device/dfx_res_pub.h"
+#include "common/cast_utils_pub.h"
 #include "log.h"
 #include "prof_sal_lite.h"
-#include <algorithm>
 #include <limits>
 #include <map>
 
@@ -433,7 +433,7 @@ bool DfxProfilingHandlerLite::CanUseCompactReport(
     if (ctx.compactReportOpInfo == nullptr || taskQueue.IsEmpty()) {
         return false;
     }
-    const u64 opInfo = reinterpret_cast<u64>(ctx.compactReportOpInfo);
+    const u64 opInfo = ReinterpretAs<u64>(ctx.compactReportOpInfo);
     for (u16 idx = taskQueue.GetBegin(), i = 0; i < taskQueue.GetCount();
          idx = (idx + 1) % taskQueue.GetCapacity(), ++i) {
         const DfxTaskInfo* task = taskQueue.GetSlot(idx);
@@ -637,7 +637,10 @@ void DfxProfilingHandlerLite::FillCommonTailFields(
     if (taskDetailsInfos.remoteRank == Hccl::DFX_INVALID_RANKID) {
         taskDetailsInfos.remoteRank = taskDetailsInfos.localRank;
     }
-    taskDetailsInfos.rdmaType = 0;
+    taskDetailsInfos.rdmaType = static_cast<u8>(DfxRdmaTypeVal::DFX_RDMA_SEND_NOTIFY);
+    if (it->taskType == static_cast<u8>(TaskParamTypeVal::TASK_RDMA)) {
+        taskDetailsInfos.rdmaType = it->rdmaType;
+    }
     taskDetailsInfos.role = static_cast<uint32_t>(DfxTaskRole::NEW_TASK_ROLE_DST);
     taskDetailsInfos.workFlowMode = static_cast<uint32_t>(DfxWorkflowMode::NEW_WORKFLOW_MODE_OP_BASE);
 }

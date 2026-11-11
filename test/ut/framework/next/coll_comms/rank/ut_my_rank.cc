@@ -9,6 +9,7 @@
  */
 
 #include <iostream>
+#include <unordered_set>
 #include "gtest/gtest.h"
 #include "mockcpp/mokc.h"
 #include <mockcpp/mockcpp.hpp>
@@ -18,10 +19,14 @@
 #include "hccl_types.h"
 #include <hccl/hccl_comm.h>
 #include "hcomm_c_adpt.h"
-#include "channel_process.h"
+#include "aicpu/aicpu_ts_urma_channel.h"
+#include "base_comm_node_accessors.h"
+#include "handle_registry_procs.h"
+#include <mutex>
+#include "endpoint_pair/channel/channel_process_pub.h"
 #include "base_config_legacy.h"
-#include "ccu_device_res.h"
-#include "ccu_device_pub.h"
+#include "comm_engine/ccu/ccu_device_res_pub.h"
+#include "comm_engine/ccu/ccu_device_pub.h"
 #include "config/env_config.h"
 #include "env_config/env_config_v2.h"
 #define private public
@@ -31,7 +36,15 @@
 #include "hccl_comm_pub.h"
 #include "host_multi_qp_config.h"
 #include "llt_hccl_stub_rank_graph.h"
+#include "llt_dca_stub.h"
+#include "coll_comm_mgr.h"
 #include "ccu_res.h"
+#include "common/orion_adpt_utils_pub.h"
+#include "adapter_rts_common.h"
+#include "adapter_rts.h"
+#include "launch_aicpu.h"
+#include <cstdlib>
+#include <cstring>
 #include "orion_adpt_utils.h"
 
 using namespace hccl;
@@ -61,6 +74,55 @@ const std::vector<uint16_t>* StubGetHostMultiQpUdpPorts(hccl::HostMultiQpConfig*
 {
     return devicePhyId == g_hostMultiQpConfigPhyId ? &g_hostMultiQpUdpPorts : nullptr;
 }
+
+HcclResult StubResolveUserHandleToHost(ChannelHandle /*userHandle*/, ChannelHandle& hostHandle)
+{
+    hostHandle = static_cast<ChannelHandle>(0xAAA); // host 哨兵：锁定新建分支 channels 反查回填
+    return HCCL_SUCCESS;
+}
+
+HcclResult StubResolveHostHandleToDevice(ChannelHandle /*hostHandle*/, ChannelHandle& deviceHandle)
+{
+    deviceHandle = static_cast<ChannelHandle>(0xBBB); // device 哨兵：锁定复用分支 deviceChannels 反查回填
+    return HCCL_SUCCESS;
+}
+
+struct NsRecoveryRegisterCall {
+    CommEngine engine;
+    std::vector<ChannelHandle> deviceHandles;
+    std::vector<ChannelHandle> hostHandles;
+    std::string commTag;
+};
+std::vector<NsRecoveryRegisterCall> g_nsRecoveryRegisterCalls;
+
+void SpyAddNsRecoveryData(
+    NsRecoveryProcessor*, const CommEngine& engine, const ChannelHandle* const deviceHandles,
+    const ChannelHandle* const hostHandles, uint32_t channelNum, const std::string& commTag)
+{
+    NsRecoveryRegisterCall call{engine, {}, {}, commTag};
+    call.deviceHandles.assign(deviceHandles, deviceHandles + channelNum);
+    call.hostHandles.assign(hostHandles, hostHandles + channelNum);
+    g_nsRecoveryRegisterCalls.push_back(std::move(call));
+}
+
+// WaitForChannelsReady 归类用例复用：首轮填 g_stubStatusFirst、后续轮填 g_stubStatus，返回 SUCCESS 触发归类
+static int32_t g_stubStatusFirst = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_READY);
+static int32_t g_stubStatus = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_READY);
+static uint32_t g_stubStatusCallCount = 0;
+
+static int32_t StubHcommChannelGetStatus(const ChannelHandle* /*channelList*/, uint32_t listNum, int32_t* statusList)
+{
+    g_stubStatusCallCount++;
+    int32_t status = (g_stubStatusCallCount == 1) ? g_stubStatusFirst : g_stubStatus;
+    for (uint32_t i = 0; i < listNum; ++i) {
+        statusList[i] = status;
+    }
+    return static_cast<int32_t>(HCCL_SUCCESS);
+}
+
+// WaitForChannelsReady 超时桩复用：g_linkTimeout 控制返回值，避免二次 mock
+static s32 g_linkTimeout = 1;
+static s32 StubGetLinkTimeOut() { return g_linkTimeout; }
 
 } // namespace
 
@@ -96,7 +158,21 @@ struct RegisterMemoryCallRecord {
     std::vector<HcclMem> mems;
 };
 static std::vector<RegisterMemoryCallRecord> s_registerMemoryCalls;
-HcclResult RegisterMemorySpyStub(
+
+static HcclResult GetBrokenSocketChannelDescStub(ChannelHandle, HcommChannelDesc* channelDesc)
+{
+    static uint32_t socketStorage = 0;
+    channelDesc->socket = reinterpret_cast<HcommSocket>(&socketStorage);
+    return HCCL_SUCCESS;
+}
+
+static HcclResult GetEndpointStub(hccl::EndpointMgr*, EndpointDesc, EndpointHandle& endpointHandle)
+{
+    endpointHandle = reinterpret_cast<EndpointHandle>(0x1234);
+    return HCCL_SUCCESS;
+}
+
+static HcclResult RegisterMemorySpyStub(
     hccl::EndpointMgr* mgr, EndpointHandle ep, const std::vector<std::string>& tags, const std::vector<HcclMem>& mems,
     uint64_t version)
 {
@@ -137,6 +213,7 @@ protected:
     virtual void SetUp()
     {
         s_registerMemoryCalls.clear();
+        g_nsRecoveryRegisterCalls.clear();
         std::cout << "A Test case in MyRankTest SetUP" << std::endl;
         MOCKER(hrtGetDeviceType).stubs().will(invoke(+[](DevType& t) -> HcclResult {
             t = DevType::DEV_TYPE_950;
@@ -150,6 +227,15 @@ protected:
         (*rankIpPortMap)[2][Hccl::IpAddress("0.0.0.0")] = 16666;
         (*rankIpPortMap)[2][Hccl::IpAddress("3.0.0.0")] = 16666;
         rankGraph = std::make_shared<RankGraphV2>(rankGraphPtr);
+        callbacks.getAicpuCommState = [this]() {
+            return aicpuCommInitialized;
+        };
+        callbacks.setAicpuCommState = [this](bool state) {
+            aicpuCommInitialized = state;
+        };
+        callbacks.kernelLaunchAicpuCommInit = []() {
+            return HCCL_SUCCESS;
+        };
         myRank = std::make_unique<MyRank>(binHandle, 0, config, callbacks, rankGraph.get(), rankIpPortMap);
         roceDescConfigurator = std::make_unique<RoceChannelDescConfigurator>(1);
     }
@@ -226,10 +312,13 @@ protected:
     uint32_t AICPU_TS_MODE = 2;
     uint32_t CCU_MS_MODE = 5;
     uint32_t CCU_SCHED_MODE = 6;
+    uint32_t CCU_MS_ONLY_MODE = 8;
+    uint32_t CCU_SCHED_ONLY_MODE = 9;
     Hccl::RankIpPortMapPtr rankIpPortMap;
     aclrtBinHandle binHandle;
     CommConfig config{"my_rank_ut"};
     ManagerCallbacks callbacks;
+    bool aicpuCommInitialized = false;
     // 真实Hccl::RankGraph对象：RankGraphV2经void*持有其裸指针（IsLevel0PcieFallback直读），
     // 传伪造指针会在标志查询时解引用崩溃；其余查询仍走IRankGraph mock，不受影响
     Hccl::RankGraph realRankGraph{0};
@@ -346,8 +435,14 @@ TEST_F(MyRankTest, Ut_When_BatchCreateChannels_Expect_SUCCESS)
         .with(mockcpp::any())
         .will(returnValue(static_cast<int>(HCCL_SUCCESS)));
     MockerFuncs();
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(returnValue(HCCL_SUCCESS));
     ChannelHandle channelHandle = 0xab;
     MOCKER(hcomm::ChannelProcess::CreateChannelsLoop).stubs().will(returnValue(HCCL_SUCCESS));
+    // CreateChannelsLoop 被桩掉后 targetChannels 不被填充，AICPU/AIV 预分配会在空句柄上解引用；
+    // 出入口两次反查（user→host、host→device）都依赖建链填充的 D2H/H2D 表，一并打桩
+    MOCKER(hcomm::ChannelProcess::PrepareUserChannels).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(invoke(StubResolveUserHandleToHost));
+    MOCKER(hcomm::ChannelProcess::ResolveHostHandleToDevice).stubs().will(invoke(StubResolveHostHandleToDevice));
 
     HcclMem cclBuffer;
     CreateCclBuffer(cclBuffer);
@@ -393,12 +488,14 @@ TEST_F(MyRankTest, Ut_When_BatchCreateChannels_Expect_SUCCESS)
     EXPECT_EQ(myRank->BatchCreateSockets(channelDesc, 1, "test", hcommDesc, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
     std::vector<ChannelHandle> hostChannelHandles(3);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
+    std::vector<ChannelHandle> deviceChannelHandles(3);
+    ChannelHandle* deviceChannelHandleList = deviceChannelHandles.data();
     std::vector<std::vector<MemHandle>> allHandles1(1);
     const s32 originalLogLevel = log_level_get_stub();
     log_level_set_stub(DLOG_INFO);
     testing::internal::CaptureStdout();
     const HcclResult createRet = myRank->BatchCreateChannels(
-        COMM_ENGINE_AICPU_TS, channelDesc, 1, hcommDesc, hostChannelHandleList, allHandles1);
+        COMM_ENGINE_AICPU_TS, channelDesc, 1, hcommDesc, hostChannelHandleList, deviceChannelHandleList, allHandles1);
     const std::string createLog = testing::internal::GetCapturedStdout();
     log_level_set_stub(originalLogLevel);
     EXPECT_EQ(createRet, HCCL_SUCCESS);
@@ -410,7 +507,8 @@ TEST_F(MyRankTest, Ut_When_BatchCreateChannels_Expect_SUCCESS)
     std::vector<std::vector<MemHandle>> allHandles2(2);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_AICPU_TS, channelDesc, 2, hcommDesc, hostChannelHandleList, allHandles2),
+            COMM_ENGINE_AICPU_TS, channelDesc, 2, hcommDesc, hostChannelHandleList, deviceChannelHandleList,
+            allHandles2),
         HCCL_SUCCESS);
     EXPECT_EQ(myRank->newChannels_.size(), 1);
     EXPECT_EQ(myRank->newChannels_[0], std::make_pair(channelIdx1, RmtEp1reuseIdx1));
@@ -419,16 +517,61 @@ TEST_F(MyRankTest, Ut_When_BatchCreateChannels_Expect_SUCCESS)
     std::vector<std::vector<MemHandle>> allHandles3(3);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_AICPU_TS, channelDesc, 3, hcommDesc, hostChannelHandleList, allHandles3),
+            COMM_ENGINE_AICPU_TS, channelDesc, 3, hcommDesc, hostChannelHandleList, deviceChannelHandleList,
+            allHandles3),
         HCCL_SUCCESS);
     EXPECT_EQ(myRank->newChannels_.size(), 1);
     EXPECT_EQ(myRank->newChannels_[0], std::make_pair(channelIdx2, RmtEp2reuseIdx0));
 
-    MOCKER_CPP(&hcomm::ChannelProcess::ChannelGetStatus).stubs().with(mockcpp::any()).will(returnValue(HCCL_E_AGAIN));
-    MOCKER_CPP(&Hccl::EnvSocketConfig::GetLinkTimeOut).stubs().with(mockcpp::any()).will(returnValue((s32)(1)));
-    EXPECT_EQ(myRank->BatchConnectChannels(channelDesc, hostChannelHandleList, 3), HCCL_E_TIMEOUT);
-    MOCKER_CPP(&hcomm::ChannelProcess::ChannelGetStatus).stubs().with(mockcpp::any()).will(returnValue(HCCL_E_TIMEOUT));
-    EXPECT_EQ(myRank->BatchConnectChannels(channelDesc, hostChannelHandleList, 3), HCCL_E_TIMEOUT);
+    // 双句柄映射断言：新建分支 channels 反查回填 host 哨兵，复用分支 deviceChannels 反查回填 device 哨兵
+    EXPECT_EQ(hostChannelHandles[0], static_cast<ChannelHandle>(0xAAA));
+    EXPECT_EQ(deviceChannelHandles[0], static_cast<ChannelHandle>(0xBBB));
+
+    // 超时路径：E_AGAIN 轮询至超时（timeout 0 秒，避免 1s 空转）
+    MOCKER_CPP(&Hccl::EnvSocketConfig::GetLinkTimeOut).stubs().with(mockcpp::any()).will(invoke(StubGetLinkTimeOut));
+    g_linkTimeout = 0;
+    MOCKER(HcommChannelGetStatus).stubs().will(returnValue(static_cast<HcommResult>(HCCL_E_AGAIN)));
+    EXPECT_EQ(
+        myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 3, COMM_ENGINE_AICPU_TS), HCCL_E_TIMEOUT);
+
+    // 归类路径：timeout 回 1s，invoke 桩填 statusList 触发 ClassifyChannelStatus
+    g_linkTimeout = 1;
+    // 前一步已对 HcommChannelGetStatus 打过 E_AGAIN 桩，重置后再挂 invoke 桩，避免旧桩永远命中
+    MOCKER(HcommChannelGetStatus).reset();
+    MOCKER(HcommChannelGetStatus).stubs().will(invoke(StubHcommChannelGetStatus));
+
+    // 全 READY → SUCCESS
+    g_stubStatusFirst = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_READY);
+    g_stubStatus = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_READY);
+    g_stubStatusCallCount = 0;
+    EXPECT_EQ(myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 3, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
+
+    // 含 CONNECTING → 首轮 E_AGAIN 重试后成功
+    g_stubStatusFirst = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_CONNECTING);
+    g_stubStatus = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_READY);
+    g_stubStatusCallCount = 0;
+    EXPECT_EQ(myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 3, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
+
+    // 含 FAILED → E_NETWORK
+    g_stubStatusFirst = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_FAILED);
+    g_stubStatus = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_FAILED);
+    g_stubStatusCallCount = 0;
+    EXPECT_EQ(
+        myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 3, COMM_ENGINE_AICPU_TS), HCCL_E_NETWORK);
+
+    // 含 RES_LOC_UNAVAIL → E_UNAVAIL
+    g_stubStatusFirst = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_RES_LOC_UNAVAIL);
+    g_stubStatus = static_cast<int32_t>(hcomm::HCOMM_CHANNEL_STATUS_RES_LOC_UNAVAIL);
+    g_stubStatusCallCount = 0;
+    EXPECT_EQ(
+        myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 3, COMM_ENGINE_AICPU_TS), HCCL_E_UNAVAIL);
+
+    // 未知状态（else 分支）→ E_UNAVAIL
+    g_stubStatusFirst = 999;
+    g_stubStatus = 999;
+    g_stubStatusCallCount = 0;
+    EXPECT_EQ(
+        myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 3, COMM_ENGINE_AICPU_TS), HCCL_E_UNAVAIL);
     unsetenv("HCCL_DFS_CONFIG");
 }
 
@@ -497,6 +640,64 @@ TEST_F(MyRankTest, Ut_CreateChannels_When_CpuEngine_UbcTp_Expect_PARAM_ERROR)
 
     ChannelHandle handles[1] = {0};
     HcclResult ret = myRank->CreateChannels(COMM_ENGINE_CPU, "test_ubctp_blocked", channelDesc, 1, handles);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+// AIV引擎多通道：channel[1]的memHandleNum超限应被拦截（修复前恒校验第0个通道，该非法参数被绕过）
+TEST_F(MyRankTest, Ut_CheckChannelParam_When_AivMultiChannelMemHandleNumExceedMax_Expect_PARAM_ERROR)
+{
+    HcclChannelDesc desc[2] = {};
+    memset(desc, 0, sizeof(desc));
+    desc[0].remoteRank = 1;
+    desc[0].channelProtocol = COMM_PROTOCOL_HCCS;
+    desc[1].remoteRank = 2;
+    desc[1].channelProtocol = COMM_PROTOCOL_HCCS;
+    desc[1].memHandleNum = 257; // MEM_HANDLE_NUM_MAX = 256
+
+    HcclResult ret = myRank->CheckChannelParam(COMM_ENGINE_AIV, desc, 2);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+// AIV引擎：memHandleNum非0但memHandles为空应被拦截
+TEST_F(MyRankTest, Ut_CheckChannelParam_When_AivMemHandlesNullWithNonZeroNum_Expect_PARAM_ERROR)
+{
+    HcclChannelDesc desc[1] = {};
+    memset(desc, 0, sizeof(desc));
+    desc[0].remoteRank = 1;
+    desc[0].channelProtocol = COMM_PROTOCOL_HCCS;
+    desc[0].memHandleNum = 2; // memHandles 保持 nullptr
+
+    HcclResult ret = myRank->CheckChannelParam(COMM_ENGINE_AIV, desc, 1);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+// 非AIV引擎：memHandleNum非0仅打告警不拦截，合法notifyNum应校验通过
+TEST_F(MyRankTest, Ut_CheckChannelParam_When_NonAivMemHandleNumNonZero_Expect_SUCCESS)
+{
+    HcclChannelDesc desc[1] = {};
+    memset(desc, 0, sizeof(desc));
+    desc[0].remoteRank = 1;
+    desc[0].channelProtocol = COMM_PROTOCOL_HCCS;
+    desc[0].memHandleNum = 1;
+    desc[0].notifyNum = 2;
+
+    HcclResult ret = myRank->CheckChannelParam(COMM_ENGINE_AICPU_TS, desc, 1);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+}
+
+// 非AIV引擎多通道：channel[1]的notifyNum超限应被拦截（修复前恒校验第0个通道，该非法参数被绕过）
+TEST_F(MyRankTest, Ut_CheckChannelParam_When_MultiChannelNotifyNumExceedMax_Expect_PARAM_ERROR)
+{
+    HcclChannelDesc desc[2] = {};
+    memset(desc, 0, sizeof(desc));
+    desc[0].remoteRank = 1;
+    desc[0].channelProtocol = COMM_PROTOCOL_HCCS;
+    desc[0].notifyNum = 2;
+    desc[1].remoteRank = 2;
+    desc[1].channelProtocol = COMM_PROTOCOL_HCCS;
+    desc[1].notifyNum = 65; // NOTIFY_NUM_MAX = 64
+
+    HcclResult ret = myRank->CheckChannelParam(COMM_ENGINE_AICPU_TS, desc, 2);
     EXPECT_EQ(ret, HCCL_E_PARA);
 }
 
@@ -574,6 +775,61 @@ TEST_F(MyRankTest, Ut_TryInitCcuInstanceOnDemand_When_NotPcieFallback_Expect_Ccu
     EXPECT_EQ(myRank->opExpansionMode_, AICPU_TS_MODE);
 }
 
+// ccu only模式入口转换：Init记录原始展开模式并转换为对应ccu模式，供回退判断与枚举上报使用
+TEST_F(MyRankTest, Ut_Init_When_CcuOnlyMode_Expect_ConvertedToCcuModeAndRawKept)
+{
+    MOCKER(hcomm::CcuInitFeature).stubs().will(returnValue(CcuResult::CCU_SUCCESS));
+
+    HcclMem cclBuffer;
+    CreateCclBuffer(cclBuffer);
+
+    EXPECT_EQ(myRank->Init(cclBuffer, CCU_MS_ONLY_MODE, 2), HCCL_SUCCESS);
+    EXPECT_EQ(myRank->GetOpExpansionModeRaw(), CCU_MS_ONLY_MODE);
+    EXPECT_EQ(myRank->opExpansionMode_, CCU_MS_MODE);
+
+    EXPECT_EQ(myRank->Init(cclBuffer, CCU_SCHED_ONLY_MODE, 2), HCCL_SUCCESS);
+    EXPECT_EQ(myRank->GetOpExpansionModeRaw(), CCU_SCHED_ONLY_MODE);
+    EXPECT_EQ(myRank->opExpansionMode_, CCU_SCHED_MODE);
+}
+
+// ccu only模式不回退：level0为pcie fallback（无UB盖板）时直接报错，不回退aicpu，不向设备侧拉起CCU驱动
+TEST_F(MyRankTest, Ut_TryInitCcuInstanceOnDemand_When_CcuOnlyMode_And_Level0PcieFallback_Expect_NotSupport)
+{
+    MOCKER(hcomm::CcuInitFeature).expects(never());
+
+    myRank->opExpansionMode_ = CCU_MS_MODE;
+    myRank->opExpansionModeRaw_ = CCU_MS_ONLY_MODE;
+    myRank->mainBoardType_ = Hccl::HcclMainboardId::MAINBOARD_POD;
+    realRankGraph.SetLevel0PcieFallback(true);
+
+    EXPECT_EQ(myRank->TryInitCcuInstanceOnDemand(), HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(myRank->opExpansionMode_, CCU_MS_MODE);
+
+    myRank->opExpansionMode_ = CCU_SCHED_MODE;
+    myRank->opExpansionModeRaw_ = CCU_SCHED_ONLY_MODE;
+    EXPECT_EQ(myRank->TryInitCcuInstanceOnDemand(), HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(myRank->opExpansionMode_, CCU_SCHED_MODE);
+}
+
+// ccu only模式不回退：CCU驱动BUSY时直接报错，不回退aicpu（对称raw=5时可回退的既有用例）
+TEST_F(MyRankTest, Ut_TryInitCcuInstanceOnDemand_When_CcuOnlyMode_And_CcuDriverBusy_Expect_NotSupport)
+{
+    myRank->opExpansionMode_ = CCU_MS_MODE;
+    myRank->opExpansionModeRaw_ = CCU_MS_ONLY_MODE;
+    myRank->mainBoardType_ = Hccl::HcclMainboardId::MAINBOARD_POD;
+    realRankGraph.SetLevel0PcieFallback(false);
+    MOCKER(hcomm::CcuInitFeature).stubs().will(returnValue(CcuResult::CCU_E_DRV_BUSY));
+
+    EXPECT_EQ(myRank->TryInitCcuInstanceOnDemand(), HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(myRank->opExpansionMode_, CCU_MS_MODE);
+
+    myRank->opExpansionMode_ = CCU_SCHED_MODE;
+    myRank->opExpansionModeRaw_ = CCU_SCHED_ONLY_MODE;
+    myRank->ccuDrvHandle_ = nullptr;
+    EXPECT_EQ(myRank->TryInitCcuInstanceOnDemand(), HCCL_E_NOT_SUPPORT);
+    EXPECT_EQ(myRank->opExpansionMode_, CCU_SCHED_MODE);
+}
+
 // RankGraphV2标志转发：经void*包装Hccl::RankGraph裸指针，IsLevel0PcieFallback直读被包装对象
 TEST_F(MyRankTest, Ut_RankGraphV2_IsLevel0PcieFallback_When_WrappedGraphFlagToggled_Expect_ForwardValue)
 {
@@ -626,18 +882,24 @@ TEST_F(MyRankTest, St_BatchCreateChannels_When_Resource_fallback_Expect_Return_H
     }
 
     // 模拟创建到rmtEp2的第二个channel时资源不足，需要清理前三个channel
-    MOCKER(HcommCollectiveChannelCreate)
+    MOCKER(HcommChannelCreate)
         .stubs()
         .will(returnValue(static_cast<int>(HCCL_SUCCESS)))
         .then(returnValue(static_cast<int>(HCCL_SUCCESS)))
         .then(returnValue(static_cast<int>(HCCL_SUCCESS)))
         .then(returnValue(static_cast<int>(HCCL_E_UNAVAIL)));
+    // 整条 HcommChannelCreate 被桩掉后 D2H/H2D 表恒空，出入口两次反查都需打桩
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::ResolveHostHandleToDevice).stubs().will(returnValue(HCCL_SUCCESS));
     std::vector<HcommChannelDesc> hcommDesc(5);
     std::vector<ChannelHandle> hostChannelHandles(5);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
+    std::vector<ChannelHandle> deviceChannelHandles(5);
     std::vector<std::vector<MemHandle>> allHandles_fb1(5);
     EXPECT_EQ(
-        myRank->BatchCreateChannels(COMM_ENGINE_CCU, channelDesc, 5, hcommDesc, hostChannelHandleList, allHandles_fb1),
+        myRank->BatchCreateChannels(
+            COMM_ENGINE_CCU, channelDesc, 5, hcommDesc, hostChannelHandleList, deviceChannelHandles.data(),
+            allHandles_fb1),
         HCCL_E_UNAVAIL);
     EXPECT_EQ(myRank->newChannels_.size(), 0);
 
@@ -713,21 +975,27 @@ TEST_F(MyRankTest, St_BatchCreateChannels_Multi_Times_When_fallback_Expect_Retur
     // 第一次调用BatchCreateChannels，创建3个channel成功
     // 第二次调用BatchCreateChannels，创建5个channel，前4个channel成功，第5个channel失败
     // 需要只清理到rmtEp2的第二个channel
-    MOCKER(HcommCollectiveChannelCreate)
+    MOCKER(HcommChannelCreate)
         .stubs()
         .will(returnValue(static_cast<int>(HCCL_SUCCESS)))    // 第一次调用，到rmtEp1的channel1成功
         .then(returnValue(static_cast<int>(HCCL_SUCCESS)))    // 第一次调用，到rmtEp1的channel2成功
         .then(returnValue(static_cast<int>(HCCL_SUCCESS)))    // 第一次调用，到rmtEp2的channel1成功
         .then(returnValue(static_cast<int>(HCCL_SUCCESS)))    // 第二次调用，到rmtEp2的channel2成功
         .then(returnValue(static_cast<int>(HCCL_E_UNAVAIL))); // 第二次调用，到rmtEp2的channel3失败
+    // 整条 HcommChannelCreate 被桩掉后 D2H/H2D 表恒空，出入口两次反查都需打桩
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::ResolveHostHandleToDevice).stubs().will(returnValue(HCCL_SUCCESS));
     std::vector<HcommChannelDesc> hcommDesc(5);
     std::vector<ChannelHandle> hostChannelHandles(5);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
+    std::vector<ChannelHandle> deviceChannelHandles(5);
+    ChannelHandle* deviceChannelHandleList = deviceChannelHandles.data();
     // 第一次调用BatchCreateChannels成功，创建3个channel
     std::vector<std::vector<MemHandle>> allHandles_multi1(3);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_CCU, channelDesc, 3, hcommDesc, hostChannelHandleList, allHandles_multi1),
+            COMM_ENGINE_CCU, channelDesc, 3, hcommDesc, hostChannelHandleList, deviceChannelHandleList,
+            allHandles_multi1),
         HCCL_SUCCESS);
     EXPECT_EQ(myRank->newChannels_.size(), 3);
     u32 channelIdx0 = 0u;
@@ -770,7 +1038,8 @@ TEST_F(MyRankTest, St_BatchCreateChannels_Multi_Times_When_fallback_Expect_Retur
     std::vector<std::vector<MemHandle>> allHandles_multi2(5);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_CCU, channelDesc, 5, hcommDesc, hostChannelHandleList, allHandles_multi2),
+            COMM_ENGINE_CCU, channelDesc, 5, hcommDesc, hostChannelHandleList, deviceChannelHandleList,
+            allHandles_multi2),
         HCCL_E_UNAVAIL);
     EXPECT_EQ(myRank->newChannels_.size(), 0);
 
@@ -1001,6 +1270,9 @@ TEST_F(MyRankTest, Ut_ChannelDescHccl2Hcomm_When_UbcCtp_DoesNotSetPathMode)
     EXPECT_EQ(out.ubMemAttr.pathMode, 2u);
 }
 
+// 复用 AICPU 直连通道时，HCCM 的 CommMemInfo* 必须先经 PrepareMemHandles 转换成
+// endpoint 返回的 LocalRmaBuffer*，且第 0 个 HcclBuffer 不能重复追加。
+
 TEST_F(MyRankTest, Ut_ConfigSqDepthByExpansionMode_When_CCU_MSModel_WithCommConfig)
 {
     HcommChannelDesc in{};
@@ -1029,29 +1301,50 @@ TEST_F(MyRankTest, Ut_ConfigSqDepthByExpansionMode_When_EngineAndProtocolVary_Ex
         uint32_t configuredSqDepth;
         uint32_t initialSqDepth;
         uint32_t expectedSqDepth;
+        uint32_t configuredScqDepth;
+        uint32_t initialScqDepth;
+        uint32_t expectedScqDepth;
     };
 
     const TestCase testCases[] = {
-        {COMM_ENGINE_AIV, COMM_PROTOCOL_UBC_TP, 128U, 64U, 128U},
-        {COMM_ENGINE_AIV, COMM_PROTOCOL_UB_CTP, 128U, 64U, 128U},
-        {COMM_ENGINE_AIV, COMM_PROTOCOL_UB_RTP, 128U, 64U, 128U},
+        // sqDepth 维度（scqDepth 未配置，不被修改）
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UBC_TP, 128U, 64U, 128U, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET},
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UB_CTP, 128U, 64U, 128U, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET},
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UB_RTP, 128U, 64U, 128U, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET},
         {COMM_ENGINE_AIV, COMM_PROTOCOL_UBC_TP, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET,
-         HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET},
-        {COMM_ENGINE_AIV, COMM_PROTOCOL_UBOE, 128U, 64U, 64U},
-        {COMM_ENGINE_AICPU_TS, COMM_PROTOCOL_UBC_TP, 128U, 64U, 64U},
+         HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET},
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UBOE, 128U, 64U, 64U, 256U, 512U, 512U},
+        {COMM_ENGINE_AICPU_TS, COMM_PROTOCOL_UBC_TP, 128U, 64U, 64U, 256U, 512U, 512U},
+        // scqDepth 维度
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UBC_TP, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, 256U, 64U, 256U},
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UB_CTP, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, 1024U, 64U, 1024U},
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UB_RTP, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, 4096U, 64U, 4096U},
+        {COMM_ENGINE_AIV, COMM_PROTOCOL_UBC_TP, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET,
+         HCCL_COMM_SQ_DEPTH_CONFIG_NOT_SET, HCCL_COMM_SCQ_DEPTH_CONFIG_NOT_SET, 64U, 64U},
     };
 
     for (const auto& testCase : testCases) {
         SCOPED_TRACE(
             testing::Message() << "engine=" << testCase.engine << ", protocol=" << testCase.protocol
-                               << ", configuredSqDepth=" << testCase.configuredSqDepth);
+                               << ", configuredSqDepth=" << testCase.configuredSqDepth
+                               << ", configuredScqDepth=" << testCase.configuredScqDepth);
         ASSERT_EQ(myRank->config_.SetConfigSqDepth(testCase.configuredSqDepth), HCCL_SUCCESS);
+        ASSERT_EQ(myRank->config_.SetConfigScqDepth(testCase.configuredScqDepth), HCCL_SUCCESS);
         HcommChannelDesc channelDesc{};
         channelDesc.remoteEndpoint.protocol = testCase.protocol;
         channelDesc.ubAttr.sqDepth = testCase.initialSqDepth;
+        channelDesc.ubAttr.scqDepth = testCase.initialScqDepth;
 
         EXPECT_EQ(myRank->ConfigSqDepthByExpansionMode(testCase.engine, channelDesc), HCCL_SUCCESS);
         EXPECT_EQ(channelDesc.ubAttr.sqDepth, testCase.expectedSqDepth);
+        EXPECT_EQ(channelDesc.ubAttr.scqDepth, testCase.expectedScqDepth);
     }
 }
 
@@ -1086,11 +1379,16 @@ TEST_F(MyRankTest, Ut_EnvAlgoConfig_When_NoExpansionModeEnv_Expect_DefaultAicpuT
 
 TEST_F(MyRankTest, Ut_CreateChannels_When_BatchExchangeAndCheckConsistency_Timeout_DevType950_Expect_HCCL_E_TIMEOUT)
 {
+    // 一致性交换超时传播经非 AICPU 引擎（AIV）的既有建链路径验证。
     MOCKER_CPP(&hccl::MyRank::BatchCreateSockets).stubs().with(mockcpp::any()).will(returnValue(HCCL_SUCCESS));
     MOCKER_CPP(&hccl::MyRank::BatchCreateChannels).stubs().with(mockcpp::any()).will(returnValue(HCCL_SUCCESS));
     MockerFuncs();
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(returnValue(HCCL_SUCCESS));
 
     MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    // 绕过 NeedCheckConsistency 门控，确保走到 ExchangeInfoMgr 超时分支
+    MOCKER_CPP(&hccl::MyRank::NeedCheckConsistency).stubs().with(outBound(true)).will(returnValue(HCCL_SUCCESS));
 
     MOCKER_CPP(&hccl::ExchangeInfoMgr::BatchExchangeAndCheckConsistency)
         .stubs()
@@ -1115,18 +1413,23 @@ TEST_F(MyRankTest, Ut_CreateChannels_When_BatchExchangeAndCheckConsistency_Timeo
     channelDesc[0].ubMemAttr.pathMode = 0;
 
     ChannelHandle channelHandles[1];
-    HcclResult ret = myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test", channelDesc, 1, channelHandles);
+    HcclResult ret = myRank->CreateChannels(COMM_ENGINE_AIV, "test", channelDesc, 1, channelHandles);
     EXPECT_EQ(ret, HCCL_E_TIMEOUT);
 }
 
 // 验证DEV_TYPE_960设备同样进入通信域一致性校验交换路径（一致性校验超时返回HCCL_E_TIMEOUT）
 TEST_F(MyRankTest, Ut_CreateChannels_When_BatchExchangeAndCheckConsistency_Timeout_DevType960_Expect_HCCL_E_TIMEOUT)
 {
+    // 一致性交换超时传播经非 AICPU 引擎（AIV）的既有建链路径验证。
     MOCKER_CPP(&hccl::MyRank::BatchCreateSockets).stubs().with(mockcpp::any()).will(returnValue(HCCL_SUCCESS));
     MOCKER_CPP(&hccl::MyRank::BatchCreateChannels).stubs().with(mockcpp::any()).will(returnValue(HCCL_SUCCESS));
     MockerFuncs();
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(returnValue(HCCL_SUCCESS));
 
     MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_960)).will(returnValue(HCCL_SUCCESS));
+
+    // 绕过 NeedCheckConsistency 门控，确保走到 ExchangeInfoMgr 超时分支
+    MOCKER_CPP(&hccl::MyRank::NeedCheckConsistency).stubs().with(outBound(true)).will(returnValue(HCCL_SUCCESS));
 
     MOCKER_CPP(&hccl::ExchangeInfoMgr::BatchExchangeAndCheckConsistency)
         .stubs()
@@ -1151,7 +1454,7 @@ TEST_F(MyRankTest, Ut_CreateChannels_When_BatchExchangeAndCheckConsistency_Timeo
     channelDesc[0].ubMemAttr.pathMode = 0;
 
     ChannelHandle channelHandles[1];
-    HcclResult ret = myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test", channelDesc, 1, channelHandles);
+    HcclResult ret = myRank->CreateChannels(COMM_ENGINE_AIV, "test", channelDesc, 1, channelHandles);
     EXPECT_EQ(ret, HCCL_E_TIMEOUT);
 }
 
@@ -1190,6 +1493,405 @@ TEST_F(MyRankTest, Ut_CreateChannels_When_ZeroChannelNum_Expect_EPara)
     ChannelHandle channelHandles[1];
     HcclResult ret = myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test", channelDesc, 0, channelHandles);
     EXPECT_EQ(ret, HCCL_E_PARA);
+}
+
+// ==================== 复用通道追加内存的 device 侧补齐下发 ====================
+
+namespace {
+// 4 字节包头 + 2 条 28 字节条目
+constexpr uint32_t PACK_BYTES_WITH_TWO_ENTRIES = 60U;
+
+struct MemUpdatePackCall {
+    ChannelHandle channel;
+    void* hostPack;      // 第一轮恒为 nullptr，第二轮为段首地址
+    uint32_t capacityIn; // 第一轮恒为 0，第二轮为 host 侧给的容量
+};
+
+struct H2dCopy {
+    const void* src;
+    std::vector<char> payload; // DeviceMem 出作用域即释放，内容只能拷下来看
+};
+
+std::unordered_map<ChannelHandle, uint32_t> g_packSizeByChannel;
+std::vector<MemUpdatePackCall> g_packCalls;
+std::vector<uint32_t> g_memHandleNumByChannel;
+std::vector<H2dCopy> g_h2dCopies;
+
+// 取包接口 spy：按通道给出所需长度，并把 host 缓冲铺成通道相关的填充值
+HcommResult SpyChannelGetMemUpdatePack(ChannelHandle channel, void* hostPack, uint32_t* packSize)
+{
+    if (packSize == nullptr) {
+        return HCCL_E_PTR;
+    }
+    g_packCalls.push_back({channel, hostPack, *packSize});
+
+    auto it = g_packSizeByChannel.find(channel);
+    const uint32_t need = (it == g_packSizeByChannel.end()) ? 0U : it->second;
+    if (need == 0) {
+        *packSize = 0;
+        return HCCL_SUCCESS;
+    }
+    if (hostPack == nullptr) {
+        *packSize = need;
+        return HCCL_SUCCESS;
+    }
+    if (*packSize < need) {
+        return HCCL_E_PARA;
+    }
+    std::memset(hostPack, static_cast<int>(0xA0U + (channel & 0x0FU)), need);
+    *packSize = need;
+    return HCCL_SUCCESS;
+}
+
+// 假建链输出：句柄按通道号编址，allHandles[i] 的元素数由用例指定
+HcclResult StubBatchCreateChannels(
+    hccl::MyRank*, CommEngine, const HcclChannelDesc*, uint32_t channelNum, std::vector<HcommChannelDesc>&,
+    ChannelHandle* hostHandles, ChannelHandle* deviceHandles, std::vector<std::vector<MemHandle>>& allHandles)
+{
+    for (u32 i = 0; i < channelNum; ++i) {
+        hostHandles[i] = static_cast<ChannelHandle>(0x1000U + i);
+        deviceHandles[i] = static_cast<ChannelHandle>(0x2000U + i);
+        const uint32_t handleNum = (i < g_memHandleNumByChannel.size()) ? g_memHandleNumByChannel[i] : 0U;
+        allHandles[i].assign(handleNum, reinterpret_cast<MemHandle>(static_cast<uintptr_t>(0x3000U + i)));
+    }
+    return HCCL_SUCCESS;
+}
+
+// llt 的 HrtMalloc 返回常量地址、aclrtMemcpy 是真 memcpy，地址互踩，这里换成真 malloc
+HcclResult StubLaunchHrtMalloc(void** devPtr, u64 size, bool /*level2Address*/)
+{
+    if (devPtr == nullptr || size == 0) {
+        return HCCL_E_PTR;
+    }
+    *devPtr = std::malloc(size);
+    return (*devPtr != nullptr) ? HCCL_SUCCESS : HCCL_E_PTR;
+}
+
+HcclResult StubLaunchHrtFree(void* devPtr)
+{
+    std::free(devPtr);
+    return HCCL_SUCCESS;
+}
+
+HcclResult
+StubLaunchHrtMemSyncCopy(void* dst, uint64_t /*destMax*/, const void* src, uint64_t count, HcclRtMemcpyKind kind)
+{
+    if (dst != nullptr && src != nullptr && count > 0) {
+        if (kind == HcclRtMemcpyKind::HCCL_RT_MEMCPY_KIND_HOST_TO_DEVICE) {
+            const char* begin = static_cast<const char*>(src);
+            g_h2dCopies.push_back({src, std::vector<char>(begin, begin + count)});
+        }
+        (void)std::memcpy(dst, src, count);
+    }
+    return HCCL_SUCCESS;
+}
+
+const H2dCopy* FindH2dCopyFrom(const void* src)
+{
+    for (const auto& copy : g_h2dCopies) {
+        if (copy.src == src) {
+            return &copy;
+        }
+    }
+    return nullptr;
+}
+
+void ResetCreateChannelsRecords()
+{
+    g_packSizeByChannel.clear();
+    g_packCalls.clear();
+    g_memHandleNumByChannel.clear();
+    g_h2dCopies.clear();
+}
+
+// launchNum：DFX 填表 1 次，复用通道有包可推时再加 1 次
+void InstallCreateChannelsLaunchMocks(MyRank* myRank, uint32_t launchNum)
+{
+    MOCKER_CPP(&hccl::MyRank::BatchCreateSockets).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::MyRank::BatchCreateChannels).stubs().will(invoke(StubBatchCreateChannels));
+    MOCKER_CPP(&hccl::MyRank::WaitForChannelsReady).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::MyRank::BatchExchangeAndCheckConsistency).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::MyRank::FinalizeChannelsByEngine).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(HcommChannelGetMemUpdatePack).stubs().will(invoke(SpyChannelGetMemUpdatePack));
+    // CreateChannels 在 AICPU/AICPU_TS 分支先兜底 EnsureDeviceReady 再下发 DFX register，
+    // 需桩掉新接口并标记 commInit 已就绪，否则真实 EnsureDeviceReady 以假句柄执行会失败提前返回
+    MOCKER(HcommChannelEnsureDeviceReady).stubs().will(returnValue(static_cast<HcommResult>(HCCL_SUCCESS)));
+    myRank->callbacks_.getAicpuCommState = []() {
+        return true;
+    };
+    MOCKER(hrtStreamCreateWithFlags).stubs().will(returnValue(static_cast<HcclResult>(HCCL_E_RUNTIME)));
+    MOCKER(hrtGetHcclV2Support).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hrtStreamSetMode).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(hrtMalloc).stubs().will(invoke(StubLaunchHrtMalloc));
+    MOCKER_CPP(hrtFree).stubs().will(invoke(StubLaunchHrtFree));
+    MOCKER_CPP(hrtMemSyncCopy).stubs().will(invoke(StubLaunchHrtMemSyncCopy));
+    MOCKER(hccl::AicpuAclKernelLaunch).expects(exactly(launchNum)).will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcclStreamSynchronize).stubs().will(returnValue(HCCL_SUCCESS));
+}
+
+void MakeChannelDescs(HcclChannelDesc* descs, const EndpointDesc& localEp, const EndpointDesc& rmtEp, uint32_t num)
+{
+    for (u32 i = 0; i < num; ++i) {
+        descs[i] = HcclChannelDesc{};
+        descs[i].channelProtocol = COMM_PROTOCOL_UB_MEM;
+        descs[i].remoteRank = 1U;
+        descs[i].notifyNum = 2U;
+        descs[i].localEndpoint = localEp;
+        descs[i].remoteEndpoint = rmtEp;
+        descs[i].ubMemAttr.pathMode = 0;
+    }
+}
+} // namespace
+
+// 整批新建：地址表随建链 kernel 一起下发，本流程一条都不取
+TEST_F(MyRankTest, Ut_CreateChannels_When_AllChannelsNew_Expect_NoPackQuery)
+{
+    ResetCreateChannelsRecords();
+    MockerFuncs();
+    InstallCreateChannelsLaunchMocks(myRank.get(), 1U);
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    HcclMem cclBuffer;
+    CreateCclBuffer(cclBuffer);
+    EXPECT_EQ(myRank->Init(cclBuffer, 2, 2), HCCL_SUCCESS);
+
+    EndpointDesc localEp;
+    CreateEndpointDesc(localEp, COMM_PROTOCOL_UB_MEM, "1.0.0.0");
+    EndpointDesc rmtEp;
+    CreateEndpointDesc(rmtEp, COMM_PROTOCOL_UB_MEM, "2.0.0.0");
+    HcclChannelDesc channelDescs[2];
+    MakeChannelDescs(channelDescs, localEp, rmtEp, 2U);
+
+    // BatchCreateChannels 被桩掉，本轮新建列表由用例直接给出
+    myRank->newChannels_ = {{0U, 0U}, {1U, 0U}};
+    g_memHandleNumByChannel = {3U, 3U};
+    g_packSizeByChannel[0x1000U] = PACK_BYTES_WITH_TWO_ENTRIES;
+    g_packSizeByChannel[0x1001U] = PACK_BYTES_WITH_TWO_ENTRIES;
+
+    ChannelHandle channelHandles[2];
+    EXPECT_EQ(
+        myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test_mem_update_new", channelDescs, 2U, channelHandles),
+        HCCL_SUCCESS);
+
+    EXPECT_TRUE(g_packCalls.empty());
+}
+
+// 复用但本轮没追加内存（memHandleNum 未增长）：不取包、不下发
+TEST_F(MyRankTest, Ut_CreateChannels_When_MemHandleNumNotGrown_Expect_NoPackQuery)
+{
+    ResetCreateChannelsRecords();
+    MockerFuncs();
+    InstallCreateChannelsLaunchMocks(myRank.get(), 1U);
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    HcclMem cclBuffer;
+    CreateCclBuffer(cclBuffer);
+    EXPECT_EQ(myRank->Init(cclBuffer, 2, 2), HCCL_SUCCESS);
+
+    EndpointDesc localEp;
+    CreateEndpointDesc(localEp, COMM_PROTOCOL_UB_MEM, "1.0.0.0");
+    EndpointDesc rmtEp;
+    CreateEndpointDesc(rmtEp, COMM_PROTOCOL_UB_MEM, "2.0.0.0");
+    HcclChannelDesc channelDescs[2];
+    MakeChannelDescs(channelDescs, localEp, rmtEp, 2U);
+
+    myRank->newChannels_.clear();
+    g_memHandleNumByChannel = {1U, 1U};
+    g_packSizeByChannel[0x1000U] = PACK_BYTES_WITH_TWO_ENTRIES;
+    g_packSizeByChannel[0x1001U] = PACK_BYTES_WITH_TWO_ENTRIES;
+
+    ChannelHandle channelHandles[2];
+    EXPECT_EQ(
+        myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test_mem_update_reuse", channelDescs, 2U, channelHandles),
+        HCCL_SUCCESS);
+
+    EXPECT_TRUE(g_packCalls.empty());
+}
+
+// 新建与复用混在同一批：两条跳过条件各自生效，只取复用那条
+TEST_F(MyRankTest, Ut_CreateChannels_When_NewAndReusedMixed_Expect_OnlyReusedQueried)
+{
+    ResetCreateChannelsRecords();
+    MockerFuncs();
+    InstallCreateChannelsLaunchMocks(myRank.get(), 2U);
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    HcclMem cclBuffer;
+    CreateCclBuffer(cclBuffer);
+    EXPECT_EQ(myRank->Init(cclBuffer, 2, 2), HCCL_SUCCESS);
+
+    EndpointDesc localEp;
+    CreateEndpointDesc(localEp, COMM_PROTOCOL_UB_MEM, "1.0.0.0");
+    EndpointDesc rmtEp;
+    CreateEndpointDesc(rmtEp, COMM_PROTOCOL_UB_MEM, "2.0.0.0");
+    HcclChannelDesc channelDescs[2];
+    MakeChannelDescs(channelDescs, localEp, rmtEp, 2U);
+
+    myRank->newChannels_ = {{0U, 0U}}; // 通道0 新建，通道1 复用
+    g_memHandleNumByChannel = {3U, 3U};
+    g_packSizeByChannel[0x1000U] = PACK_BYTES_WITH_TWO_ENTRIES;
+    g_packSizeByChannel[0x1001U] = PACK_BYTES_WITH_TWO_ENTRIES;
+
+    ChannelHandle channelHandles[2];
+    EXPECT_EQ(
+        myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test_mem_update_mixed", channelDescs, 2U, channelHandles),
+        HCCL_SUCCESS);
+
+    ASSERT_EQ(g_packCalls.size(), 2U);
+    EXPECT_EQ(g_packCalls[0].channel, 0x1001U);
+    EXPECT_EQ(g_packCalls[0].hostPack, nullptr);
+    EXPECT_EQ(g_packCalls[0].capacityIn, 0U);
+    EXPECT_EQ(g_packCalls[1].channel, 0x1001U);
+    ASSERT_NE(g_packCalls[1].hostPack, nullptr);
+    EXPECT_EQ(g_packCalls[1].capacityIn, PACK_BYTES_WITH_TWO_ENTRIES);
+}
+
+// AICPU 输出句柄会做 Entity 适配，但 NS Recovery 必须登记原始 device 句柄。
+TEST_F(MyRankTest, Ut_FinalizeChannelsByEngine_When_AicpuTsUrma_Expect_NsRecoveryUsesDeviceHandles)
+{
+    MockerFuncs();
+    MOCKER(hrtSetDevice).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hrtGetDevice).stubs().will(invoke(+[](int32_t* deviceId) {
+        *deviceId = 0;
+        return HCCL_SUCCESS;
+    }));
+    myRank->nsRecoveryProcessor_ = std::make_unique<NsRecoveryProcessor>();
+    MOCKER_CPP(&hccl::NsRecoveryProcessor::AddNsRecoveryData).stubs().will(invoke(SpyAddNsRecoveryData));
+    auto channel0 = std::make_shared<hcomm::AicpuTsUrmaChannel>(
+        reinterpret_cast<EndpointHandle>(0x1U), HcommChannelDesc{}, COMM_ENGINE_AICPU_TS);
+    auto channel1 = std::make_shared<hcomm::AicpuTsUrmaChannel>(
+        reinterpret_cast<EndpointHandle>(0x2U), HcommChannelDesc{}, COMM_ENGINE_AICPU_TS);
+    const ChannelHandle deviceHandles[2]
+        = {reinterpret_cast<ChannelHandle>(channel0.get()), reinterpret_cast<ChannelHandle>(channel1.get())};
+    auto& registry = hcomm::GetChannelHandleRegistryProc();
+    {
+        std::lock_guard<std::mutex> registryLock(registry.ChannelMapMtx());
+        for (const auto& deviceHandle : deviceHandles) {
+            hcomm::DeviceChannelKey key{myRank->devLogicId_, deviceHandle};
+            registry.ChannelMap().emplace(deviceHandle, deviceHandle == deviceHandles[0] ? channel0 : channel1);
+            registry.ChannelD2HMap().emplace(key, deviceHandle);
+        }
+    }
+    MOCKER(HcommChannelBuildDeviceEntity).stubs().will(invoke(+[](ChannelHandle, uint64_t* entityHandle) {
+        *entityHandle = 0x7777U;
+        return static_cast<HcommResult>(HCCL_SUCCESS);
+    }));
+
+    ChannelHandle hostHandles[2] = {0x1000U, 0x1001U};
+    ChannelHandle publicHandles[2] = {0, 0};
+    ASSERT_EQ(
+        myRank->FinalizeChannelsByEngine(
+            COMM_ENGINE_AICPU_TS, "test_ns_recovery", 2U, hostHandles, deviceHandles, publicHandles),
+        HCCL_SUCCESS);
+
+    EXPECT_EQ(publicHandles[0], 0x7777U);
+    EXPECT_EQ(publicHandles[1], 0x7777U);
+    ASSERT_EQ(g_nsRecoveryRegisterCalls.size(), 1U);
+    EXPECT_EQ(g_nsRecoveryRegisterCalls[0].engine, COMM_ENGINE_AICPU_TS);
+    ASSERT_EQ(g_nsRecoveryRegisterCalls[0].deviceHandles.size(), 2U);
+    EXPECT_EQ(g_nsRecoveryRegisterCalls[0].deviceHandles[0], reinterpret_cast<ChannelHandle>(channel0.get()));
+    EXPECT_EQ(g_nsRecoveryRegisterCalls[0].deviceHandles[1], reinterpret_cast<ChannelHandle>(channel1.get()));
+    ASSERT_EQ(g_nsRecoveryRegisterCalls[0].hostHandles.size(), 2U);
+    EXPECT_EQ(g_nsRecoveryRegisterCalls[0].hostHandles[0], 0x1000U);
+    EXPECT_EQ(g_nsRecoveryRegisterCalls[0].hostHandles[1], 0x1001U);
+    EXPECT_EQ(g_nsRecoveryRegisterCalls[0].commTag, "test_ns_recovery");
+
+    {
+        std::lock_guard<std::mutex> registryLock(registry.ChannelMapMtx());
+        registry.ChannelMap().clear();
+        registry.ChannelD2HMap().clear();
+        registry.ChannelH2DMap().clear();
+        registry.ChannelDestroyHandleMap().clear();
+    }
+}
+
+// 复用通道的包长为 0：只问一轮，总长 0 直接返回，不发补包 kernel
+TEST_F(MyRankTest, Ut_CreateChannels_When_PackEmpty_Expect_OnlyQueryOnceNoLaunch)
+{
+    ResetCreateChannelsRecords();
+    MockerFuncs();
+    InstallCreateChannelsLaunchMocks(myRank.get(), 1U);
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    HcclMem cclBuffer;
+    CreateCclBuffer(cclBuffer);
+    EXPECT_EQ(myRank->Init(cclBuffer, 2, 2), HCCL_SUCCESS);
+
+    EndpointDesc localEp;
+    CreateEndpointDesc(localEp, COMM_PROTOCOL_UB_MEM, "1.0.0.0");
+    EndpointDesc rmtEp;
+    CreateEndpointDesc(rmtEp, COMM_PROTOCOL_UB_MEM, "2.0.0.0");
+    HcclChannelDesc channelDescs[1];
+    MakeChannelDescs(channelDescs, localEp, rmtEp, 1U);
+
+    myRank->newChannels_.clear();
+    g_memHandleNumByChannel = {3U};
+    g_packSizeByChannel[0x1000U] = 0U;
+
+    ChannelHandle channelHandles[1];
+    EXPECT_EQ(
+        myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test_mem_update_empty", channelDescs, 1U, channelHandles),
+        HCCL_SUCCESS);
+
+    ASSERT_EQ(g_packCalls.size(), 1U);
+    EXPECT_EQ(g_packCalls[0].channel, 0x1000U);
+    EXPECT_EQ(g_packCalls[0].hostPack, nullptr);
+}
+
+// 两个复用通道各有包：两轮取包共 4 次，两段拼进同一缓冲后一次下发
+TEST_F(MyRankTest, Ut_CreateChannels_When_TwoReusedChannelsGrown_Expect_PackPushedAsOneBlob)
+{
+    ResetCreateChannelsRecords();
+    MockerFuncs();
+    InstallCreateChannelsLaunchMocks(myRank.get(), 2U);
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    HcclMem cclBuffer;
+    CreateCclBuffer(cclBuffer);
+    EXPECT_EQ(myRank->Init(cclBuffer, 2, 2), HCCL_SUCCESS);
+
+    EndpointDesc localEp;
+    CreateEndpointDesc(localEp, COMM_PROTOCOL_UB_MEM, "1.0.0.0");
+    EndpointDesc rmtEp;
+    CreateEndpointDesc(rmtEp, COMM_PROTOCOL_UB_MEM, "2.0.0.0");
+    HcclChannelDesc channelDescs[2];
+    MakeChannelDescs(channelDescs, localEp, rmtEp, 2U);
+
+    myRank->newChannels_.clear();
+    g_memHandleNumByChannel = {3U, 3U};
+    g_packSizeByChannel[0x1000U] = PACK_BYTES_WITH_TWO_ENTRIES;
+    g_packSizeByChannel[0x1001U] = PACK_BYTES_WITH_TWO_ENTRIES;
+
+    ChannelHandle channelHandles[2];
+    EXPECT_EQ(
+        myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test_mem_update_two", channelDescs, 2U, channelHandles),
+        HCCL_SUCCESS);
+
+    // 第一轮只问长度，第二轮才带缓冲
+    ASSERT_EQ(g_packCalls.size(), 4U);
+    EXPECT_EQ(g_packCalls[0].channel, 0x1000U);
+    EXPECT_EQ(g_packCalls[0].hostPack, nullptr);
+    EXPECT_EQ(g_packCalls[0].capacityIn, 0U);
+    EXPECT_EQ(g_packCalls[1].channel, 0x1001U);
+    EXPECT_EQ(g_packCalls[1].hostPack, nullptr);
+    ASSERT_NE(g_packCalls[2].hostPack, nullptr);
+    EXPECT_EQ(g_packCalls[2].channel, 0x1000U);
+    EXPECT_EQ(g_packCalls[2].capacityIn, PACK_BYTES_WITH_TWO_ENTRIES);
+    ASSERT_NE(g_packCalls[3].hostPack, nullptr);
+    EXPECT_EQ(g_packCalls[3].channel, 0x1001U);
+    EXPECT_EQ(g_packCalls[3].capacityIn, PACK_BYTES_WITH_TWO_ENTRIES);
+    // 通道顺序即段顺序：通道1 的段紧接在通道0 之后
+    EXPECT_EQ(
+        static_cast<const char*>(g_packCalls[3].hostPack),
+        static_cast<const char*>(g_packCalls[2].hostPack) + PACK_BYTES_WITH_TWO_ENTRIES);
+
+    // 下发的就是这两段拼起来的那份缓冲
+    const H2dCopy* pushed = FindH2dCopyFrom(g_packCalls[2].hostPack);
+    ASSERT_NE(pushed, nullptr);
+    ASSERT_EQ(pushed->payload.size(), 2U * PACK_BYTES_WITH_TWO_ENTRIES);
+    std::vector<char> expectBlob(PACK_BYTES_WITH_TWO_ENTRIES, static_cast<char>(0xA0));
+    expectBlob.insert(expectBlob.end(), PACK_BYTES_WITH_TWO_ENTRIES, static_cast<char>(0xA1));
+    EXPECT_EQ(pushed->payload, expectBlob);
 }
 
 TEST_F(MyRankTest, Ut_ConfigSqDepthByExpansionMode_When_CcuMs_Expect_CorrectDepth)
@@ -1249,6 +1951,8 @@ TEST_F(MyRankTest, Ut_BatchCreateChannels_HcommDescsEquivalence)
         .with(mockcpp::any())
         .will(returnValue((Hccl::Socket*)0xab));
     MOCKER(hcomm::ChannelProcess::CreateChannelsLoop).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::PrepareUserChannels).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(returnValue(HCCL_SUCCESS));
 
     HcclMem cclBuffer;
     CreateCclBuffer(cclBuffer);
@@ -1316,10 +2020,12 @@ TEST_F(MyRankTest, Ut_BatchCreateChannels_HcommDescsEquivalence)
 
     std::vector<ChannelHandle> hostChannelHandles(4);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
+    std::vector<ChannelHandle> deviceChannelHandles(4);
     std::vector<std::vector<MemHandle>> allHandles_eq(4);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_AICPU_TS, channelDesc, 4, hcommDesc, hostChannelHandleList, allHandles_eq),
+            COMM_ENGINE_AICPU_TS, channelDesc, 4, hcommDesc, hostChannelHandleList, deviceChannelHandles.data(),
+            allHandles_eq),
         HCCL_SUCCESS);
 
     // 验证 hcommDescs：输出仅取决于 channelDesc 的 memHandle 子集，与内部注册方式无关
@@ -1395,6 +2101,8 @@ TEST_F(MyRankTest, Ut_BatchCreateChannels_RegisterMemoryPerEndpoint)
     MOCKER_CPP(&hccl::EndpointMgr::RegisterMemory).stubs().will(invoke(RegisterMemorySpyStub));
     MOCKER_CPP(&hccl::EndpointMgr::GetMemHandlesByTags).stubs().will(invoke(GetMemHandlesByTagsStub));
     MOCKER(hcomm::ChannelProcess::CreateChannelsLoop).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::PrepareUserChannels).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(returnValue(HCCL_SUCCESS));
 
     HcclMem cclBuffer;
     CreateCclBuffer(cclBuffer);
@@ -1430,10 +2138,13 @@ TEST_F(MyRankTest, Ut_BatchCreateChannels_RegisterMemoryPerEndpoint)
     EXPECT_EQ(myRank->BatchCreateSockets(channelDesc, 4, "test", hcommDesc, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
 
     std::vector<ChannelHandle> hostChannelHandles(4);
+    std::vector<ChannelHandle> deviceChannelHandles(4);
     std::vector<std::vector<MemHandle>> allHandles(4);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
     EXPECT_EQ(
-        myRank->BatchCreateChannels(COMM_ENGINE_AICPU_TS, channelDesc, 4, hcommDesc, hostChannelHandleList, allHandles),
+        myRank->BatchCreateChannels(
+            COMM_ENGINE_AICPU_TS, channelDesc, 4, hcommDesc, hostChannelHandleList, deviceChannelHandles.data(),
+            allHandles),
         HCCL_SUCCESS);
 
     // 验证：2个endpoint → 2次RegisterMemory调用（非4次per-channel）
@@ -1471,6 +2182,9 @@ TEST_F(MyRankTest, Ut_MemRegAndAcquireLifecycle)
     MOCKER(hrtGetDeviceRefresh).stubs().with(mockcpp::any()).will(returnValue(HCCL_SUCCESS));
     // channel 跳过平台层
     MOCKER(hcomm::ChannelProcess::CreateChannelsLoop).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::PrepareUserChannels).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(hcomm::ChannelProcess::ResolveHostHandleToDevice).stubs().will(returnValue(HCCL_SUCCESS));
     // socket
     MOCKER_CPP(&Hccl::SocketManager::GetConnectedSocket)
         .stubs()
@@ -1538,10 +2252,12 @@ TEST_F(MyRankTest, Ut_MemRegAndAcquireLifecycle)
 
     // ---- Round 1: CreateChannels ----
     std::vector<ChannelHandle> hostChannelHandles1(2);
+    std::vector<ChannelHandle> deviceChannelHandles1(2);
     std::vector<std::vector<MemHandle>> allHandles1(2);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_AIV, channelDesc, 2, hcommDesc, hostChannelHandles1.data(), allHandles1),
+            COMM_ENGINE_AIV, channelDesc, 2, hcommDesc, hostChannelHandles1.data(), deviceChannelHandles1.data(),
+            allHandles1),
         HCCL_SUCCESS);
 
     // cclBuffer + A + B + C = 4 tags, 2 endpoints → 8 HcommMemReg calls
@@ -1555,10 +2271,12 @@ TEST_F(MyRankTest, Ut_MemRegAndAcquireLifecycle)
     }
     EXPECT_EQ(myRank->BatchCreateSockets(channelDesc, 2, "test", hcommDesc1b, COMM_ENGINE_AIV), HCCL_SUCCESS);
     std::vector<ChannelHandle> hostChannelHandles1b(2);
+    std::vector<ChannelHandle> deviceChannelHandles1b(2);
     std::vector<std::vector<MemHandle>> allHandles1b(2);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_AIV, channelDesc, 2, hcommDesc1b, hostChannelHandles1b.data(), allHandles1b),
+            COMM_ENGINE_AIV, channelDesc, 2, hcommDesc1b, hostChannelHandles1b.data(), deviceChannelHandles1b.data(),
+            allHandles1b),
         HCCL_SUCCESS);
 
     // 版本不变，RegisterMemory 跳过，无新增 HcommMemReg
@@ -1575,10 +2293,12 @@ TEST_F(MyRankTest, Ut_MemRegAndAcquireLifecycle)
     }
     EXPECT_EQ(myRank->BatchCreateSockets(channelDesc, 2, "test", hcommDesc2, COMM_ENGINE_AIV), HCCL_SUCCESS);
     std::vector<ChannelHandle> hostChannelHandles2(2);
+    std::vector<ChannelHandle> deviceChannelHandles2(2);
     std::vector<std::vector<MemHandle>> allHandles2(2);
     EXPECT_EQ(
         myRank->BatchCreateChannels(
-            COMM_ENGINE_AIV, channelDesc, 2, hcommDesc2, hostChannelHandles2.data(), allHandles2),
+            COMM_ENGINE_AIV, channelDesc, 2, hcommDesc2, hostChannelHandles2.data(), deviceChannelHandles2.data(),
+            allHandles2),
         HCCL_SUCCESS);
 
     // 版本变更，"B"已不在 CommMems 中，"B"不会被注册
@@ -1636,14 +2356,18 @@ TEST_F(MyRankTest, Ut_BatchCreateChannels_When_DefaultPort_EnvConfigured_Expect_
     channelDesc[0].memHandles = nullptr;
     channelDesc[0].memHandleNum = 0;
 
-    MOCKER(HcommCollectiveChannelCreate).stubs().will(returnValue(static_cast<int>(HCCL_SUCCESS)));
+    MOCKER(HcommChannelCreate).stubs().will(returnValue(static_cast<int>(HCCL_SUCCESS)));
+    // 整条 HcommChannelCreate 被桩掉后 D2H 表恒空，出口反查需打桩
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(returnValue(HCCL_SUCCESS));
 
     std::vector<HcommChannelDesc> hcommDesc(1);
     std::vector<ChannelHandle> hostChannelHandles(1);
+    std::vector<ChannelHandle> deviceChannelHandles(1);
     std::vector<std::vector<MemHandle>> allHandles(1);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
     EXPECT_EQ(
-        myRank->BatchCreateChannels(COMM_ENGINE_CCU, channelDesc, 1, hcommDesc, hostChannelHandleList, allHandles),
+        myRank->BatchCreateChannels(
+            COMM_ENGINE_CCU, channelDesc, 1, hcommDesc, hostChannelHandleList, deviceChannelHandles.data(), allHandles),
         HCCL_SUCCESS);
 
     GlobalMockObject::verify();
@@ -1693,14 +2417,18 @@ TEST_F(MyRankTest, Ut_BatchCreateChannels_When_DefaultPort_EnvNotConfigured_Expe
     channelDesc[0].memHandles = nullptr;
     channelDesc[0].memHandleNum = 0;
 
-    MOCKER(HcommCollectiveChannelCreate).stubs().will(returnValue(static_cast<int>(HCCL_SUCCESS)));
+    MOCKER(HcommChannelCreate).stubs().will(returnValue(static_cast<int>(HCCL_SUCCESS)));
+    // 整条 HcommChannelCreate 被桩掉后 D2H 表恒空，出口反查需打桩
+    MOCKER(hcomm::ChannelProcess::ResolveUserHandleToHost).stubs().will(returnValue(HCCL_SUCCESS));
 
     std::vector<HcommChannelDesc> hcommDesc(1);
     std::vector<ChannelHandle> hostChannelHandles(1);
+    std::vector<ChannelHandle> deviceChannelHandles(1);
     std::vector<std::vector<MemHandle>> allHandles(1);
     ChannelHandle* hostChannelHandleList = hostChannelHandles.data();
     EXPECT_EQ(
-        myRank->BatchCreateChannels(COMM_ENGINE_CCU, channelDesc, 1, hcommDesc, hostChannelHandleList, allHandles),
+        myRank->BatchCreateChannels(
+            COMM_ENGINE_CCU, channelDesc, 1, hcommDesc, hostChannelHandleList, deviceChannelHandles.data(), allHandles),
         HCCL_SUCCESS);
 
     GlobalMockObject::verify();
@@ -2207,7 +2935,7 @@ TEST_F(MyRankTest, Ut_When_DestroyPartialFail_Expect_ContinueAndReturnFirstErr)
 
 // ==================== CCU回退链路 UT====================
 
-// CCU 回滚链路: BatchConnectChannels 返回资源不足时, CreateChannels 销毁本轮新建通道并返回 E_UNAVAIL
+// CCU 回滚链路: WaitForChannelsReady 返回资源不足时, CreateChannels 销毁本轮新建通道并返回 E_UNAVAIL
 TEST_F(MyRankTest, Ut_When_RollbackFullChain_ResourceUnavailable_Expect_StateRestored)
 {
     HcclMem cclBuffer;
@@ -2218,7 +2946,7 @@ TEST_F(MyRankTest, Ut_When_RollbackFullChain_ResourceUnavailable_Expect_StateRes
     // 建链阶段 mock 成功, 连接阶段返回资源不足, 触发 CCU 回滚(真实 DestroyNewChannels 路径)
     MOCKER_CPP(&MyRank::BatchCreateSockets).stubs().will(returnValue(HCCL_SUCCESS));
     MOCKER_CPP(&MyRank::BatchCreateChannels).stubs().will(returnValue(HCCL_SUCCESS));
-    MOCKER_CPP(&MyRank::BatchConnectChannels).stubs().will(returnValue(HCCL_E_UNAVAIL));
+    MOCKER_CPP(&MyRank::WaitForChannelsReady).stubs().will(returnValue(HCCL_E_UNAVAIL));
     // CCU 引擎需要 CCU 展开模式
     myRank->opExpansionMode_ = CCU_SCHED_MODE;
 
@@ -2416,4 +3144,594 @@ TEST_F(MyRankTest, Ut_QueryListenPort_When_SameIpLocalRankLarger_Expect_Client)
     EXPECT_EQ(desc.role, HCOMM_SOCKET_ROLE_CLIENT);
     EXPECT_EQ(listenPort, 16666);
     EXPECT_EQ(desc.port, 16666);
+}
+
+// NeedCheckConsistency: DEV_TYPE_950 且 rankConsistentState 为 0(first) 时需要校验
+TEST_F(MyRankTest, Ut_NeedCheckConsistency_When_DevType950AndModeFirst_Expect_NeedCheck)
+{
+    // 清除 SetUp 默认的 hrtGetDeviceType(950) mock，使本用例的 mock 生效
+    GlobalMockObject::verify();
+    setenv("HCCL_DFS_CONFIG", "inconsistent_check:first", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    bool needCheck = false;
+    EXPECT_EQ(myRank->NeedCheckConsistency(needCheck), HCCL_SUCCESS);
+    EXPECT_TRUE(needCheck);
+
+    // 恢复环境，避免影响后续用例
+    setenv("HCCL_DFS_CONFIG", "task_exception:on", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+}
+
+// NeedCheckConsistency: DEV_TYPE_960 且 rankConsistentState 为 1(on) 时需要校验
+TEST_F(MyRankTest, Ut_NeedCheckConsistency_When_DevType960AndModeOn_Expect_NeedCheck)
+{
+    // 清除 SetUp 默认的 hrtGetDeviceType(950) mock，使本用例的 mock 生效
+    GlobalMockObject::verify();
+    setenv("HCCL_DFS_CONFIG", "inconsistent_check:on", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_960)).will(returnValue(HCCL_SUCCESS));
+
+    bool needCheck = false;
+    EXPECT_EQ(myRank->NeedCheckConsistency(needCheck), HCCL_SUCCESS);
+    EXPECT_TRUE(needCheck);
+
+    // 恢复环境，避免影响后续用例
+    setenv("HCCL_DFS_CONFIG", "task_exception:on", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+}
+
+// NeedCheckConsistency: rankConsistentState 为 off(-1) 时不需要校验
+TEST_F(MyRankTest, Ut_NeedCheckConsistency_When_ModeOff_Expect_NoNeedCheck)
+{
+    // 清除 SetUp 默认的 hrtGetDeviceType(950) mock，使本用例的 mock 生效
+    GlobalMockObject::verify();
+    setenv("HCCL_DFS_CONFIG", "inconsistent_check:off", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+
+    bool needCheck = true;
+    EXPECT_EQ(myRank->NeedCheckConsistency(needCheck), HCCL_SUCCESS);
+    EXPECT_FALSE(needCheck);
+
+    // 恢复环境，避免影响后续用例
+    setenv("HCCL_DFS_CONFIG", "task_exception:on", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+}
+
+// NeedCheckConsistency: 非 DEV_TYPE_950/960 设备不需要校验
+TEST_F(MyRankTest, Ut_NeedCheckConsistency_When_DevTypeNotSupport_Expect_NoNeedCheck)
+{
+    // 清除 SetUp 默认的 hrtGetDeviceType(950) mock，使本用例的 mock 生效
+    GlobalMockObject::verify();
+    setenv("HCCL_DFS_CONFIG", "inconsistent_check:on", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_910B)).will(returnValue(HCCL_SUCCESS));
+
+    bool needCheck = true;
+    EXPECT_EQ(myRank->NeedCheckConsistency(needCheck), HCCL_SUCCESS);
+    EXPECT_FALSE(needCheck);
+
+    // 恢复环境，避免影响后续用例
+    setenv("HCCL_DFS_CONFIG", "task_exception:on", 1);
+    Hccl::EnvConfig::GetInstance().Parse();
+}
+
+// NeedCheckConsistency: 设备类型查询失败时向上返回错误码
+TEST_F(MyRankTest, Ut_NeedCheckConsistency_When_GetDeviceTypeFails_Expect_Error)
+{
+    // 清除 SetUp 默认的 hrtGetDeviceType(950) mock，使本用例的 mock 生效
+    GlobalMockObject::verify();
+    MOCKER(hrtGetDeviceType).stubs().will(returnValue(HCCL_E_RUNTIME));
+
+    bool needCheck = false;
+    EXPECT_EQ(myRank->NeedCheckConsistency(needCheck), HCCL_E_RUNTIME);
+    EXPECT_FALSE(needCheck);
+}
+
+// NeedCheckConsistency 返回错误时，一致性交换流程透传该错误
+TEST_F(MyRankTest, Ut_BatchExchangeAndCheckConsistency_When_NeedCheckFails_Expect_Propagate)
+{
+    MOCKER_CPP(&hccl::MyRank::NeedCheckConsistency).stubs().will(returnValue(HCCL_E_INTERNAL));
+
+    HcclChannelDesc channelDesc[1]{};
+    channelDesc[0].remoteRank = 1;
+    ChannelHandle channelHandles[1] = {0};
+    EXPECT_EQ(myRank->BatchExchangeAndCheckConsistency(channelDesc, channelHandles, 1), HCCL_E_INTERNAL);
+}
+
+// needCheck 为 false 时跳过一致性交换，不调用 ExchangeInfoMgr
+TEST_F(MyRankTest, Ut_BatchExchangeAndCheckConsistency_When_NeedCheckFalse_Expect_Skip)
+{
+    MOCKER_CPP(&hccl::MyRank::NeedCheckConsistency).stubs().with(outBound(false)).will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::ExchangeInfoMgr::BatchExchangeAndCheckConsistency).stubs().will(returnValue(HCCL_E_TIMEOUT));
+
+    HcclChannelDesc channelDesc[1]{};
+    channelDesc[0].remoteRank = 1;
+    ChannelHandle channelHandles[1] = {0};
+    EXPECT_EQ(myRank->BatchExchangeAndCheckConsistency(channelDesc, channelHandles, 1), HCCL_SUCCESS);
+}
+
+// ---------------------------------------------------------------------------
+// DCA 集成直测（检视 D8）：失败对端收集 / 端口查询 / 探测下发队列的真实路径
+// ---------------------------------------------------------------------------
+static HcclResult StubDcaGetListenPortOk(
+    hccl::MyRank* /*self*/, uint32_t /*rank*/, const Hccl::IpAddress& /*addr*/, EndpointLocType /*locType*/,
+    CommEngine /*engine*/, uint32_t* port)
+{
+    *port = 16666;
+    return HCCL_SUCCESS;
+}
+
+static HcclResult StubDcaCollectPeerInfo(
+    hccl::MyRank* /*self*/, const HcclChannelDesc* /*channelDescs*/,
+    const std::unordered_map<uint32_t, uint32_t>& /*failedRanks*/, std::vector<hcomm::DcaPeerInfo>& peers,
+    CommEngine /*engine*/)
+{
+    peers.emplace_back();
+    return HCCL_SUCCESS;
+}
+
+static HcclResult
+StubDcaCollectLocalInfo(hccl::MyRank* /*self*/, std::vector<hcomm::LocalIpInfo>& localIps, CommEngine /*engine*/)
+{
+    localIps.emplace_back();
+    return HCCL_SUCCESS;
+}
+
+static HcclResult StubDcaGetNetInstId(hccl::MyRank* /*self*/, uint32_t /*remoteRank*/, std::string& netInstId)
+{
+    netInstId = "stub_netinst";
+    return HCCL_SUCCESS;
+}
+
+TEST_F(MyRankTest, Ut_CollectFailedRanks_When_MixedStatus_Expect_OnlyBadRanksCollected)
+{
+    // 仅 CONNECTING/FAILED/TIMEOUT 计入失败对端，READY 和资源不足状态跳过
+    HcclChannelDesc descs[5]{};
+    descs[0].remoteRank = 1;
+    descs[1].remoteRank = 2;
+    descs[2].remoteRank = 3;
+    descs[3].remoteRank = 4;
+    descs[4].remoteRank = 5;
+    int32_t statusList[5] = {
+        hcomm::HCOMM_CHANNEL_STATUS_CONNECTING, hcomm::HCOMM_CHANNEL_STATUS_READY, hcomm::HCOMM_CHANNEL_STATUS_FAILED,
+        hcomm::HCOMM_CHANNEL_STATUS_TIMEOUT, hcomm::HCOMM_CHANNEL_STATUS_RES_LOC_UNAVAIL};
+    std::unordered_map<uint32_t, uint32_t> failedRanks;
+    myRank->CollectFailedRanks(descs, statusList, 5, failedRanks);
+    ASSERT_EQ(failedRanks.size(), 3u);
+    EXPECT_EQ(failedRanks[1], 0u);
+    EXPECT_EQ(failedRanks[3], 2u);
+    EXPECT_EQ(failedRanks[4], 3u);
+}
+
+TEST_F(MyRankTest, Ut_GetDcaPort_When_QueryOk_Expect_QueriedPort_WhenFail_Expect_DefaultPort)
+{
+    MOCKER_CPP(&hccl::MyRank::GetListenPortByAddr).stubs().will(invoke(StubDcaGetListenPortOk));
+    EXPECT_EQ(
+        myRank->GetDcaPort(1, Hccl::IpAddress("1.0.0.0"), ENDPOINT_LOC_TYPE_DEVICE, COMM_ENGINE_AICPU_TS), 16666u);
+    GlobalMockObject::verify();
+
+    MOCKER_CPP(&hccl::MyRank::GetListenPortByAddr).stubs().will(returnValue(HCCL_E_NOT_FOUND));
+    // 查询失败回退默认端口：device=16666（DEFAULT_VALUE_TCPPORT）、host=60001（DEFAULT_LISTENING_PORT）
+    EXPECT_EQ(
+        myRank->GetDcaPort(1, Hccl::IpAddress("1.0.0.0"), ENDPOINT_LOC_TYPE_DEVICE, COMM_ENGINE_AICPU_TS), 16666u);
+    EXPECT_EQ(myRank->GetDcaPort(1, Hccl::IpAddress("1.0.0.0"), ENDPOINT_LOC_TYPE_HOST, COMM_ENGINE_CPU), 60001u);
+}
+
+TEST_F(MyRankTest, Ut_CollectDcaPeerInfo_When_DeviceLoc_Expect_PeerFilled)
+{
+    MOCKER_CPP(&hccl::MyRank::GetDcaPort).stubs().will(returnValue(16666u));
+    MOCKER_CPP(&hccl::MyRank::GetNetInstId).stubs().will(invoke(StubDcaGetNetInstId));
+    HcclChannelDesc descs[1]{};
+    descs[0].remoteRank = 1;
+    CreateEndpointDesc(descs[0].localEndpoint, COMM_PROTOCOL_ROCE, "1.0.0.0");
+    CreateEndpointDesc(descs[0].remoteEndpoint, COMM_PROTOCOL_ROCE, "3.0.0.0");
+    descs[0].remoteEndpoint.loc.device.devPhyId = 3;
+    std::unordered_map<uint32_t, uint32_t> failedRanks{{1, 0}};
+    std::vector<hcomm::DcaPeerInfo> peers;
+    EXPECT_EQ(myRank->CollectDcaPeerInfo(descs, failedRanks, peers, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
+    ASSERT_EQ(peers.size(), 1u);
+    EXPECT_EQ(peers[0].remoteRankId, 1u);
+    EXPECT_EQ(peers[0].remoteDevPhyId, 3u);
+    EXPECT_EQ(peers[0].remotePort, 16666u);
+    EXPECT_STREQ(peers[0].remoteNetInstId, "stub_netinst");
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_StartDcaDetectByFailedRanks_When_Valid_Expect_AddIpQueueCalled)
+{
+    // 真实路径：失败对端经 StartDcaDetectByFailedRanks 下发到 DCA 队列（AddIpQueue 桩计数递增）
+    hcomm::DcaStubResetCounts();
+    HcclChannelDesc descs[1]{};
+    descs[0].remoteRank = 1;
+    std::unordered_map<uint32_t, uint32_t> failedRanks{{1, 0}};
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(invoke(StubDcaCollectPeerInfo));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaLocalInfo).stubs().will(invoke(StubDcaCollectLocalInfo));
+    MOCKER_CPP(&hccl::MyRank::GetNetInstId).stubs().will(invoke(StubDcaGetNetInstId));
+    myRank->StartDcaDetectByFailedRanks(descs, 1, failedRanks, COMM_ENGINE_AICPU_TS);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 1u);
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_StartDcaDetectByFailedRanks_When_GetPhyIdFails_Expect_SkipDetect)
+{
+    // 本端 phyId 获取失败：跳过本次探测，不下发 DCA 队列
+    hcomm::DcaStubResetCounts();
+    HcclChannelDesc descs[1]{};
+    descs[0].remoteRank = 1;
+    std::unordered_map<uint32_t, uint32_t> failedRanks{{1, 0}};
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().will(returnValue(HCCL_E_RUNTIME));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(invoke(StubDcaCollectPeerInfo));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaLocalInfo).stubs().will(invoke(StubDcaCollectLocalInfo));
+    myRank->StartDcaDetectByFailedRanks(descs, 1, failedRanks, COMM_ENGINE_AICPU_TS);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 0u);
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_DcaStub_InitDeinit_Expect_CallCountsBalanced)
+{
+    // DCA 生命周期桩计数：Init/Deinit 成对到达
+    hcomm::DcaStubResetCounts();
+    hcomm::DetectConnectionAnomalies& dca = CollCommMgr::GetInstance().GetDetectConnectionAnomalies(0);
+    dca.Init();
+    dca.Init();
+    dca.Deinit();
+    dca.Deinit();
+    EXPECT_EQ(hcomm::DcaStubInitCallCount(), 2u);
+    EXPECT_EQ(hcomm::DcaStubDeinitCallCount(), 2u);
+}
+
+// ---------------------------------------------------------------------------
+// DCA 覆盖补齐：CollectEndpointDescs/CollectDcaLocalInfo/GetNetInstId/触发点
+// ---------------------------------------------------------------------------
+static HcclResult StubDcaGetDeviceType960(DevType& devType)
+{
+    devType = DevType::DEV_TYPE_960; // 设备门未通过（非 950）
+    return HCCL_SUCCESS;
+}
+
+static EndpointDesc MakeStubEndpointDesc(const char* ip, EndpointLocType locType, CommProtocol protocol)
+{
+    EndpointDesc desc{};
+    desc.protocol = protocol;
+    desc.loc.locType = locType;
+    (void)hcomm::IpAddressToCommAddr(Hccl::IpAddress(ip), desc.commAddr);
+    return desc;
+}
+
+static HcclResult StubDcaEndpointDescsDup(hccl::MyRank* /*self*/, std::vector<EndpointDesc>& descs)
+{
+    descs.clear();
+    EndpointDesc desc = MakeStubEndpointDesc("1.0.0.0", ENDPOINT_LOC_TYPE_DEVICE, COMM_PROTOCOL_ROCE);
+    descs.push_back(desc);
+    descs.push_back(desc); // 同 IP 第二条：验证按 IP 去重
+    return HCCL_SUCCESS;
+}
+
+static HcclResult StubDcaEndpointDescsInvalid(hccl::MyRank* /*self*/, std::vector<EndpointDesc>& descs)
+{
+    descs.clear();
+    // 非 HOST/DEVICE → 过滤
+    EndpointDesc invalidLoc = MakeStubEndpointDesc("1.0.0.0", static_cast<EndpointLocType>(0xFF), COMM_PROTOCOL_ROCE);
+    descs.push_back(invalidLoc);
+    // 地址解析失败（CommAddrToIpAddress mock 失败）→ 跳过
+    EndpointDesc badAddr = MakeStubEndpointDesc("2.0.0.0", ENDPOINT_LOC_TYPE_DEVICE, COMM_PROTOCOL_ROCE);
+    descs.push_back(badAddr);
+    return HCCL_SUCCESS;
+}
+
+// 端点查询 mock 缝隙：RankGraphV2 统一委托 Hccl::IRankGraph（pImpl），与 SetUp 既有 IRankGraph mock 一致。
+// 注意：不要直接 mock RankGraphV2 的虚函数入口（mockcpp JmpOnlyApiHook 会崩溃）
+static uint32_t g_dcaNetLayers[3] = {0, 1, 2};
+static uint32_t g_dcaTopoInsts[1] = {0};
+static HcclResult StubDcaGetNetLayers(Hccl::IRankGraph* /*self*/, uint32_t** netLayers, uint32_t* netLayerNum)
+{
+    *netLayers = g_dcaNetLayers;
+    *netLayerNum = 3;
+    return HCCL_SUCCESS;
+}
+static HcclResult
+StubDcaGetTopoInsts(Hccl::IRankGraph* /*self*/, uint32_t netLayer, uint32_t** topoInsts, uint32_t* topoInstNum)
+{
+    if (netLayer == 0) {
+        return HCCL_E_INTERNAL; // layer0 失败 → continue 到下一层
+    }
+    *topoInsts = g_dcaTopoInsts;
+    *topoInstNum = 1;
+    return HCCL_SUCCESS;
+}
+static HcclResult
+StubDcaGetEndpointNum(Hccl::IRankGraph* /*self*/, uint32_t netLayer, uint32_t /*topoInstId*/, uint32_t* num)
+{
+    *num = (netLayer == 2) ? 0u : 3u; // layer2 数量为 0 → continue
+    return HCCL_SUCCESS;
+}
+static HcclResult StubDcaGetEndpointDesc(
+    Hccl::IRankGraph* /*self*/, uint32_t /*netLayer*/, uint32_t /*topoInstId*/, uint32_t* descNum,
+    EndpointDesc* endpointDesc)
+{
+    if (endpointDesc != nullptr && *descNum > 0) {
+        endpointDesc[0] = MakeStubEndpointDesc("9.9.9.9", ENDPOINT_LOC_TYPE_DEVICE, COMM_PROTOCOL_ROCE);
+    }
+    *descNum = 1; // 回写实际填充条数：申请 3 → 1，触发 resize 截断
+    return HCCL_SUCCESS;
+}
+
+TEST_F(MyRankTest, Ut_CollectFailedRanks_When_ConnectingStatusThenInvalidArgs_Expect_CollectedThenGuarded)
+{
+    // 轮1：等待超时时仍处于 CONNECTING 的通道也计入失败对端
+    HcclChannelDesc descs[2]{};
+    descs[0].remoteRank = 1;
+    descs[1].remoteRank = 2;
+    int32_t statusList[2] = {hcomm::HCOMM_CHANNEL_STATUS_CONNECTING, hcomm::HCOMM_CHANNEL_STATUS_READY};
+    std::unordered_map<uint32_t, uint32_t> failedRanks;
+    myRank->CollectFailedRanks(descs, statusList, 2, failedRanks);
+    ASSERT_EQ(failedRanks.size(), 1u);
+    EXPECT_EQ(failedRanks[1], 0u);
+
+    // 轮2：空指针/0 数量守卫：不收集、不崩溃
+    failedRanks.clear();
+    myRank->CollectFailedRanks(nullptr, statusList, 2, failedRanks);
+    myRank->CollectFailedRanks(descs, nullptr, 2, failedRanks);
+    myRank->CollectFailedRanks(descs, statusList, 0, failedRanks);
+    EXPECT_TRUE(failedRanks.empty());
+}
+
+TEST_F(MyRankTest, Ut_CollectDcaPeerInfo_When_HostLocThenInvalidAddr_Expect_PhyIdThenSkip)
+{
+    MOCKER_CPP(&hccl::MyRank::GetNetInstId).stubs().will(invoke(StubDcaGetNetInstId));
+    HcclChannelDesc descs[1]{};
+    descs[0].remoteRank = 1;
+    CreateEndpointDesc(descs[0].localEndpoint, COMM_PROTOCOL_ROCE, "1.0.0.0");
+    CreateEndpointDesc(descs[0].remoteEndpoint, COMM_PROTOCOL_ROCE, "3.0.0.0");
+    std::unordered_map<uint32_t, uint32_t> failedRanks{{1, 0}};
+
+    // 轮1：host locType 走 rankGraph_->GetDeviceId 取对端 phyId
+    descs[0].remoteEndpoint.loc.locType = ENDPOINT_LOC_TYPE_HOST;
+    descs[0].remoteEndpoint.loc.device.devPhyId = 7; // 哨兵：host 路径不得读该值
+    MOCKER_CPP(&hccl::MyRank::GetDcaPort).stubs().will(returnValue(16666u));
+    std::vector<hcomm::DcaPeerInfo> peers;
+    EXPECT_EQ(myRank->CollectDcaPeerInfo(descs, failedRanks, peers, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
+    ASSERT_EQ(peers.size(), 1u);
+    EXPECT_EQ(peers[0].remoteDevPhyId, 0u); // 走 GetDeviceId，未读写回 → 0（而非 desc 的 7）
+    GlobalMockObject::verify();
+
+    // 轮2：对端地址解析失败 → 跳过该 peer
+    std::vector<hcomm::DcaPeerInfo> peers2;
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_E_PARA));
+    EXPECT_EQ(myRank->CollectDcaPeerInfo(descs, failedRanks, peers2, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
+    EXPECT_TRUE(peers2.empty());
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_StartDcaDetectByFailedRanks_When_GuardsNotPass_Expect_SkipDetect)
+{
+    hcomm::DcaStubResetCounts();
+    HcclChannelDesc descs[1]{};
+    descs[0].remoteRank = 1;
+    std::unordered_map<uint32_t, uint32_t> failedRanks{{1, 0}};
+
+    // 轮1：参数非法（descs 空 / channelNum 0）
+    myRank->StartDcaDetectByFailedRanks(nullptr, 1, failedRanks, COMM_ENGINE_AICPU_TS);
+    myRank->StartDcaDetectByFailedRanks(descs, 0, failedRanks, COMM_ENGINE_AICPU_TS);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 0u);
+
+    // 轮2：failedRanks 为空
+    std::unordered_map<uint32_t, uint32_t> emptyRanks;
+    myRank->StartDcaDetectByFailedRanks(descs, 1, emptyRanks, COMM_ENGINE_AICPU_TS);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 0u);
+
+    // 轮3：设备门未通过（非 950）。
+    // 先 verify 清掉 SetUp 注册的默认 hrtGetDeviceType 桩，再挂本轮的 960 桩（同函数后注册 MOCKER 不覆盖先注册）
+    GlobalMockObject::verify();
+    MOCKER(hrtGetDeviceType).stubs().will(invoke(StubDcaGetDeviceType960));
+    myRank->StartDcaDetectByFailedRanks(descs, 1, failedRanks, COMM_ENGINE_AICPU_TS);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 0u);
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_StartDcaDetectByFailedRanks_When_CollectInfoNotUsable_Expect_SkipDetect)
+{
+    HcclChannelDesc descs[1]{};
+    descs[0].remoteRank = 1;
+    std::unordered_map<uint32_t, uint32_t> failedRanks{{1, 0}};
+
+    // 轮1：CollectDcaPeerInfo 返回空 peers → 跳过
+    hcomm::DcaStubResetCounts();
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(returnValue(HCCL_SUCCESS));
+    myRank->StartDcaDetectByFailedRanks(descs, 1, failedRanks, COMM_ENGINE_AICPU_TS);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 0u);
+    GlobalMockObject::verify();
+
+    // 轮2：CollectDcaLocalInfo 失败 → 跳过
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(invoke(StubDcaCollectPeerInfo));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaLocalInfo).stubs().will(returnValue(HCCL_E_INTERNAL));
+    myRank->StartDcaDetectByFailedRanks(descs, 1, failedRanks, COMM_ENGINE_AICPU_TS);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 0u);
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_GetNetInstId_When_RankGraphNullThenNotV2_Expect_ErrorCodes)
+{
+    auto* savedRankGraph = myRank->rankGraph_;
+    std::string netInstId;
+
+    // 轮1：rankGraph_ 为空 → E_PTR
+    myRank->rankGraph_ = nullptr;
+    EXPECT_EQ(myRank->GetNetInstId(1, netInstId), HCCL_E_PTR);
+
+    // 轮2：非 RankGraphV2 实例 → E_NOT_SUPPORT
+    hccl::RankGraphV1 nonV2Graph;
+    myRank->rankGraph_ = &nonV2Graph;
+    EXPECT_EQ(myRank->GetNetInstId(1, netInstId), HCCL_E_NOT_SUPPORT);
+    EXPECT_TRUE(netInstId.empty());
+    myRank->rankGraph_ = savedRankGraph;
+}
+
+TEST_F(MyRankTest, Ut_RankGraphV2_GetNetInstId_When_NullThenNormal_Expect_NotFoundThenNetInstId)
+{
+    auto* v2 = dynamic_cast<RankGraphV2*>(rankGraph.get());
+    ASSERT_NE(v2, nullptr);
+    std::string netInstId;
+
+    // 轮1：netLayer0 无 netInstance → E_NOT_FOUND
+    MOCKER_CPP(
+        &Hccl::RankGraph::GetNetInstanceByRankId,
+        const Hccl::NetInstance* (Hccl::RankGraph::*)(u32, Hccl::RankId) const)
+        .stubs()
+        .will(returnValue(static_cast<const Hccl::NetInstance*>(nullptr)));
+    EXPECT_EQ(v2->GetNetInstId(0, netInstId), HCCL_E_NOT_FOUND);
+    EXPECT_TRUE(netInstId.empty());
+    GlobalMockObject::verify();
+
+    // 轮2：正常返回 netLayer0 的 netInstId
+    Hccl::NetInstance* fakeInstance = reinterpret_cast<Hccl::NetInstance*>(0x1);
+    MOCKER_CPP(
+        &Hccl::RankGraph::GetNetInstanceByRankId,
+        const Hccl::NetInstance* (Hccl::RankGraph::*)(u32, Hccl::RankId) const)
+        .stubs()
+        .will(returnValue(static_cast<const Hccl::NetInstance*>(fakeInstance)));
+    MOCKER_CPP(&Hccl::NetInstance::GetNetInstId).stubs().will(returnValue(std::string("S1")));
+    EXPECT_EQ(v2->GetNetInstId(0, netInstId), HCCL_SUCCESS);
+    EXPECT_EQ(netInstId, "S1");
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_CollectEndpointDescs_When_EarlyReturn_Expect_ErrorMapping)
+{
+    auto* savedRankGraph = myRank->rankGraph_;
+    std::vector<EndpointDesc> descs;
+
+    // 轮1：非 RankGraphV2 → E_NOT_SUPPORT
+    hccl::RankGraphV1 nonV2Graph;
+    myRank->rankGraph_ = &nonV2Graph;
+    EXPECT_EQ(myRank->CollectEndpointDescs(descs), HCCL_E_NOT_SUPPORT);
+    EXPECT_TRUE(descs.empty());
+
+    // 轮2：GetNetLayers 失败 → E_NOT_FOUND（mock pImpl 委托层 IRankGraph）
+    myRank->rankGraph_ = savedRankGraph;
+    MOCKER_CPP(&Hccl::IRankGraph::GetNetLayers).stubs().will(returnValue(HCCL_E_INTERNAL));
+    EXPECT_EQ(myRank->CollectEndpointDescs(descs), HCCL_E_NOT_FOUND);
+    myRank->rankGraph_ = savedRankGraph;
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_CollectEndpointDescs_When_LayerFailsAndDescTruncated_Expect_SkipAndResize)
+{
+    // 三层遍历：layer0 topoInst 失败跳过、layer1 正常、layer2 端点数为 0 跳过；
+    // 且 GetEndpointDesc 回写更小 descNum 时按实际条数截断（mock pImpl 委托层 IRankGraph）
+    MOCKER_CPP(&Hccl::IRankGraph::GetNetLayers).stubs().will(invoke(StubDcaGetNetLayers));
+    MOCKER_CPP(&Hccl::IRankGraph::GetTopoInstsByLayer).stubs().will(invoke(StubDcaGetTopoInsts));
+    MOCKER_CPP(&Hccl::IRankGraph::GetEndpointNum).stubs().will(invoke(StubDcaGetEndpointNum));
+    MOCKER_CPP(&Hccl::IRankGraph::GetEndpointDesc).stubs().will(invoke(StubDcaGetEndpointDesc));
+
+    std::vector<EndpointDesc> descs;
+    EXPECT_EQ(myRank->CollectEndpointDescs(descs), HCCL_SUCCESS);
+    ASSERT_EQ(descs.size(), 1u); // 3 → 1 截断，且只来自 layer1
+    Hccl::IpAddress ip;
+    EXPECT_EQ(hcomm::CommAddrToIpAddress(descs[0].commAddr, ip), HCCL_SUCCESS);
+    EXPECT_EQ(ip.GetIpStr(), "9.9.9.9");
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_CollectDcaLocalInfo_When_DedupThenInvalidSkip_Expect_SingleThenEmpty)
+{
+    // 轮1：同 IP 的多个 endpoint 只保留一条，端口经 GetDcaPort 获取
+    MOCKER_CPP(&hccl::MyRank::CollectEndpointDescs).stubs().will(invoke(StubDcaEndpointDescsDup));
+    MOCKER_CPP(&hccl::MyRank::GetDcaPort).stubs().will(returnValue(16666u));
+    std::vector<hcomm::LocalIpInfo> localIps;
+    EXPECT_EQ(myRank->CollectDcaLocalInfo(localIps, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
+    ASSERT_EQ(localIps.size(), 1u);
+    EXPECT_EQ(localIps[0].ip.GetIpStr(), "1.0.0.0");
+    EXPECT_EQ(localIps[0].port, 16666u);
+    GlobalMockObject::verify();
+
+    // 轮2：非法 locType 与地址解析失败均跳过 → 空结果
+    MOCKER_CPP(&hccl::MyRank::CollectEndpointDescs).stubs().will(invoke(StubDcaEndpointDescsInvalid));
+    MOCKER(hcomm::CommAddrToIpAddress).stubs().will(returnValue(HCCL_E_PARA));
+    std::vector<hcomm::LocalIpInfo> localIps2;
+    EXPECT_EQ(myRank->CollectDcaLocalInfo(localIps2, COMM_ENGINE_AICPU_TS), HCCL_SUCCESS);
+    EXPECT_TRUE(localIps2.empty());
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_WaitForChannelsReady_When_TimeoutAndStatusFail_Expect_DcaDetectTriggered)
+{
+    // 两个触发调用点各占一轮：等待超时 / 状态异常返回
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(invoke(StubDcaCollectPeerInfo));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaLocalInfo).stubs().will(invoke(StubDcaCollectLocalInfo));
+    MOCKER_CPP(&hccl::MyRank::GetNetInstId).stubs().will(invoke(StubDcaGetNetInstId));
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().will(returnValue(HCCL_SUCCESS));
+
+    HcclChannelDesc channelDesc[1]{};
+    channelDesc[0].remoteRank = 1;
+    ChannelHandle hostChannelHandleList[1] = {0};
+
+    // 轮1：HcommChannelGetStatus 持续 E_AGAIN + LinkTimeOut=1s → 等待超时调用点
+    hcomm::DcaStubResetCounts();
+    MOCKER(HcommChannelGetStatus).stubs().will(returnValue(static_cast<HcommResult>(HCCL_E_AGAIN)));
+    MOCKER_CPP(&Hccl::EnvSocketConfig::GetLinkTimeOut).stubs().with(mockcpp::any()).will(returnValue((s32)(1)));
+    EXPECT_EQ(
+        myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 1, COMM_ENGINE_AICPU_TS), HCCL_E_TIMEOUT);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 1u);
+
+    // 轮2：HcommChannelGetStatus 直接失败 → 状态异常返回调用点
+    hcomm::DcaStubResetCounts();
+    MOCKER(HcommChannelGetStatus).reset();
+    MOCKER(HcommChannelGetStatus).stubs().will(returnValue(static_cast<HcommResult>(HCCL_E_TIMEOUT)));
+    EXPECT_EQ(
+        myRank->WaitForChannelsReady(channelDesc, hostChannelHandleList, 1, COMM_ENGINE_AICPU_TS), HCCL_E_TIMEOUT);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 1u);
+    GlobalMockObject::verify();
+}
+
+TEST_F(MyRankTest, Ut_CreateChannels_When_ExchangeReturnsTcpConnect_Expect_DcaDetectTriggered)
+{
+    // 一致性校验返回 E_TCP_CONNECT 时触发 DCA。
+    MockerFuncs();
+    MOCKER_CPP(&hccl::MyRank::BatchCreateSockets).stubs().with(mockcpp::any()).will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::MyRank::BatchCreateChannels).stubs().with(mockcpp::any()).will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::EndpointMgr::Get).stubs().will(invoke(GetEndpointStub));
+    MOCKER_CPP(&hcomm::ChannelProcess::ChannelGetDesc).stubs().will(invoke(GetBrokenSocketChannelDescStub));
+    MOCKER_CPP(&Hccl::Socket::GetSocketStatus)
+        .stubs()
+        .will(returnValue(Hccl::SocketStatus(Hccl::SocketStatus::TIMEOUT)));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaPeerInfo).stubs().will(invoke(StubDcaCollectPeerInfo));
+    MOCKER_CPP(&hccl::MyRank::CollectDcaLocalInfo).stubs().will(invoke(StubDcaCollectLocalInfo));
+    MOCKER_CPP(&hccl::MyRank::GetNetInstId).stubs().will(invoke(StubDcaGetNetInstId));
+
+    MOCKER(hrtGetDeviceType).stubs().with(outBound(DevType::DEV_TYPE_950)).will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::MyRank::NeedCheckConsistency).stubs().with(outBound(true)).will(returnValue(HCCL_SUCCESS));
+    MOCKER_CPP(&hccl::ExchangeInfoMgr::BatchExchangeAndCheckConsistency)
+        .stubs()
+        .with(mockcpp::any())
+        .will(returnValue(HCCL_E_TCP_CONNECT));
+    MOCKER(hrtGetDevicePhyIdByIndex).stubs().will(returnValue(HCCL_SUCCESS));
+
+    HcclMem cclBuffer;
+    CreateCclBuffer(cclBuffer);
+    EXPECT_EQ(myRank->Init(cclBuffer, 2, 2), HCCL_SUCCESS);
+
+    EndpointDesc localEp;
+    CreateEndpointDesc(localEp, COMM_PROTOCOL_UB_CTP, "1.0.0.0");
+    EndpointDesc rmtEp;
+    CreateEndpointDesc(rmtEp, COMM_PROTOCOL_UB_CTP, "2.0.0.0");
+
+    HcclChannelDesc channelDesc[1]{};
+    channelDesc[0].channelProtocol = COMM_PROTOCOL_UB_CTP;
+    channelDesc[0].remoteRank = 1;
+    channelDesc[0].notifyNum = 2;
+    channelDesc[0].localEndpoint = localEp;
+    channelDesc[0].remoteEndpoint = rmtEp;
+    channelDesc[0].ubMemAttr.pathMode = 0;
+
+    hcomm::DcaStubResetCounts();
+    ChannelHandle channelHandles[1];
+    HcclResult ret = myRank->CreateChannels(COMM_ENGINE_AICPU_TS, "test", channelDesc, 1, channelHandles);
+    EXPECT_EQ(ret, HCCL_E_TCP_CONNECT);
+    EXPECT_EQ(hcomm::DcaStubAddIpQueueCallCount(), 1u);
+    GlobalMockObject::verify();
 }

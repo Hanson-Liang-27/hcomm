@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
 #include "local_ipc_rma_buffer_v2.h"
 
 #include "rma_buffer.h"
@@ -52,7 +52,8 @@ string LocalIpcRmaBuffer::Describe() const
 std::unique_ptr<Serializable> LocalIpcRmaBuffer::GetExchangeDto()
 {
     std::unique_ptr<ExchangeIpcBufferDto> dto = make_unique<ExchangeIpcBufferDto>(
-        buf->GetAddr(), buf->GetSize(), ipcOffset, HrtDeviceGetBareTgid(), buf->GetMemInfo().c_str());
+        buf->GetAddr(), buf->GetSize(), ipcOffset, HrtDeviceGetBareTgid(), buf->GetMemInfo().c_str(),
+        buf->GetMemType());
     (void)memcpy_s(dto->name, RTS_IPC_MEM_NAME_LEN, name, RTS_IPC_MEM_NAME_LEN);
     return std::unique_ptr<Serializable>(dto.release());
 }

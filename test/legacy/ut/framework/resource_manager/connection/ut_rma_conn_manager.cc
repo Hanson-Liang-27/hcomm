@@ -33,6 +33,7 @@
 #include "ccu_context_mgr_imp.h"
 #include "ccu_res_batch_allocator_legacy.h"
 #include "ccu_component.h"
+#include "dev_ub_connection.h"
 
 #undef private
 
@@ -124,14 +125,14 @@ TEST_F(
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -227,10 +228,10 @@ TEST_F(RmaConnManagerTest, should_return_normally_when_calling_addwhitelist_with
     MOCKER(HrtMemcpy).stubs().with(mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any(), mockcpp::any());
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
 
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER(HrtSetDevice).stubs().with(mockcpp::any()).will(ignoreReturnValue());
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
@@ -281,14 +282,14 @@ TEST_F(RmaConnManagerTest, should_return_valid_ptr_when_calling_creatermadevnetc
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
 
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -344,6 +345,19 @@ TEST_F(RmaConnManagerTest, should_return_valid_ptr_when_calling_creatermadevnetc
     delete socket;
 }
 
+TEST_F(RmaConnManagerTest, Ut_Describe_Expect_UbStageIncluded)
+{
+    RdmaHandle rdmaHandle = (void*)0x1000000;
+    RdmaHandleManager::GetInstance().tokenInfoMap[rdmaHandle] = make_unique<TokenInfoManager>(0, rdmaHandle);
+    BasePortType portType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
+    LinkData linkData(portType, 0, 1, 0, 1);
+    DevUbConnection conn(rdmaHandle, linkData.GetLocalAddr(), linkData.GetRemoteAddr(), OpMode::OPBASE);
+
+    const std::string desc = conn.Describe();
+    EXPECT_TRUE(desc.find("DevUbConnection[") != std::string::npos);
+    EXPECT_TRUE(desc.find("ubStage=UbConnStatus::INIT") != std::string::npos);
+}
+
 TEST_F(RmaConnManagerTest, should_return_valid_ptr_when_calling_createdevubconn_with_valid_param)
 {
     BasePortType basePortType(PortDeploymentType::DEV_NET, ConnectProtoType::UB);
@@ -374,14 +388,14 @@ TEST_F(RmaConnManagerTest, should_return_valid_ptr_when_calling_createdevubconn_
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
 
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -575,14 +589,14 @@ TEST_F(RmaConnManagerTest, should_delete_all_when_calling_batchdeletejettys_with
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -667,14 +681,14 @@ TEST_F(RmaConnManagerTest, should_delete_all_when_calling_batchdeletejettys_with
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -768,14 +782,14 @@ TEST_F(RmaConnManagerTest, should_delete_part_when_calling_batchdeletejettys_wit
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -865,14 +879,14 @@ TEST_F(RmaConnManagerTest, should_failed_when_calling_batchdeletejettys_with_inv
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -963,14 +977,14 @@ TEST_F(RmaConnManagerTest, should_failed_when_calling_batchdeletejettys_with_inv
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());
@@ -1061,14 +1075,14 @@ TEST_F(RmaConnManagerTest, should_failed_when_calling_batchdeletejettys_with_inv
     impl.rankGraph = make_unique<RankGraph>(0);
     impl.rankGraph->peers_[0] = make_shared<NetInstance::Peer>(0, 0, 0, 0);
     MOCKER_CPP(&CommunicatorImpl::InitCollService).stubs().will(returnValue(HcclResult::HCCL_SUCCESS));
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const std::string&))
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const std::string&))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
-    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, void(CommunicatorImpl::*)(const string& rankTablePath))
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
+    MOCKER_CPP(&CommunicatorImpl::InitRankGraph, HcclResult(CommunicatorImpl::*)(const string& rankTablePath))
         .stubs()
         .with(mockcpp::any())
-        .will(ignoreReturnValue());
+        .will(returnValue(HcclResult::HCCL_SUCCESS));
     MOCKER_CPP(&CcuComponent::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CcuResBatchAllocator::Init).stubs().will(ignoreReturnValue());
     MOCKER_CPP(&CtxMgrImp::Init).stubs().will(ignoreReturnValue());

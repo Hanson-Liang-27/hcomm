@@ -305,9 +305,10 @@ u32 AicpuHcclProcess::AicpuRpcClearOpRes(const struct HcclKfcClearOpResTilingDat
             HCCL_KFC_CLEAR_OP_RES_MAGIC, tilingData->magic);
         return HCCL_E_PARA;
     }
-    if (tilingData->tagCount == 0 || tilingData->tagCount > HCCL_KFC_CLEAR_OP_RES_MAX_BATCH) {
+    // 注意: tagCount允许为0 —— 非零拷贝capture图不登记tag, 但其capture期产生的op-unfold cache entry仍需清理
+    if (tilingData->tagCount > HCCL_KFC_CLEAR_OP_RES_MAX_BATCH) {
         HCCL_ERROR(
-            "[AicpuRpcClearOpRes] invalid tagCount[%u], must be in [1, %u]", tilingData->tagCount,
+            "[AicpuRpcClearOpRes] invalid tagCount[%u], must be in [0, %u]", tilingData->tagCount,
             HCCL_KFC_CLEAR_OP_RES_MAX_BATCH);
         return HCCL_E_PARA;
     }
@@ -346,6 +347,14 @@ u32 AicpuHcclProcess::AicpuRpcClearOpRes(const struct HcclKfcClearOpResTilingDat
             lastErr = ret;
             // 单 tag 失败不影响后续 tag, 尽量清干净
         }
+    }
+    // aclgraph图销毁时, 清理该图capture期(aclgraph图构建)产生的op-unfold cache entry (按modelId精确匹配)
+    // 注意: 无论本批tagCount是否为0, capture cache entry都需要清理 (非零拷贝capture图不登记tag)
+    HcclResult captureRet = commAicpu->ClearCaptureOpUnfoldCache(tilingData->modelId);
+    if (captureRet != HCCL_SUCCESS) {
+        HCCL_ERROR(
+            "[AicpuRpcClearOpRes] ClearCaptureOpUnfoldCache fail, group[%s] ret[%d]", groupStr.c_str(), captureRet);
+        lastErr = (lastErr == HCCL_SUCCESS) ? captureRet : lastErr;
     }
     AicpuHcclProcess::AicpuReleaseCommbyGroup(groupStr);
     HCCL_INFO(
@@ -429,6 +438,7 @@ HcclResult AicpuHcclProcess::AicpuRunRpcServerV2(
     opParam.supportSymmetricMemory = tilingData->isSymmetricMemory;
     opParam.index = tilingData->index;
     opParam.isCapture = tilingData->isCapture;
+    opParam.captureModelId = tilingData->captureModelId;
     opParam.needIncreLink = tilingData->needIncreLink;
     opParam.aicpuCacheEnable = tilingData->aicpuCacheEnable;
     opParam.aicpuUnfoldMode = tilingData->aicpuUnfoldMode;
@@ -680,39 +690,6 @@ HcclResult AicpuHcclProcess::AicpuIndOpChannelInit(HcclIndOpChannelRemoteResV3* 
             "[AicpuHcclProcess][AicpuIndOpChannelInit]errNo[0x%016llx] Failed to init channels group[%s]",
             HCCL_ERROR_CODE(ret), group.c_str()),
         ret);
-    AicpuReleaseCommbyGroup(group);
-    return HCCL_SUCCESS;
-}
-
-HcclResult AicpuHcclProcess::AicpuIndOpNotifyInit(NotifyMgrAicpuParam* param)
-{
-    CHK_PTR_NULL(param);
-    std::string group = param->hcomId;
-    hccl::HcclCommAicpu* hcclCommAicpu = AicpuHcclProcess::AicpuGetCommbyGroup(group);
-    CHK_PRT_RET(!hcclCommAicpu, HCCL_ERROR("%s hcclCommAicpu is null, group[%s]", __func__, group.c_str()), HCCL_E_PTR);
-
-    HcclResult ret = HCCL_E_INTERNAL;
-    if (param->freeFlag) {
-        ret = hcclCommAicpu->NotifyFree(param);
-        CHK_PRT_RET(
-            ret != HCCL_SUCCESS,
-            HCCL_ERROR(
-                "[AicpuHcclProcess][%s]errNo[0x%016llx] Failed to free notify group[%s]", __func__,
-                HCCL_ERROR_CODE(ret), group.c_str()),
-            ret);
-    } else {
-        ret = hcclCommAicpu->NotifyAlloc(param);
-        CHK_PRT_RET(
-            ret != HCCL_SUCCESS,
-            HCCL_ERROR(
-                "[AicpuHcclProcess][%s]errNo[0x%016llx] Failed to alloc notify group[%s]", __func__,
-                HCCL_ERROR_CODE(ret), group.c_str()),
-            ret);
-    }
-
-    HCCL_INFO(
-        "[AicpuHcclProcess][%s] comm identifier[%s], notify op[%u] success, num[%u]", __func__, group.c_str(),
-        param->freeFlag, param->notifyNum);
     AicpuReleaseCommbyGroup(group);
     return HCCL_SUCCESS;
 }

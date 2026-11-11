@@ -12,16 +12,14 @@
 #define COLL_COMM_AICPU_KERNEL_ADPT_H
 
 #include "common.h"
-#include "aicpu_launch_manager.h"
-#include "channel_param.h"
+#include "comm_engine/aicpu_launch_manager_pub.h"
+#include "endpoint_pair/channel/channel_param_pub.h"
 #include "aicpu_init_param.h"
 
 // kernel 入口 C++ 适配层 — 供 kernel 入口调用，封装 Acquire→操作→Release 流程。extern "C" 接口见
 // coll_comm_aicpu_kernel.h。 内部委托到 CollCommAicpuMgr 单例，完成 Acquire → 操作 → Release 流程。
 
 HcclResult CollCommAicpuKernelAdptInitThreads(ThreadMgrAicpuParam* param);
-HcclResult CollCommAicpuKernelAdptInitChannel(HcclChannelUrmaRes* commParam);
 HcclResult CollCommAicpuKernelAdptUpdateChannel(HcclChannelUrmaRes* commParam);
-HcclResult CollCommAicpuKernelAdptInitNotify(NotifyMgrAicpuParam* param);
 
 #endif // COLL_COMM_AICPU_KERNEL_ADPT_H

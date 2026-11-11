@@ -65,7 +65,7 @@ typedef struct {
         } ub;
         uint8_t raws[24];
     } memInfo;
-} ProtectionInfo; // 32B
+} ProtectionInfo;
 
 typedef struct {
     RegedBufferType type;
@@ -90,7 +90,7 @@ typedef struct {
             uint64_t addr;
             uint32_t size;
             int32_t notifyId;
-        } ipcRt;
+        } ipcRt; // Thread 之间 Notify 填 ipcRt.notifyId。
         struct {
             uint64_t addr;
             uint32_t size;
@@ -123,6 +123,10 @@ typedef struct {
             uint32_t sqDepth;
             uint32_t tpID;
             uint8_t remoteEID[16];
+            uint32_t sqHead;
+            uint32_t sqTail;
+            uint32_t maxReadSize;
+            uint32_t maxWriteSize;
         } ubJfs;
         struct {
             uint64_t sqVa;
@@ -135,9 +139,13 @@ typedef struct {
             uint32_t depth;
             uint8_t sl;
             uint64_t dbVendorSpecified;
+            uint32_t sqHead;
+            uint32_t sqTail;
         } roceSq;
-        uint8_t raws[120];
+        uint8_t raws[112];
     } contextInfo;
+    uint8_t fence;
+    uint8_t reserve[3];
 } SqContext;
 
 typedef struct {
@@ -151,6 +159,8 @@ typedef struct {
             uint32_t jfcID;
             uint32_t cqeSize;
             uint32_t cqDepth;
+            uint32_t cqHead;
+            uint32_t cqTail;
         } ubJfc;
         struct {
             uint64_t cqVa;
@@ -162,10 +172,21 @@ typedef struct {
             uint32_t cqeSize;
             uint32_t cqDepth;
             uint64_t dbVendorSpecified;
+            uint32_t cqHead;
+            uint32_t cqTail;
+            uint8_t cqDbFlush;
         } roceCq;
         uint8_t raws[120];
     } contextInfo;
 } CqContext;
+
+typedef struct {
+    uint32_t chipVersion; // 预留芯片版本字段，当前默认0。
+    uint32_t devPhyId;    // Host 侧 NPU 物理设备 ID；Device 侧可转换为本地设备 ID。
+    uint8_t dieId;
+    uint8_t funcId;
+    uint8_t reserve[30];
+} HcommDevInfo; // 40B
 
 typedef struct {
     CommAbiHeader abiHeader;
@@ -183,11 +204,59 @@ typedef struct {
     RegedBufferEntity* remoteBufferAddr;
     SqContext* sqContextAddr;
     CqContext* cqContextAddr;
-    uint8_t reserve[160];
+    HcommDevInfo devInfo;
+    ChannelHandle compatChannelHandle;
+    uint8_t reserve[112];
 } ChannelEntity; // 256B
+
+typedef enum {
+    HCOMM_THREAD_SQ_CONTEXT_TYPE_INVALID = -1,
+    HCOMM_THREAD_SQ_CONTEXT_TYPE_RTSQ = 0
+} HcommThreadSqContextType;
+
+typedef struct {
+    HcommThreadSqContextType type;
+    union {
+        struct {
+            uint32_t streamId;
+            uint32_t sqId;
+            uint64_t sqBaseAddr;
+            uint32_t sqDepth;
+            uint32_t sqHead;
+            uint32_t sqTail;
+            uint32_t taskId;
+            uint32_t taskIdEnd;
+            uint64_t localSqAddr;
+            uint32_t localSqDepth;
+            uint32_t pendingSqeCnt;
+        } rtsqContext;
+        uint8_t raws[120];
+    } contextInfo;
+} HcommThreadSqContext; // 128B
+
+typedef struct {
+    CommAbiHeader abiHeader;
+    CommEngine engine;
+    ThreadType threadType;
+    HcommDevInfo devInfo;
+    uint32_t localNotifyNum;
+    RegedNotifyEntity* localNotifyAddr; // 本地 Notify 实体首段地址；localNotifyNum 为 0 时可为空。每段含 127 个
+                                        // Notify 槽和 1 个链接槽，链接槽首 8 字节为下一段地址，0 表示末段
+    HcommThreadSqContext* sqContextAddr;
+    ThreadHandle compatThreadHandle; // Device 侧 AICPU Thread 对象地址，仅供 hcomm 内部兼容解包，跨仓消费者不得解引用
+    uint8_t reserve[160]; // 预留字段，当前必须清零
+} HcommThreadEntity;      // 256B
+
+// AICPU数据面跨SO资源ABI。ChannelEntity/HcommThreadEntity同时作为hcomm内部实体和
+// asc-comm按句柄直取的公开POD契约，必须保持跨仓二进制布局一致。
+#define HCOMM_CHANNEL_ENTITY_VERSION 0U
+#define HCOMM_CHANNEL_ENTITY_MAGIC_WORD 0x0fcf0f5fU
+#define HCOMM_THREAD_ENTITY_VERSION 0U
+#define HCOMM_THREAD_ENTITY_MAGIC_WORD 0x0fcf0f6fU
 
 #ifdef __cplusplus
 }
+
 #endif
 
 #endif // HCOMM_RES_ENTITY_DEFS_H

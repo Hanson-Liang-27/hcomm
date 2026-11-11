@@ -29,7 +29,10 @@ using namespace CcuRep;
 
 class CcuKernelMgr {
 public:
-    static CcuKernelMgr& GetInstance(const s32 userDevId);
+    explicit CcuKernelMgr() = default;
+    ~CcuKernelMgr();
+    // userDevId_ 唯一写入口：由 owner（CcuDrvHandle::Init / CcuInstance::Init）在生命周期起点设定，窄访问器不回写
+    void SetUserDevId(int32_t userDevId) { userDevId_ = userDevId; }
 
     HcclResult Init();
     HcclResult Deinit();
@@ -37,6 +40,11 @@ public:
     CcuResult Register(
         CcuResPack& resPack, const uint32_t dieId, const char* kernelFuncName, const void* kernelFunc,
         const void** kernelArgs, const uint32_t argNum, CcuInstance* ccuIns, CcuKernelHandle& kernelHandle);
+
+    // 级联计数器块解析回调：由上层（API 适配层）注入，避免 kernel 管理模块反向依赖实例管理模块。
+    // userDevId 作为入参传入，同一解析逻辑可服务所有设备实例；重复注入幂等，仅首次生效。
+    using CascCntResolver = CcuResult (*)(int32_t userDevId, HcommCcuCascCntHandle handle, CntXnBlock& cascCntBlock);
+    static void SetCascCntResolver(CascCntResolver resolver);
 
     CcuResult GetKernelResourceRequest(
         const uint32_t dieId, const char* kernelFuncName, const void* kernelFunc, const void** kernelArgs,
@@ -52,9 +60,6 @@ public:
     CcuKernel* GetCurrentKernel();
 
 private:
-    explicit CcuKernelMgr() = default;
-    ~CcuKernelMgr();
-
     CcuKernelMgr(const CcuKernelMgr& that) = delete;
     CcuKernelMgr& operator=(const CcuKernelMgr& that) = delete;
 
@@ -88,6 +93,8 @@ private:
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::shared_ptr<CcuRep::CcuRepTranslator>>> translators;
     std::unordered_map<uint16_t, std::unordered_map<uint16_t, std::shared_ptr<CcuRep::CcuRepReferenceManager>>>
         referenceMgrs;
+    // 跨kernel调用的 func Addr 共享传参，每个die一份，与referenceMgrs同期分配与绑定
+    std::unordered_map<uint16_t, CcuFuncAddr> funcAddrs_;
     CcuTranslatResPack translatorResPack{};
     std::unique_ptr<CcuKernel> currKernel_{nullptr};
     std::shared_ptr<CcuInsGeneratorBase> insGenePtr;

@@ -165,23 +165,6 @@ RmaConnection* RmaConnManager::Get(const std::string& tag, const LinkData& linkD
     return nullptr;
 }
 
-std::vector<RmaConnection*> RmaConnManager::GetOpTagConns(const std::string& tag) const
-{
-    std::vector<RmaConnection*> rmaConnList;
-    auto opTagIter = rmaConnectionMap.find(tag);
-    if (opTagIter != rmaConnectionMap.end()) {
-        for (auto& linkDataConn : opTagIter->second) {
-            rmaConnList.emplace_back(linkDataConn.second.get());
-        }
-        return rmaConnList;
-    }
-    HCCL_WARNING(
-        "WARNING: RmaConnection not existed, "
-        "errNo[0x%016llx], localRank[%d], tag[%s]",
-        HCCL_ERROR_CODE(HcclResult::HCCL_E_PTR), comm->GetMyRank(), tag.c_str());
-    return rmaConnList;
-}
-
 void RmaConnManager::Release(const std::string& tag, const LinkData& linkData)
 {
     auto tagIter = rmaConnectionMap.find(tag);
@@ -443,7 +426,7 @@ void RmaConnManager::SendExchangeData(Socket* socket, const LinkData& linkData)
 void RmaConnManager::RecvExchangeData(Socket* socket, const LinkData& linkData)
 {
     recvData.resize(exchangeDataSize);
-    socket->RecvAsync(reinterpret_cast<u8*>(recvData.data()), recvData.size());
+    socket->RecvAsync(recvData.data(), recvData.size());
 
     HCCL_INFO("recv data %s, size=%llu", linkData.Describe().c_str(), recvData.size());
 }

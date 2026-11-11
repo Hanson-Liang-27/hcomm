@@ -88,16 +88,16 @@ STATIC int RsPingCbGetUrmaContextAndIndex(struct RsPingCtxCb *pingCb, struct Pin
     int ret;
 
     pingCb->udevCb.urmaCtx = RsUrmaCreateContext(pingCb->udevCb.urmaDev, attr->dev.ub.eidIndex);
+    RS_URMA_PTR_TO_ERRNO(pingCb->udevCb.urmaCtx, ret);
     CHK_PRT_RETURN(pingCb->udevCb.urmaCtx == NULL,
         hccp_err("urma_create_context failed, errno:%d, "
                  "eidIndex:%u",
             errno, attr->dev.ub.eidIndex),
-        -ENODEV);
+        ret);
 
     ret = RsUbGetUeInfo(pingCb->udevCb.urmaCtx, &devAttr);
     if (ret != 0) {
         hccp_err("rs_ub_get_ue_info failed, ret:%d errno:%d", ret, errno);
-        ret = -EOPENSRC;
         goto free_urma_ctx;
     }
 
@@ -112,8 +112,10 @@ free_urma_ctx:
 
 STATIC int RsPingCommonInitJfce(struct RsPingCtxCb *pingCb, struct RsPingLocalJettyCb *jettyCb)
 {
+    int ret = 0;
     jettyCb->jfce = RsUrmaCreateJfce(pingCb->udevCb.urmaCtx);
-    CHK_PRT_RETURN(jettyCb->jfce == NULL, hccp_err("urma_create_jfce failed, errno:%d", errno), -EOPENSRC);
+    RS_URMA_PTR_TO_ERRNO(jettyCb->jfce, ret);
+    CHK_PRT_RETURN(jettyCb->jfce == NULL, hccp_err("urma_create_jfce failed, errno:%d, ret:%d", errno, ret), ret);
 
     hccp_run_info("eid:%016llx:%016llx init jfce success, fd:%d", pingCb->udevCb.eidInfo.eid.in6.subnetPrefix,
         pingCb->udevCb.eidInfo.eid.in6.interfaceId, jettyCb->jfce->fd);
@@ -124,6 +126,7 @@ STATIC int RsPingCommonInitSendJfcWithAttr(struct rs_cb *rscb, struct RsPingCtxC
     struct RsPingLocalJettyCb *jettyCb)
 {
     (void)rscb;
+    int ret = 0;
     urma_jfc_cfg_t sendJfcCfg = {
         .depth = attr->ub.cqAttr.sendCqDepth,
         .flag = {.value = 0},
@@ -134,7 +137,8 @@ STATIC int RsPingCommonInitSendJfcWithAttr(struct rs_cb *rscb, struct RsPingCtxC
     jettyCb->sendJfc.numEvents = 0;
     jettyCb->sendJfc.maxRecvWcNum = RS_PING_URMA_RECV_WC_NUM;
     jettyCb->sendJfc.jfc = RsUrmaCreateJfc(pingCb->udevCb.urmaCtx, &sendJfcCfg);
-    CHK_PRT_RETURN(jettyCb->sendJfc.jfc == NULL, hccp_err("urma_create_jfc failed, errno:%d", errno), -EOPENSRC);
+    RS_URMA_PTR_TO_ERRNO(jettyCb->sendJfc.jfc, ret);
+    CHK_PRT_RETURN(jettyCb->sendJfc.jfc == NULL, hccp_err("urma_create_jfc failed, errno:%d, ret:%d", errno, ret), ret);
 
     hccp_run_info("eid:%016llx:%016llx init send jfc success, jfc_id:%u", pingCb->udevCb.eidInfo.eid.in6.subnetPrefix,
         pingCb->udevCb.eidInfo.eid.in6.interfaceId, jettyCb->sendJfc.jfc->jfc_id.id);
@@ -144,6 +148,7 @@ STATIC int RsPingCommonInitSendJfcWithAttr(struct rs_cb *rscb, struct RsPingCtxC
 STATIC int RsPingCommonInitRecvJfcWithAttr(struct RsPingCtxCb *pingCb, union PingQpAttr *attr,
     struct RsPingLocalJettyCb *jettyCb)
 {
+    int ret = 0;
     urma_jfc_cfg_t recvJfcCfg = {
         .depth = attr->ub.cqAttr.recvCqDepth,
         .flag = {.value = 0},
@@ -154,7 +159,9 @@ STATIC int RsPingCommonInitRecvJfcWithAttr(struct RsPingCtxCb *pingCb, union Pin
     jettyCb->recvJfc.numEvents = 0;
     jettyCb->recvJfc.maxRecvWcNum = RS_PING_URMA_RECV_WC_NUM;
     jettyCb->recvJfc.jfc = RsUrmaCreateJfc(pingCb->udevCb.urmaCtx, &recvJfcCfg);
-    CHK_PRT_RETURN(jettyCb->recvJfc.jfc == NULL, hccp_err("create recv jfc failed, errno:%d", errno), -EOPENSRC);
+    RS_URMA_PTR_TO_ERRNO(jettyCb->recvJfc.jfc, ret);
+    CHK_PRT_RETURN(jettyCb->recvJfc.jfc == NULL,
+        hccp_err("urma_create_jfc failed, jfcType:recv, errno:%d, ret:%d", errno, ret), ret);
 
     hccp_run_info("eid:%016llx:%016llx init recv jfc success, jfc_id:%u", pingCb->udevCb.eidInfo.eid.in6.subnetPrefix,
         pingCb->udevCb.eidInfo.eid.in6.interfaceId, jettyCb->recvJfc.jfc->jfc_id.id);
@@ -186,7 +193,8 @@ STATIC int RsPingCommonInitJettyWithAttr(struct RsPingCtxCb *pingCb, union PingQ
     jfrCfg.token_value.token = attr->ub.qpAttr.tokenValue;
 
     jettyCb->jfr = RsUrmaCreateJfr(pingCb->udevCb.urmaCtx, &jfrCfg);
-    CHK_PRT_RETURN(jettyCb->jfr == NULL, hccp_err("urma_create_jfr failed, errno:%d", errno), -ENOMEM);
+    RS_URMA_PTR_TO_ERRNO(jettyCb->jfr, ret);
+    CHK_PRT_RETURN(jettyCb->jfr == NULL, hccp_err("urma_create_jfr failed, errno:%d", errno), ret);
 
     jettyCfg.flag.bs.share_jfr = URMA_SHARE_JFR;
     jettyCfg.jfs_cfg = jfsCfg;
@@ -194,9 +202,9 @@ STATIC int RsPingCommonInitJettyWithAttr(struct RsPingCtxCb *pingCb, union PingQ
     jettyCfg.shared.jfc = jettyCb->recvJfc.jfc;
 
     jettyCb->jetty = RsUrmaCreateJetty(pingCb->udevCb.urmaCtx, &jettyCfg);
+    RS_URMA_PTR_TO_ERRNO(jettyCb->jetty, ret);
     if (jettyCb->jetty == NULL) {
         hccp_err("urma_create_jetty failed, errno:%d", errno);
-        ret = -ENOMEM;
         goto create_jetty_fail;
     }
 
@@ -327,9 +335,10 @@ STATIC int RsPingCommonInitSegCb(struct rs_cb *rscb, struct RsPingCtxCb *pingCb,
 
     segCfg.va = segCb->addr;
     segCb->segment = RsUrmaRegisterSeg(pingCb->udevCb.urmaCtx, &segCfg);
+    RS_URMA_PTR_TO_ERRNO(segCb->segment, ret);
     if (segCb->segment == NULL) {
-        ret = -errno;
-        hccp_err("urma_register_seg failed, ret:%d addr:0x%llx len:0x%llx", ret, segCb->addr, segCb->len);
+        hccp_err("urma_register_seg failed, ret:%d addr:0x%llx len:0x%llx errno:%d", ret, segCb->addr, segCb->len,
+            errno);
         goto segment_reg_fail;
     }
 
@@ -470,8 +479,9 @@ STATIC int RsPingCommonJfrPostRecv(struct RsPingLocalJettyCb *jettyCb)
     jfrWr.src.num_sge = 1;
 
     ret = RsUrmaPostJettyRecvWr(jettyCb->jetty, &jfrWr, &jfrBadWr);
+    RS_URMA_RET_TO_ERRNO(ret);
     if (ret != 0) {
-        hccp_err("urma_post_jetty_recv_wr failed, ret:%d", ret);
+        hccp_err("urma_post_jetty_recv_wr failed, ret:%d, errno:%d", ret, errno);
         return ret;
     }
 
@@ -573,10 +583,10 @@ STATIC int RsPingUrmaPingCbInit(unsigned int phyId, struct PingInitAttr *attr, s
 
     (void)memcpy_s(eid.raw, sizeof(eid.raw), attr->dev.ub.eid.raw, sizeof(attr->dev.ub.eid.raw));
     pingCb->udevCb.urmaDev = RsUrmaGetDeviceByEid(eid, URMA_TRANSPORT_UB);
+    RS_URMA_PTR_TO_ERRNO(pingCb->udevCb.urmaDev, ret);
     if (pingCb->udevCb.urmaDev == NULL) {
         hccp_err("urma_get_device_by_eid failed, urmaDev is NULL, errno:%d eid:%016llx:%016llx", errno,
             eid.in6.subnet_prefix, eid.in6.interface_id);
-        ret = -ENODEV;
         goto get_urma_dev_fail;
     }
 
@@ -637,6 +647,7 @@ STATIC int RsPingCommonImportJetty(urma_context_t *urmaCtx, struct PingQpInfo *t
     urma_token_t tokenValue = {0};
     urma_eid_t remoteEid = {0};
     urma_rjetty_t rjetty = {0};
+    int ret = 0;
 
     RsGetJettyInfo(target, &rjetty.jetty_id, &remoteEid);
 
@@ -647,10 +658,11 @@ STATIC int RsPingCommonImportJetty(urma_context_t *urmaCtx, struct PingQpInfo *t
     rjetty.tp_type = URMA_UTP;
 
     *importTjetty = RsUrmaImportJetty(urmaCtx, &rjetty, &tokenValue);
+    RS_URMA_PTR_TO_ERRNO(*importTjetty, ret);
     if (*importTjetty == NULL) {
         hccp_err("urma_import_jetty failed, errno:%d remote eid:%016llx:%016llx", errno, remoteEid.in6.subnet_prefix,
             remoteEid.in6.interface_id);
-        return -EOPENSRC;
+        return ret;
     }
     return 0;
 }
@@ -789,8 +801,9 @@ STATIC int RsPingUrmaPostSend(struct RsPingCtxCb *pingCb, struct RsPingTargetInf
     header->magic = 0x55AA;
 
     ret = RsUrmaPostJettySendWr(pingCb->pingJetty.jetty, &wr, &badWr);
+    RS_URMA_RET_TO_ERRNO(ret);
     if (ret != 0) {
-        hccp_err("rs_urma_post_jetty_send_wr jetty_id:%u failed, ret:%d", serverJettyKey.id, ret);
+        hccp_err("urma_post_jetty_send_wr jetty_id:%u failed, ret:%d, errno:%d", serverJettyKey.id, ret, errno);
         RS_PTHREAD_MUTEX_LOCK(&target->tripMutex);
         target->state = RS_PING_PONG_TARGET_ERROR;
         RS_PTHREAD_MUTEX_ULOCK(&target->tripMutex);
@@ -804,8 +817,9 @@ STATIC int RsPingUrmaPollScq(struct RsPingCtxCb *pingCb, struct RsPingTargetInfo
     int polledCnt;
 
     polledCnt = RsUrmaPollJfc(pingCb->pingJetty.sendJfc.jfc, 1, &sendCr);
+    RS_URMA_RET_TO_ERRNO(polledCnt);
     if (polledCnt != 1) {
-        hccp_err("uuid:0x%llx rs_urma_poll_jfc polled_cnt:%d", target->uuid, polledCnt);
+        hccp_err("uuid:0x%llx urma_poll_jfc polled_cnt:%d, errno:%d", target->uuid, polledCnt, errno);
         target->state = RS_PING_PONG_TARGET_ERROR;
         return -ENODATA;
     }
@@ -827,6 +841,7 @@ STATIC int RsPingUrmaPollRcq(struct RsPingCtxCb *pingCb, int *polledCnt, struct 
     (void)gettimeofday(timestamp2, NULL);
 
     waitCnt = RsUrmaWaitJfc(pingCb->pingJetty.jfce, 1, 0, &evJfc);
+    RS_URMA_RET_TO_ERRNO(waitCnt);
     if (waitCnt == 0) {
         return -EAGAIN;
     }
@@ -843,8 +858,9 @@ STATIC int RsPingUrmaPollRcq(struct RsPingCtxCb *pingCb, int *polledCnt, struct 
     pingCb->pingJetty.recvJfc.numEvents++;
 
     *polledCnt = RsUrmaPollJfc(evJfc, pingCb->pingJetty.recvJfc.maxRecvWcNum, gPingJettyRecvCr);
+    RS_URMA_RET_TO_ERRNO(*polledCnt);
     CHK_PRT_RETURN(*polledCnt > pingCb->pingJetty.recvJfc.maxRecvWcNum || *polledCnt < 0,
-        hccp_err("urma_poll_jfc failed, ret:%d", *polledCnt), -EOPENSRC);
+        hccp_err("urma_poll_jfc failed, ret:%d, errno:%d", *polledCnt, errno), -EOPENSRC);
 
     return 0;
 }
@@ -855,8 +871,9 @@ STATIC int RsPingCommonPollSendJfc(struct RsPingLocalJettyCb *jettyCb)
     int polledCnt;
 
     polledCnt = RsUrmaPollJfc(jettyCb->sendJfc.jfc, 1, &cr);
+    RS_URMA_RET_TO_ERRNO(polledCnt);
     if (polledCnt < 0) {
-        hccp_warn_rma("urma_poll_jfc unsuccessful, polledCnt:%d", polledCnt);
+        hccp_warn_rma("urma_poll_jfc unsuccessful, polledCnt:%d, errno:%d", polledCnt, errno);
     } else if (polledCnt > 0) {
         if (cr.status != URMA_CR_SUCCESS) {
             hccp_err("wr_id:0x%llx error cqe status(%d)", cr.user_ctx, cr.status);
@@ -1007,9 +1024,10 @@ STATIC int RsPongJettyPostSend(struct RsPingCtxCb *pingCb, urma_cr_t *cr, struct
     header->magic = 0xAA55;
 
     ret = RsUrmaPostJettySendWr(pingCb->pongJetty.jetty, &wr, &badWr);
+    RS_URMA_RET_TO_ERRNO(ret);
     if (ret != 0) {
         targetInfo->state = RS_PING_PONG_TARGET_ERROR;
-        hccp_err("urma_post_jetty_send_wr failed, ret:%d", ret);
+        hccp_err("urma_post_jetty_send_wr failed, ret:%d, errno:%d", ret, errno);
         return ret;
     }
 
@@ -1042,8 +1060,9 @@ STATIC void RsPongUrmaHandleSend(struct RsPingCtxCb *pingCb, int polledCnt, stru
     }
 
     ret = RsUrmaRearmJfc(pingCb->pingJetty.recvJfc.jfc, false);
+    RS_URMA_RET_TO_ERRNO(ret);
     if (ret != 0) {
-        hccp_err("urma_rearm_jfc failed, ret:%d", ret);
+        hccp_err("urma_rearm_jfc failed, ret:%d, errno:%d", ret, errno);
     }
 
     return;
@@ -1078,30 +1097,7 @@ STATIC int RsPongJettyResolveResponsePacket(struct RsPingCtxCb *pingCb, uint32_t
     }
 
     (void)memset_s((void *)header, RS_PING_PAYLOAD_HEADER_MASK_SIZE, 0, RS_PING_PAYLOAD_HEADER_MASK_SIZE);
-    RS_PTHREAD_MUTEX_LOCK(&targetInfo->tripMutex);
-    targetInfo->resultSummary.recvCnt++;
-    targetInfo->resultSummary.taskId = header->taskId;
-    // rtt timeout, increase timeoutCnt
-    if (((uint64_t)targetInfo->resultSummary.taskAttr.timeoutInterval * RS_PING_MSEC_TO_USEC) < rtt) {
-        targetInfo->resultSummary.timeoutCnt++;
-        hccp_dbg("recvCnt:%u timeoutInterval:%u rtt:%u timeoutCnt:%u", targetInfo->resultSummary.recvCnt,
-            targetInfo->resultSummary.taskAttr.timeoutInterval, rtt, targetInfo->resultSummary.timeoutCnt);
-        RS_PTHREAD_MUTEX_ULOCK(&targetInfo->tripMutex);
-        return 0;
-    }
-
-    // handle rtt_min, rtt_max, rtt_avg
-    if (targetInfo->resultSummary.rttMin > rtt) {
-        targetInfo->resultSummary.rttMin = rtt;
-    }
-    if (targetInfo->resultSummary.rttMax < rtt) {
-        targetInfo->resultSummary.rttMax = rtt;
-    }
-    if (targetInfo->resultSummary.rttAvg == 0) {
-        targetInfo->resultSummary.rttAvg = rtt;
-    }
-    targetInfo->resultSummary.rttAvg = (targetInfo->resultSummary.rttAvg + rtt) / 2U;
-    RS_PTHREAD_MUTEX_ULOCK(&targetInfo->tripMutex);
+    RsPingUpdateResultSummary(targetInfo, rtt, header->taskId);
     return 0;
 }
 
@@ -1120,11 +1116,12 @@ STATIC void RsPongUrmaPollRcq(struct RsPingCtxCb *pingCb)
     (void)gettimeofday(&timestamp, NULL);
 
     waitCnt = RsUrmaWaitJfc(pingCb->pongJetty.jfce, 1, 0, &evJfc);
+    RS_URMA_RET_TO_ERRNO(waitCnt);
     if (waitCnt == 0) {
         return;
     }
     if (waitCnt != 1) {
-        hccp_err("urma_wait_jfc failed, ret:%d", waitCnt);
+        hccp_err("urma_wait_jfc failed, ret:%d, errno:%d", waitCnt, errno);
         return;
     }
     RsUrmaAckJfc((urma_jfc_t **)&evJfc, &ackCnt, 1);
@@ -1136,8 +1133,9 @@ STATIC void RsPongUrmaPollRcq(struct RsPingCtxCb *pingCb)
     pingCb->pongJetty.recvJfc.numEvents++;
 
     polledCnt = RsUrmaPollJfc(evJfc, pingCb->pongJetty.recvJfc.maxRecvWcNum, gPongJettyRecvCr);
+    RS_URMA_RET_TO_ERRNO(polledCnt);
     if (polledCnt > pingCb->pongJetty.recvJfc.maxRecvWcNum || polledCnt < 0) {
-        hccp_err("urma_poll_jfc failed, ret:%d", polledCnt);
+        hccp_err("urma_poll_jfc failed, ret:%d, errno:%d", polledCnt, errno);
         goto rearm_jfc;
     }
 
@@ -1167,8 +1165,9 @@ STATIC void RsPongUrmaPollRcq(struct RsPingCtxCb *pingCb)
 
 rearm_jfc:
     ret = RsUrmaRearmJfc(evJfc, false);
+    RS_URMA_RET_TO_ERRNO(ret);
     if (ret != 0) {
-        hccp_err("urma_rearm_jfc failed, ret:%d", ret);
+        hccp_err("urma_rearm_jfc failed, ret:%d, errno:%d", ret, errno);
     }
 
     return;

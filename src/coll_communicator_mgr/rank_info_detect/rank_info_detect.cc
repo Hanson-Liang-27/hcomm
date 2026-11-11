@@ -21,11 +21,11 @@
 #include "env_config/env_config_v2.h"
 #include "bootstrap_ip.h"
 #include "preempt_port_manager_v2.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 
 namespace Hccl {
 
-constexpr u32 HOST_CONTROL_BASE_PORT = 60000; // 控制面起始port
+constexpr u32 HOST_CONTROL_BASE_PORT = 60016; // 控制面起始port，当前专用于拓扑探测使用，范围在[60016,60031]
 constexpr u32 HOST_CONTROL_PORT_COUNT = 15;
 constexpr u32 HCCL_WHITELIST_ON = 1;
 constexpr u32 HOST_SOCKET_CONN_LIMIT = 8; // HCCL_AISERVER_DEVICE_NUM (8)
@@ -71,10 +71,10 @@ HcclResult RankInfoDetect::SetupServer(HcclRootHandleV2& rootHandle)
     HCCL_DEBUG("[RankInfoDetect::%s] setup server start.", __func__);
 
     // host网卡使能
-    TRY_CATCH_RETURN(HccpPeerManager::GetInstance().Init(devLogicId_));
+    TRY_CATCH_RETURN(HccpPeerManager::GetInstance().Init(devLogicId_););
 
     // 获取LocalHostIP
-    TRY_CATCH_RETURN(hostIp_ = GetBootstrapIp(devPhyId_));
+    TRY_CATCH_RETURN(hostIp_ = GetBootstrapIp(devPhyId_););
     CHK_PRT_RET(hostIp_.IsInvalid(), HCCL_ERROR("[RankInfoDetect::%s] get hostIp fail.", __func__), HCCL_E_INTERNAL);
 
     // 获取端口号port
@@ -85,10 +85,11 @@ HcclResult RankInfoDetect::SetupServer(HcclRootHandleV2& rootHandle)
     TRY_CATCH_RETURN(serverSocket = ServerInit(););
 
     // 2. 构建rootHandle
-    TRY_CATCH_RETURN(GetRootHandle(rootHandle););
+    CHK_RET(GetRootHandle(rootHandle));
 
     // 3. 实际端口和identifier就绪后，使用最终tag下发白名单
-    HcclResult ret = GetHandleAndAddHostSocketWhitelist();
+    HcclResult ret = HCCL_SUCCESS;
+    TRY_CATCH_RETURN(ret = GetHandleAndAddHostSocketWhitelist(););
     if (ret == HCCL_E_PTR) {
         HCCL_ERROR("[RankInfoDetect::%s] get host socket handle failed, ret[%d].", __func__, ret);
         return HcclResult::HCCL_E_PTR;
@@ -103,10 +104,12 @@ HcclResult RankInfoDetect::SetupServer(HcclRootHandleV2& rootHandle)
     }
 
     // 4. 拉起线程，调用RankInfoDetectService.Run()，注意新线程中需要HrtSetDevice
-    std::thread threadHandle(
-        &RankInfoDetect::SetupRankInfoDetectService, this, hrtErrMGetErrorContextPub(), serverSocket, devLogicId_,
-        devPhyId_, identifier_, wlistInfo_);
-    threadHandle.detach();
+    TRY_CATCH_RETURN({
+        std::thread threadHandle(
+            &RankInfoDetect::SetupRankInfoDetectService, this, hrtErrMGetErrorContextPub(), serverSocket, devLogicId_,
+            devPhyId_, identifier_, wlistInfo_);
+        threadHandle.detach();
+    });
 
     HCCL_DEBUG("[RankInfoDetect::%s] setup server end.", __func__);
     return HcclResult::HCCL_SUCCESS;
@@ -146,6 +149,12 @@ shared_ptr<Socket> RankInfoDetect::ServerInit()
         if (portRange.empty()) {
             SocketPortRange defaultRange = {HOST_CONTROL_BASE_PORT, HOST_CONTROL_BASE_PORT + HOST_CONTROL_PORT_COUNT};
             portRange.push_back(defaultRange);
+        } else {
+            // 控制面使用后半端口范围
+            std::vector<SocketPortRange> frontHalf;
+            std::vector<SocketPortRange> backHalf;
+            SplitPortRange(portRange, frontHalf, backHalf);
+            portRange = backHalf;
         }
         PreemptPortManager::GetInstance(devLogicId_).ListenPreempt(serverSocket, portRange, hostPort_);
     } else {
@@ -216,30 +225,31 @@ std::shared_ptr<Socket> RankInfoDetect::ClientInit(const HcclRootHandleV2& rootH
     return clientSocket;
 }
 
-void RankInfoDetect::SetupAgent(u32 rankSize, u32 rankId, const HcclRootHandleV2& rootHandle)
+HcclResult RankInfoDetect::SetupAgent(u32 rankSize, u32 rankId, const HcclRootHandleV2& rootHandle)
 {
     HCCL_DEBUG("[RankInfoDetect::%s] setup agent start.", __func__);
 
     // 网卡使能
-    HccpPeerManager::GetInstance().Init(devLogicId_);
-    HccpHdcManager::GetInstance().Init(devLogicId_);
+    TRY_CATCH_RETURN(HccpPeerManager::GetInstance().Init(devLogicId_););
+    TRY_CATCH_RETURN(HccpHdcManager::GetInstance().Init(devLogicId_););
 
     // 获取LocalHostIP
-    hostIp_ = GetBootstrapIp(devPhyId_);
-    CHK_PRT_THROW(
-        hostIp_.IsInvalid(), HCCL_ERROR("[RankInfoDetect::%s] get hostIp fail.", __func__), InternalException,
-        "get hostIp fail");
+    TRY_CATCH_RETURN(hostIp_ = GetBootstrapIp(devPhyId_););
+    CHK_PRT_RET(hostIp_.IsInvalid(), HCCL_ERROR("[RankInfoDetect::%s] get hostIp fail.", __func__), HCCL_E_INTERNAL);
 
     // 创建clientSocket
-    std::shared_ptr<Socket> clientSocket = ClientInit(rootHandle);
+    std::shared_ptr<Socket> clientSocket;
+    TRY_CATCH_RETURN(clientSocket = ClientInit(rootHandle););
 
     // 1. 创建RankInfoDetectClient对象
-    rankInfoDetectClient = std::make_shared<RankInfoDetectClient>(devPhyId_, rankSize, rankId, clientSocket);
+    TRY_CATCH_RETURN(rankInfoDetectClient
+                     = std::make_shared<RankInfoDetectClient>(devPhyId_, rankSize, rankId, clientSocket););
 
     // 2. 调用RankInfoDetectClient.Setup, 获取rankTable
-    rankInfoDetectClient->Setup(rankTable_);
+    CHK_RET(rankInfoDetectClient->Setup(rankTable_));
 
     HCCL_DEBUG("[RankInfoDetect::%s] setup agent end.", __func__);
+    return HCCL_SUCCESS;
 }
 
 void RankInfoDetect::SetupRankInfoDetectService(
@@ -264,7 +274,12 @@ void RankInfoDetect::SetupRankInfoDetectService(
         = make_shared<RankInfoDetectService>(devPhyId, serverSocket, identifier, wlistInfo);
 
     bool hasException = false;
-    EXCEPTION_CATCH(rankInfoDetectService->Setup(), hasException = true);
+    HcclResult setupRet = HCCL_SUCCESS;
+    EXCEPTION_CATCH(setupRet = rankInfoDetectService->Setup(), hasException = true);
+    if (setupRet != HCCL_SUCCESS) {
+        HCCL_ERROR("[%s]Failed, Setup failed, ret[%d].", __func__, setupRet);
+        hasException = true;
+    }
 
     // 若有异常则设置error状态退出
     if (hasException == true) {
@@ -317,7 +332,7 @@ u32 RankInfoDetect::GetHostListenPort()
         return listenPort;
     }
 
-    // 无环境变量设置，返回HCCL_INVALID_PORT触发PreemptPortManager轮询查找端口[60000, 60015]
+    // 无环境变量设置，返回HCCL_INVALID_PORT触发PreemptPortManager轮询查找端口[60016, 60031]
     listenPort = HCCL_INVALID_PORT;
     HCCL_INFO(
         "[RankInfoDetect::%s] No port configuration, using default port range[%u, %u]", __func__,
@@ -325,14 +340,14 @@ u32 RankInfoDetect::GetHostListenPort()
     return listenPort;
 }
 
-void RankInfoDetect::GetRootHandle(HcclRootHandleV2& rootHandle)
+HcclResult RankInfoDetect::GetRootHandle(HcclRootHandleV2& rootHandle)
 {
     u64 timestamp = 0;
     HcclResult ret = SalGetCurrentTimestamp(timestamp);
-    CHK_PRT_THROW(
+    CHK_PRT_RET(
         ret != HCCL_SUCCESS,
         HCCL_ERROR("[RankInfoDetect::%s] get timestamp failed, ret[%d].", __func__, static_cast<int>(ret)),
-        InternalException, "get timestamp failed");
+        HCCL_E_INTERNAL);
     identifier_ = hostIp_.GetIpStr();
     identifier_.append("_");
     identifier_.append(to_string(hostPort_));
@@ -340,25 +355,23 @@ void RankInfoDetect::GetRootHandle(HcclRootHandleV2& rootHandle)
     identifier_.append(to_string(devPhyId_));
     identifier_.append("_");
     identifier_.append(to_string(timestamp));
-    CHK_PRT_THROW(
+    CHK_PRT_RET(
         (identifier_.length() >= ROOTINFO_IDENTIFIER_MAX_LENGTH),
         HCCL_ERROR("[RankInfoDetect::%s] rootInfo identifier len[%u] is invalid.", __func__, identifier_.length()),
-        InternalException, "identifier error");
+        HCCL_E_INTERNAL);
 
     s32 sRet = memcpy_s(
         &rootHandle.identifier[0], sizeof(rootHandle.identifier), identifier_.c_str(), (identifier_.length() + 1));
-    CHK_PRT_THROW(
+    CHK_PRT_RET(
         sRet != EOK,
         HCCL_ERROR(
             "[RankInfoDetect::%s] memcpy failed. ret[%d], params: destMaxSize[%zu], count[%zu]", __func__, sRet,
             sizeof(rootHandle.identifier), (identifier_.length() + 1)),
-        InternalException, "memcpy failed");
+        HCCL_E_INTERNAL);
 
     sRet = strncpy_s(
         rootHandle.ip, sizeof(rootHandle.ip), hostIp_.GetIpStr().c_str(), strlen(hostIp_.GetIpStr().c_str()));
-    CHK_PRT_THROW(
-        sRet != EOK, HCCL_ERROR("[RankInfoDetect::%s] strncpy failed [%d]", __func__, sRet), InternalException,
-        "strncpy failed");
+    CHK_PRT_RET(sRet != EOK, HCCL_ERROR("[RankInfoDetect::%s] strncpy failed [%d]", __func__, sRet), HCCL_E_INTERNAL);
 
     rootHandle.listenPort = hostPort_;
     rootHandle.netMode = HrtNetworkMode::HDC;
@@ -366,6 +379,7 @@ void RankInfoDetect::GetRootHandle(HcclRootHandleV2& rootHandle)
     HCCL_INFO(
         "[RankInfoDetect::%s] rootInfo: ip[%s] port[%u] identifier[%s]", __func__, rootHandle.ip, rootHandle.listenPort,
         identifier_.c_str());
+    return HCCL_SUCCESS;
 }
 
 void RankInfoDetect::GetRankTable(RankTableInfo& ranktable) const { ranktable = rankTable_; }
@@ -402,7 +416,7 @@ HcclResult RankInfoDetect::WaitComplete(u32 listenPort, u32 listenStatus) const
                     true, "EI0015", std::vector<std::string>({"error_reason"}),
                     std::vector<std::string>({StringFormat(
                         "Receiving message from the root node timed out "
-                        "after %lld seconds. Timeout was set to %lld seconds. Check whether node %s reports an error.",
+                        "after %lld seconds. Timeout was set to %lld seconds. Check whether node %s reports an error",
                         static_cast<long long>(elapsed.count()), static_cast<long long>(timeout.count()),
                         identifier_.c_str())}));
                 HCCL_ERROR(

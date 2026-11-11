@@ -12,6 +12,7 @@
 
 #include "exception_util.h"
 #include "internal_exception.h"
+#include "invalid_params_exception.h"
 #include "communicator_impl.h"
 #include "ccu_jetty_mgr.h"
 #include "coll_service_device_mode.h"
@@ -56,6 +57,11 @@ CachedCCUParams::CachedCCUParams(
       insType(insType),
       isSlave(isSlave)
 {
+    if (ccuInstruction.size() != profilingInfo.size()) {
+        THROW<InvalidParamsException>(StringFormat(
+            "[CachedCCUParams] ccuInstruction size[%zu] does not match profilingInfo size[%zu].", ccuInstruction.size(),
+            profilingInfo.size()));
+    }
     std::vector<std::vector<rtCcuTaskInfo_t>> ccuTaskInstruction{};
     auto& commImpl = *(static_cast<CommunicatorImpl*>(comm));
     for (auto& vec : ccuInstruction) {
@@ -121,9 +127,11 @@ CachedCCUParams::alloc_and_memcpy_aligned(const std::vector<std::vector<rtCcuTas
     if (alignment < alignof(CcuTaskParam)) {
         THROW<InternalException>(StringFormat("[CachedCCUParams] alignment must be larger than type alignment."));
     }
+    if (vecs.empty()) {
+        THROW<InvalidParamsException>(StringFormat("[CachedCCUParams] ccu task params is empty."));
+    }
     count.resize(vecs.size());
-    std::size_t countIndex = 0;
-    count[countIndex++] = vecs[0].size();
+    count[0] = vecs[0].size();
     for (const auto& vec : vecs) {
         totalCounts += vec.size();
         HCCL_INFO("CachedCCUParams: vec.size[%llu]", static_cast<std::uint64_t>(vec.size()));
@@ -148,9 +156,10 @@ CachedCCUParams::alloc_and_memcpy_aligned(const std::vector<std::vector<rtCcuTas
         }
         cur += count[0];
     }
-    u32 reqStreamNum = vecs.size() - 1;
+    std::size_t reqStreamNum = vecs.size() - 1;
     for (std::size_t i = 1; i <= reqStreamNum; i++) {
         auto& vec = vecs[i];
+        count[i] = vec.size();
         if (!vec.empty()) {
             auto ret
                 = memcpy_s(cur, vec.size() * sizeof(rtCcuTaskInfo_t), vec.data(), vec.size() * sizeof(rtCcuTaskInfo_t));
@@ -158,7 +167,6 @@ CachedCCUParams::alloc_and_memcpy_aligned(const std::vector<std::vector<rtCcuTas
                 aligned_free(dst);
                 THROW<InternalException>(StringFormat("[CachedCCUParams] failed to memcpy, ret %d.", ret));
             }
-            count[countIndex++] = vec.size();
             cur += vec.size();
         }
     }

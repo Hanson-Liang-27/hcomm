@@ -9,14 +9,16 @@
  */
 
 #include "../../ut_hcomm_base.h"
+#include "endpoint_pair/channel/channel_c_adpt_pub.h"
+#include "res_mgr_c_adpt_pub.h"
 #include <memory>
-#include "channel_process.h"
+#include "endpoint_pair/channel/channel_process_pub.h"
 #include "endpoint.h"
 #include "hcomm_channel.h"
 #include "mockcpp/mockcpp.hpp"
 #include "shared_jetty_mgr.h"
-#include "../../../../../../src/base_comm/hcomm_res_mgr.h"
-#include "../../../../../../src/base_comm/resources/endpoints/mgr/endpoint_mgr.h"
+#include "base_comm_node_accessors.h"
+#include "endpoint_handle_mgr.h"
 
 namespace {
 
@@ -38,13 +40,13 @@ public:
         desc.loc.locType = locType;
         auto ep = std::make_unique<ChannelStubEndpoint>(desc);
         handle_ = reinterpret_cast<EndpointHandle>(ep.get());
-        hcomm::HcommResMgr::GetInstance().GetEndpointMgr().Add(handle_, std::move(ep));
+        hcomm::GetEndpointHandleMgr().Add(handle_, std::move(ep));
     }
 
     ~ScopedChannelStubEndpoint()
     {
         if (handle_ != nullptr) {
-            hcomm::HcommResMgr::GetInstance().GetEndpointMgr().Remove(handle_);
+            hcomm::GetEndpointHandleMgr().Remove(handle_);
         }
     }
 
@@ -97,7 +99,9 @@ TEST_F(TestHcommChannel, Ut_TestHcommChannelCreate_When_ChannelsNullptr_Return_H
     EXPECT_EQ(ret, HCCL_E_PTR);
 }
 
-TEST_F(TestHcommChannel, Ut_TestHcommChannelCreate_When_NumZero_Return_HCCL_E_PARA)
+// HcommChannelCreate 首句校验 endpointHandle，本用例传 null 句柄故断言 E_PTR；
+// channelNum==0 → E_PARA 由下方 *NumZero* 用例覆盖
+TEST_F(TestHcommChannel, Ut_TestHcommChannelCreate_When_NumZeroAndEndpointNull_Return_HCCL_E_PTR)
 {
     HcommChannelDesc desc;
     desc.role = HCOMM_SOCKET_ROLE_SERVER;
@@ -118,20 +122,22 @@ TEST_F(TestHcommChannel, Ut_TestHcommChannelCreate_When_CcuUbRtp_Return_NotSuppo
     EXPECT_EQ(channels[0], static_cast<ChannelHandle>(0));
 }
 
-TEST_F(TestHcommChannel, Ut_TestHcommCollectiveChannelCreate_When_ParamsNull_Return_HCCL_E_PTR)
+TEST_F(TestHcommChannel, Ut_TestHcommChannelCreate_When_ParamsNull_Return_HCCL_E_PTR)
 {
     ChannelHandle channels[1];
-    HcommResult ret = HcommCollectiveChannelCreate(nullptr, COMM_ENGINE_AICPU, nullptr, 1, channels);
+    HcommResult ret = HcommChannelCreate(nullptr, COMM_ENGINE_AICPU, nullptr, 1, channels);
     EXPECT_EQ(ret, HCCL_E_PTR);
 }
 
-TEST_F(TestHcommChannel, Ut_TestHcommCollectiveChannelCreate_When_NumZero_Return_HCCL_E_PARA)
+TEST_F(TestHcommChannel, Ut_TestHcommChannelCreate_When_NumZero_Return_HCCL_E_PARA)
 {
+    // HcommChannelCreate 首句校验 endpointHandle，需给非空句柄才能走到 channelNum==0 这一支
+    ScopedChannelStubEndpoint stubEndpoint;
     HcommChannelDesc desc;
     desc.role = HCOMM_SOCKET_ROLE_SERVER;
     desc.port = 12345;
     ChannelHandle channels[1];
-    HcommResult ret = HcommCollectiveChannelCreate(nullptr, COMM_ENGINE_AICPU, &desc, 0, channels);
+    HcommResult ret = HcommChannelCreate(stubEndpoint.Get(), COMM_ENGINE_AICPU, &desc, 0, channels);
     EXPECT_EQ(ret, HCCL_E_PARA);
 }
 
@@ -198,6 +204,80 @@ TEST_F(TestHcommChannel, Ut_TestHcommChannelGetRemoteMems_When_NumNullptr_Return
     EXPECT_EQ(ret, HCCL_E_PTR);
 }
 
+// HcommChannelGetRemoteMems 当 memInfos 为 nullptr 返回 HCOMM_E_PTR
+TEST_F(TestHcommChannel, Ut_TestHcommChannelGetRemoteMems_When_MemInfosNullptr_Return_HCCL_E_PTR)
+{
+    uint32_t memNum = 0;
+    CommMem* remoteMem = nullptr;
+    HcommResult ret = HcommChannelGetRemoteMems(0, &memNum, &remoteMem, nullptr);
+    EXPECT_EQ(ret, HCCL_E_PTR);
+}
+
+// HcommChannelGetRemoteMems 当 ChannelProcess 返回错误时透传错误码
+TEST_F(TestHcommChannel, Ut_TestHcommChannelGetRemoteMems_When_ChannelProcessError_Expect_ErrorPropagated)
+{
+    ChannelHandle channelHandle = 0xFFFF;
+    CommMem* remoteMem = nullptr;
+    uint32_t memNum = 0;
+    char* memInfosStorage[2] = {nullptr, nullptr};
+    char** memInfos = memInfosStorage;
+    MOCKER(&hcomm::ChannelProcess::ChannelGetRemoteMems)
+        .stubs()
+        .will(returnValue(static_cast<HcclResult>(HCCL_E_NOT_FOUND)));
+    HcommResult ret = HcommChannelGetRemoteMems(channelHandle, &memNum, &remoteMem, &memInfos);
+    EXPECT_EQ(ret, static_cast<HcommResult>(HCCL_E_NOT_FOUND));
+}
+
+// ===================== HcommChannelCreate AIV+UB_MEM API UT =====================
+
+// HcommChannelCreate API 级 AIV+UB_MEM 创建成功（自创建 Socket 路径）
+TEST_F(TestHcommChannel, Ut_HcommChannelCreate_When_AivUbMem_Expect_ReturnSuccess)
+{
+    ScopedChannelStubEndpoint stubEndpoint;
+    EndpointHandle ep = stubEndpoint.Get();
+    HcommChannelDesc desc{};
+    ASSERT_EQ(HcommChannelDescInit(&desc, 1), HCCL_SUCCESS);
+    desc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_MEM;
+    desc.ubMemAttr.pathMode = 0;
+    desc.socket = nullptr;
+    desc.role = HCOMM_SOCKET_ROLE_SERVER;
+    desc.port = 60001;
+    ChannelHandle channels[1] = {0};
+
+    MOCKER(HcommResMgrInit).stubs().will(returnValue(static_cast<HcommResult>(HCCL_SUCCESS)));
+    MOCKER(&hcomm::ChannelProcess::CreateChannelsLoop).stubs().will(returnValue(HCCL_SUCCESS));
+    MOCKER(&hcomm::ChannelProcess::PrepareUserChannels).stubs().will(returnValue(HCCL_SUCCESS));
+
+    HcommResult ret = HcommChannelCreate(ep, COMM_ENGINE_AIV, &desc, 1, channels);
+    EXPECT_EQ(ret, HCCL_SUCCESS);
+    hcomm::GetSharedJettyMgr().UnregisterEndpoint(ep);
+}
+
+// HcommChannelCreate AIV+UB_MEM + 非法 pathMode 在 Normalize 阶段被拦截
+TEST_F(TestHcommChannel, Ut_HcommChannelCreate_When_AivUbMemInvalidPathMode_Expect_ReturnEPARA)
+{
+    ScopedChannelStubEndpoint stubEndpoint;
+    EndpointHandle ep = stubEndpoint.Get();
+    HcommChannelDesc desc{};
+    ASSERT_EQ(HcommChannelDescInit(&desc, 1), HCCL_SUCCESS);
+    desc.remoteEndpoint.protocol = COMM_PROTOCOL_UB_MEM;
+    desc.ubMemAttr.pathMode = 5; // 非法值
+    ChannelHandle channels[1] = {0};
+
+    HcommResult ret = HcommChannelCreate(ep, COMM_ENGINE_AIV, &desc, 1, channels);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+    hcomm::GetSharedJettyMgr().UnregisterEndpoint(ep);
+}
+
+// HcommChannelCreate 当 channelDescs 为 nullptr 返回 HCOMM_E_PTR
+TEST_F(TestHcommChannel, Ut_HcommChannelCreate_When_ChannelDescsNullptr_Expect_ReturnEPtr)
+{
+    EndpointHandle ep = reinterpret_cast<EndpointHandle>(0x12345);
+    ChannelHandle channels[1] = {0};
+    HcommResult ret = HcommChannelCreate(ep, COMM_ENGINE_AIV, nullptr, 1, channels);
+    EXPECT_EQ(ret, HCCL_E_PTR);
+}
+
 // base_comm 层 IsUbProtocol 门控覆盖：
 // HcommChannelCreateWithConfig → ValidateSharedQueueConfig → IsUbProtocol
 
@@ -216,7 +296,7 @@ TEST_F(TestHcommChannel, Ut_HcommChannelCreateWithConfig_When_SharedQueue_UbRtp_
 
     HcommResult ret = HcommChannelCreateWithConfig(ep, COMM_ENGINE_AIV, &desc, 1, config, channels);
     EXPECT_EQ(ret, HCCL_SUCCESS);
-    hcomm::SharedJettyMgr::GetInstance().UnregisterEndpoint(ep);
+    hcomm::GetSharedJettyMgr().UnregisterEndpoint(ep);
     HcommChannelConfigDestroy(config);
 }
 
@@ -248,6 +328,61 @@ TEST_F(TestHcommChannel, Ut_HcommChannelCreateWithConfig_When_SharedQueue_Uboe_E
     MOCKER(HcommResMgrInit).stubs().will(returnValue(static_cast<HcommResult>(HCCL_SUCCESS)));
 
     HcommResult ret = HcommChannelCreateWithConfig(ep, COMM_ENGINE_AIV, &desc, 1, config, channels);
+    EXPECT_EQ(ret, static_cast<HcommResult>(HCCL_E_NOT_SUPPORT));
+    HcommChannelConfigDestroy(config);
+}
+
+// ===================== engine 入口校验 =====================
+
+// HcommChannelCreate 保留值/越界 engine 在入口被拦截，返回 HCCL_E_PARA
+// （校验先于 endpoint 解析，传假句柄可同时验证 fail-fast，不触达句柄管理器）
+TEST_F(TestHcommChannel, Ut_HcommChannelCreate_When_EngineInvalid_Expect_ReturnEPARA)
+{
+    const CommEngine invalidEngines[]
+        = {COMM_ENGINE_RESERVED, static_cast<CommEngine>(COMM_ENGINE_CCU + 1), static_cast<CommEngine>(100)};
+    HcommChannelDesc desc = MakeSharedQueueChannelDesc(COMM_PROTOCOL_UB_RTP);
+    ChannelHandle channels[1] = {0};
+    for (CommEngine engine : invalidEngines) {
+        HcommResult ret = HcommChannelCreate(reinterpret_cast<EndpointHandle>(0x12345), engine, &desc, 1, channels);
+        EXPECT_EQ(ret, HCCL_E_PARA);
+    }
+    EXPECT_EQ(channels[0], static_cast<ChannelHandle>(0));
+}
+
+// HcommChannelCreate CPU_TS 为合法枚举：通过入口值域校验（区别于 E_PARA 用例），假句柄下
+// 穿透入口后在 endpoint 解析处失败返回 HCCL_E_NOT_FOUND；合法句柄下由深层 Channel::CreateChannel 拦截
+TEST_F(TestHcommChannel, Ut_HcommChannelCreate_When_EngineCpuTs_Expect_ReturnENotFound)
+{
+    HcommChannelDesc desc = MakeSharedQueueChannelDesc(COMM_PROTOCOL_UB_RTP);
+    ChannelHandle channels[1] = {0};
+    HcommResult ret
+        = HcommChannelCreate(reinterpret_cast<EndpointHandle>(0x12345), COMM_ENGINE_CPU_TS, &desc, 1, channels);
+    EXPECT_EQ(ret, static_cast<HcommResult>(HCCL_E_NOT_FOUND));
+    EXPECT_EQ(channels[0], static_cast<ChannelHandle>(0));
+}
+
+// 反向：IS_SHARED_QUEUE=true + 越界 engine，入口即拦截返回 HCCL_E_PARA（原穿透至 AIV 门禁返回 E_NOT_SUPPORT）
+TEST_F(TestHcommChannel, Ut_HcommChannelCreateWithConfig_When_SharedQueue_EngineInvalid_Expect_ReturnEPARA)
+{
+    HcommChannelConfig config = MakeSharedQueueConfig();
+    HcommChannelDesc desc = MakeSharedQueueChannelDesc(COMM_PROTOCOL_UB_RTP);
+    ChannelHandle channels[1] = {0};
+    HcommResult ret = HcommChannelCreateWithConfig(
+        reinterpret_cast<EndpointHandle>(0x12345), static_cast<CommEngine>(100), &desc, 1, config, channels);
+    EXPECT_EQ(ret, HCCL_E_PARA);
+    HcommChannelConfigDestroy(config);
+}
+
+// 反向：IS_SHARED_QUEUE=true + 合法但非 AIV 的 engine，由既有 AIV 门禁拦截返回 HCCL_E_NOT_SUPPORT
+TEST_F(TestHcommChannel, Ut_HcommChannelCreateWithConfig_When_SharedQueue_EngineNotAiv_Expect_ReturnNotSupport)
+{
+    HcommChannelConfig config = MakeSharedQueueConfig();
+    HcommChannelDesc desc = MakeSharedQueueChannelDesc(COMM_PROTOCOL_UB_RTP);
+    ChannelHandle channels[1] = {0};
+    ScopedChannelStubEndpoint stubEndpoint;
+    EndpointHandle ep = stubEndpoint.Get();
+
+    HcommResult ret = HcommChannelCreateWithConfig(ep, COMM_ENGINE_AICPU, &desc, 1, config, channels);
     EXPECT_EQ(ret, static_cast<HcommResult>(HCCL_E_NOT_SUPPORT));
     HcommChannelConfigDestroy(config);
 }

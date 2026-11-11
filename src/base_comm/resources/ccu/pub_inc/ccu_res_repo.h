@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
@@ -11,12 +11,14 @@
 #ifndef CCU_RES_REPO_H
 #define CCU_RES_REPO_H
 
+// CCU 资源仓库数据结构定义（内部）。coll_comm 不依赖本头文件，
+// 边界侧 ccu_device_pub.h 仅对 CcuResRepository/CntXnBlock 作前置声明。
 #include <array>
 #include <string>
 #include <sstream>
 #include <utility>
 #include <vector>
-#include "ccu_common.h"
+#include "comm_engine/ccu/ccu_common_pub.h"
 
 namespace hcomm {
 
@@ -53,6 +55,16 @@ struct MissionResInfo {
     std::array<std::vector<ResInfo>, CCU_MAX_IODIE_NUM> mission;
 };
 
+using CntXnBlock = struct tagCntXnBlock {
+    ResInfo resInfo{};                          // cntXn resInfo
+    std::pair<uint32_t, uint32_t> wishCntXns{}; // wishCntXn Id <begin, end>
+    std::pair<void*, uint64_t> wishCntXnsMem{}; // wishCntXnsMem <ptr, size>
+    uint32_t totalCntXn{0};                     // totalCntXn Id
+    uint32_t expectedCntXn{0};                  // expectedCntXn Id
+    uint32_t blockIdx{0};                       // wishCntXn和totalCntXn绑定时的idx
+    uint8_t dieId{0};                           // 块归属的 ioDie, 块内 Id 均为 die 内索引
+};
+
 struct CcuResRepository {
     std::array<std::vector<ResInfo>, CCU_MAX_IODIE_NUM> loopEngine{};
     std::array<std::vector<ResInfo>, CCU_MAX_IODIE_NUM> blockLoopEngine{};
@@ -66,6 +78,8 @@ struct CcuResRepository {
     std::array<std::vector<ResInfo>, CCU_MAX_IODIE_NUM> legacyBlockXn{}; // 仅用于legacy流程
     std::array<std::vector<ResInfo>, CCU_MAX_IODIE_NUM> gsa{};
     std::array<std::vector<ResInfo>, CCU_MAX_IODIE_NUM> blockGsa{};
+    // 0.5RTT级联计数器块，由CcuResBatchAllocator在分配资源时申请并登记，随资源句柄统一释放
+    std::array<std::vector<CntXnBlock>, CCU_MAX_IODIE_NUM> cascCntBlock{};
     MissionResInfo mission{};
 };
 
@@ -87,16 +101,8 @@ struct CcuResReq {
     std::array<uint32_t, CCU_MAX_IODIE_NUM> legacyBlockXnReq{}; // 仅用于legacy流程
     std::array<uint32_t, CCU_MAX_IODIE_NUM> gsaReq{};
     std::array<uint32_t, CCU_MAX_IODIE_NUM> blockGsaReq{};
+    std::array<uint32_t, CCU_MAX_IODIE_NUM> cascCntReq{}; // cascCnt请求数，按die填充，供判空及申请级联计数器块
     MissionReq missionReq{};
-};
-
-using CntXnBlock = struct tagCntXnBlock {
-    ResInfo resInfo{};                          // cntXn resInfo
-    std::pair<uint32_t, uint32_t> wishCntXns{}; // wishCntXn Id <begin, end>
-    std::pair<void*, uint64_t> wishCntXnsMem{}; // wishCntXnsMem <ptr, size>
-    uint32_t totalCntXn{0};                     // totalCntXn Id
-    uint32_t expectedCntXn{0};                  // expectedCntXn Id
-    uint32_t blockIdx{0};                       // wishCntXn和totalCntXn绑定时的idx
 };
 
 } // namespace hcomm

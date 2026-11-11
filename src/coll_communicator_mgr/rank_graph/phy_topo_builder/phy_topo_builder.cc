@@ -15,7 +15,7 @@
 #include "null_ptr_exception.h"
 #include "invalid_params_exception.h"
 #include "adapter_error_manager_pub.h"
-#include "hccl_log_keywords.h"
+#include "common/hccl_log_keywords_pub.h"
 
 namespace Hccl {
 
@@ -35,13 +35,78 @@ std::shared_ptr<PhyTopo::Node> CreateNode(const PhyTopo::Node::NodeType nodeType
     }
 }
 
-void PhyTopoBuilder::Build(const std::string& topoPath)
+// 判断链路协议是否全为UB系协议(含PCIE/ROCE等非UB协议时返回false, 保护pciesw等混合机型)
+static bool IsAllUbProtocol(const std::set<LinkProtocol>& protocols)
+{
+    static const std::set<LinkProtocol> ubProtocols
+        = {LinkProtocol::UB_CTP, LinkProtocol::UB_TP, LinkProtocol::UB_MEM, LinkProtocol::UBOE, LinkProtocol::UB_RTP};
+    if (protocols.empty()) {
+        return false;
+    }
+    for (const auto& protocol : protocols) {
+        if (ubProtocols.count(protocol) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 拓扑文件名即机型标识: 两条topoPath获取路径(rootinfo的topo_file_path/TopoAddrInfoGetTopoFilePath)
+// 最终都经TopoGetFilePath(mainboard_id)生成, 仅350L(mainboard 0x44)对应atlas_850_3.json;
+// 8PMESH系(0x25等)对应atlas_850_1/2.json(原生分层), 550EL对应atlas_550EL_*.json, 标卡对应atlas_350_*.json
+static constexpr char UBX_350L_TOPO_FILE_NAME[] = "atlas_850_3.json";
+
+// 判断topoPath是否为350L机型的标准拓扑文件(取最后一段文件名比对, 与driver安装路径无关)
+// 兼容三种路径形态: '/'分隔的绝对路径(生产常规形态, 由TopoGetFilePath拼接)、
+// 无分隔符的裸文件名相对路径、'\'分隔路径(防御性兼容, 生产Linux环境不会出现)
+static bool IsUbxClosSplitMachine(const std::string& topoPath)
+{
+    const size_t pos = topoPath.find_last_of("/\\");
+    const std::string fileName = (pos == std::string::npos) ? topoPath : topoPath.substr(pos + 1);
+    return fileName == UBX_350L_TOPO_FILE_NAME;
+}
+
+// UBX 350L机型(仅此机型, 见IsUbxClosSplitMachine)的topo.json未拆层:
+// DEVICE位置的UB CLOS上交换边与mesh直连边混在netLayer=0。
+// rootinfo侧已拆层(level0=mesh, level1=clos)时, 在内存中将这批边重分桶到netLayer=1, 与rootinfo对齐,
+// 避免CheckNetLayerFromPhyTopo因物理图缺少netLayer=1而报错。等价于手工将topo.json中对应边的
+// net_layer由0改为1, 但不依赖设备侧文件变更。
+// 返回值: 是否发生了350L拆层复制(供Build置位ubxClosSplit_标志, 自由函数无法访问类私有成员)
+static bool SplitUbClosEdgesToLayer1(const std::string& topoPath, std::shared_ptr<TopoInfo>& topoInfo)
+{
+    if (!IsUbxClosSplitMachine(topoPath)) {
+        return false; // 仅350L机型执行拆层复制, 其他机型拓扑保持原状
+    }
+    if (topoInfo->edges.count(1) > 0 || topoInfo->edges.count(0) == 0) {
+        return false; // topo.json已拆层或无layer0, 无需处理
+    }
+    std::vector<EdgeInfo> closEdges;
+    for (auto& edge : topoInfo->edges[0]) {
+        if (edge.linkType == LinkType::PEER2NET && edge.position == AddrPosition::DEVICE
+            && edge.topoType == TopoType::CLOS && IsAllUbProtocol(edge.protocols)) {
+            edge.netLayer = 1;
+            closEdges.emplace_back(edge);
+        }
+    }
+    if (closEdges.empty()) {
+        return false; // layer0中无UB CLOS边, 保持原状
+    }
+    // 复制而非搬移: graph(0)保留clos边副本, 供对称场景的rank graph按基线单层形态建fabric链路;
+    // graph(1)的副本供非对称拆层形态使用。消费侧(rank_graph_builder)按对称性决定用哪份。
+    HCCL_INFO(
+        "[PhyTopoBuilder] topo.json is not layered, copy [%zu] UB CLOS edges to netLayer[1] (kept in netLayer[0]).",
+        closEdges.size());
+    topoInfo->edges[1] = closEdges;
+    return true; // 标记350L拆层形态, 供rank graph侧RestoreSymmetricLevel0View判别机型
+}
+
+HcclResult PhyTopoBuilder::Build(const std::string& topoPath)
 {
     std::lock_guard<std::mutex> lock(phyTopoMutex);
 
     if (PhyTopo::GetInstance()->IsInitFinished()) {
         HCCL_INFO("PhyTopo has been initialized and does not need to be rebuilt");
-        return;
+        return HCCL_SUCCESS;
     }
 
     if (topoPath.empty()) {
@@ -51,29 +116,32 @@ void PhyTopoBuilder::Build(const std::string& topoPath)
         HCCL_ERROR(
             "[%s][%s] errNo[0x%016llx] topo path %s is not a valid real path.", LOG_KEYWORDS_INIT_GROUP.c_str(),
             LOG_KEYWORDS_RANKTABLE_CONFIG.c_str(), HCOM_ERROR_CODE(HcclResult::HCCL_E_PARA), topoPath.c_str());
-        THROW<InvalidParamsException>("[PhyTopoBuilder::%s] Topo path is empty.", __func__);
+        HCCL_ERROR("[%s] Topo path is empty.", __func__);
+        return HCCL_E_PARA;
     }
 
     HCCL_DEBUG("[PhyTopoBuilder::%s]Start to build physic topo.", __func__);
 
-    auto topoInfo = LoadTopoInfo(topoPath);
-    // 根据topoInfo，按netLayer构造Graph
+    std::shared_ptr<TopoInfo> topoInfo = nullptr;
+    TRY_CATCH_RETURN(topoInfo = LoadTopoInfo(topoPath););
+    if (SplitUbClosEdgesToLayer1(topoPath, topoInfo)) {
+        ubxClosSplit_ = true; // 标记350L拆层形态, 供rank graph侧RestoreSymmetricLevel0View判别机型
+    }
     for (const auto& iter : topoInfo->edges) {
         auto netLayer = iter.first;
-        auto graph = CreateGraph(iter.second);
-        PhyTopo::GetInstance()->AddTopoGraph(netLayer, graph);
+        std::shared_ptr<Graph<PhyTopo::Node, PhyTopo::Link>> graph = nullptr;
+        TRY_CATCH_RETURN(graph = CreateGraph(iter.second););
+        CHK_RET(PhyTopo::GetInstance()->AddTopoGraph(netLayer, graph));
         HCCL_DEBUG("[PhyTopoBuilder::%s]Build netLayer[%u] topo graph success.", __func__, netLayer);
     }
 
-    // 遍历peerList，把peerList中的localId构造peer节点，加到layer-0的graph中
     auto graph = PhyTopo::GetInstance()->GetTopoGraph(0);
     if (graph == nullptr) {
         HCCL_INFO("[PhyTopoBuilder::%s] layer0 graph is nullptr, build now", __func__);
         graph = make_shared<Graph<PhyTopo::Node, PhyTopo::Link>>();
-        PhyTopo::GetInstance()->AddTopoGraph(0, graph);
+        CHK_RET(PhyTopo::GetInstance()->AddTopoGraph(0, graph));
     }
     for (const auto& iter : topoInfo->peers) {
-        // 判断当前layer0的graph有没有这个节点
         if (!graph->HasNode(iter.localId)) {
             auto node = CreateNode(PhyTopo::Node::NodeType::PEER, iter.localId);
             graph->AddNode(iter.localId, node);
@@ -84,6 +152,7 @@ void PhyTopoBuilder::Build(const std::string& topoPath)
 
     HCCL_DEBUG("[PhyTopoBuilder::%s]build physic topo success.", __func__);
     PhyTopo::GetInstance()->Dump();
+    return HCCL_SUCCESS;
 }
 
 std::shared_ptr<TopoInfo> PhyTopoBuilder::LoadTopoInfo(const std::string& topoPath)
@@ -119,7 +188,11 @@ std::shared_ptr<TopoInfo> PhyTopoBuilder::LoadTopoInfo(const std::string& topoPa
     }
 
     JsonParser topoParser;
-    topoParser.ParseFile(topoPath, *topoInfo);
+    HcclResult parseRet = topoParser.ParseFile(topoPath, *topoInfo);
+    if (parseRet != HCCL_SUCCESS) {
+        HCCL_ERROR("[%s] ParseFile failed, ret[%d]", __func__, parseRet);
+        THROW<InvalidParamsException>(StringFormat("[%s] ParseFile failed", __func__));
+    }
     topoInfo_ = topoInfo;
     return topoInfo;
 }
@@ -272,19 +345,23 @@ PhyTopoBuilder::CreateGraph(const std::vector<EdgeInfo>& edges) const
     return graph;
 }
 
-void PhyTopoBuilder::RecoverBuild(const TopoInfo& topoInfo)
+HcclResult PhyTopoBuilder::RecoverBuild(const TopoInfo& topoInfo)
 {
     std::lock_guard<std::mutex> lock(phyTopoMutex);
 
     // PhyTopo::GetInstance()->ResetInstance();
     if (PhyTopo::GetInstance()->IsInitFinished()) {
-        return;
+        return HCCL_SUCCESS;
     }
     // 根据topoInfo，按netLayer构造Graph
     for (const auto& iter : topoInfo.edges) {
         auto netLayer = iter.first;
-        auto graph = CreateGraph(iter.second);
-        PhyTopo::GetInstance()->AddTopoGraph(netLayer, graph);
+        std::shared_ptr<Graph<PhyTopo::Node, PhyTopo::Link>> graph = nullptr;
+        TRY_CATCH_RETURN(graph = CreateGraph(iter.second););
+        if (PhyTopo::GetInstance()->AddTopoGraph(netLayer, graph) != HCCL_SUCCESS) {
+            HCCL_ERROR("[%s] AddTopoGraph failed, netLayer[%u]", __func__, netLayer);
+            return HCCL_E_INTERNAL;
+        }
         HCCL_DEBUG("[PhyTopoBuilder::%s]Build netLayer[%u] topo graph success.", __func__, netLayer);
     }
 
@@ -292,6 +369,7 @@ void PhyTopoBuilder::RecoverBuild(const TopoInfo& topoInfo)
 
     HCCL_DEBUG("[PhyTopoBuilder::%s]build physic topo success.", __func__);
     PhyTopo::GetInstance()->Dump();
+    return HCCL_SUCCESS;
 }
 
 std::shared_ptr<TopoInfo> PhyTopoBuilder::GetTopoInfo() const { return topoInfo_; }

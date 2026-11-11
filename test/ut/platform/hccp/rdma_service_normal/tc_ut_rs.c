@@ -54,7 +54,7 @@
 extern void RsGetCurTime(struct timeval* time);
 extern int memset_s(void* dest, size_t destMax, int c, size_t count);
 extern int RsPthreadMutexInit(struct rs_cb* rscb, struct RsInitConfig* cfg);
-extern void RsSslRecvTagInHandle(struct RsAcceptInfo* acceptInfo, struct RsConnInfo* connTmp);
+extern int RsSslRecvTagInHandle(struct RsAcceptInfo* acceptInfo, struct RsConnInfo* connTmp);
 extern void RsEpollEventSslRecvTagInHandle(struct rs_cb* rsCb, struct RsAcceptInfo* acceptInfo);
 extern int RsRdev2rdevCb(unsigned int chipId, unsigned int rdevIndex, struct RsRdevCb** rdevCb);
 extern int RsCompareIpGid(struct rdev rdevInfo, union ibv_gid* gid);
@@ -269,6 +269,15 @@ int DlHalGetDeviceInfoSharemem(uint32_t devId, int32_t moduleType, int32_t infoT
 int DlHalQueryDevPidSharemem(struct halQueryDevpidInfo info, pid_t* devPid) { return 0; }
 
 extern int SprintfS(char* strDest, size_t destMax, const char* format, ...);
+extern enum ProductType RsParseProductType(const char* chipName);
+
+void TcRsGetProductType350Underscore()
+{
+    EXPECT_INT_EQ(RsParseProductType("350_355pr"), PRODUCT_TYPE_350);
+    EXPECT_INT_EQ(RsParseProductType("350355pr"), PRODUCT_TYPE_350);
+    EXPECT_INT_EQ(RsParseProductType("355pr"), PRODUCT_TYPE_OTHERS);
+}
+
 void TcRsInit()
 {
     int ret = 0;
@@ -3641,6 +3650,7 @@ void TcRsRdevCbInit()
     mocker(RsGetIbCtxAndRdevIndex, 20, 0);
     mocker(RsGetSqDepthAndQpMaxNum, 20, 0);
     mocker(RsRoceUnmmapAiDbReg, 20, 0);
+    mocker((stub_fn_t)DlHalGetDeviceInfo, 20, 0);
     mocker(RsSetupPdAndNotify, 20, 1);
     ret = RsRdevCbInit(rdevInfo, &rdevCb, &rsCb, &rdevIndex);
     EXPECT_INT_EQ(ret, 1);
@@ -3648,6 +3658,7 @@ void TcRsRdevCbInit()
 
     mocker(RsInetNtop, 20, 0);
     mocker(RsGetIbCtxAndRdevIndex, 20, 0);
+    mocker((stub_fn_t)DlHalGetDeviceInfo, 20, 0);
     mocker(RsDrvQueryNotifyAndAllocPd, 20, 1);
     mocker(ibv_close_device, 20, 1);
     ret = RsRdevCbInit(rdevInfo, &rdevCb, &rsCb, &rdevIndex);
@@ -3656,6 +3667,7 @@ void TcRsRdevCbInit()
 
     mocker(RsInetNtop, 20, 0);
     mocker(RsGetIbCtxAndRdevIndex, 20, 0);
+    mocker((stub_fn_t)DlHalGetDeviceInfo, 20, 0);
     mocker(RsDrvQueryNotifyAndAllocPd, 20, 0);
     mocker(RsDrvRegNotifyMr, 20, 1);
     mocker(ibv_dealloc_pd, 20, 1);
@@ -3713,10 +3725,14 @@ void TcRsSslFree()
 
 void TcRsDrvConnect()
 {
+    struct RsConnInfo conn = {0};
     gRsCb = malloc(sizeof(struct rs_cb));
     gRsCb->hccpMode = 1;
+    conn.connfd = 1;
+    conn.port = 1;
+    conn.clientIp.family = AF_INET;
     mocker(connect, 20, 1);
-    RsDrvConnect(1, NULL, NULL, 1);
+    RsDrvConnect(&conn);
     mocker_clean();
     free(gRsCb);
     gRsCb = NULL;
@@ -6994,5 +7010,79 @@ void TcRsGetLbMax()
     mocker_invoke(RsQueryRdevCb, RsQueryRdevCbStub, 1);
     ret = RsGetLbMax(phyId, rdevIndex, &lbMax);
     EXPECT_INT_EQ(ret, 0);
+    mocker_clean();
+}
+
+static struct ibv_context gRdevGetAttrIbCtx;
+static uint32_t gRdevGetAttrExtDevCap = 0;
+static int gRdevGetAttrDirectFlag = 0;
+
+/* 构造带 ibCtx/deviceAttr/directFlag/extDevCap 的静态 rdevCb，供 RsRdevGetAttr 使用 */
+int RsQueryRdevCbGetAttrStub(unsigned int phyId, unsigned int rdevIndex, struct RsRdevCb** rdevCb)
+{
+    static struct RsRdevCb stubRdevCb = {0};
+    stubRdevCb.ibCtx = &gRdevGetAttrIbCtx;
+    stubRdevCb.ibPort = 1;
+    stubRdevCb.deviceAttr.max_qp_wr = 1024;
+    stubRdevCb.deviceAttr.max_cqe = 512;
+    stubRdevCb.directFlag = gRdevGetAttrDirectFlag;
+    stubRdevCb.extDevCap = gRdevGetAttrExtDevCap;
+    *rdevCb = &stubRdevCb;
+    return 0;
+}
+
+void TcRsRdevGetAttr()
+{
+    struct RdevAttr attr = {0};
+    unsigned int rdevIndex = 0;
+    unsigned int phyId = 0;
+    int ret = 0;
+
+    /* 入参异常：phyId 越界 -> 返回非 0 */
+    ret = RsRdevGetAttr(RS_MAX_DEV_NUM, rdevIndex, &attr);
+    EXPECT_INT_EQ(ret, -EINVAL);
+
+    /* 入参异常：attr 为空 -> 返回非 0 */
+    ret = RsRdevGetAttr(phyId, rdevIndex, NULL);
+    EXPECT_INT_EQ(ret, -EINVAL);
+
+    /* RsQueryRdevCb 失败 -> 返回非 0 */
+    mocker_clean();
+    mocker(RsQueryRdevCb, 1, -1);
+    ret = RsRdevGetAttr(phyId, rdevIndex, &attr);
+    EXPECT_INT_NE(ret, 0);
+    mocker_clean();
+
+    /* directFlag==UB 且 extDevCap 含 INLINE_REDUCE 位 -> isInlineReduceSupported==true */
+    mocker_clean();
+    gRdevGetAttrDirectFlag = DIRECT_FLAG_UB;
+    gRdevGetAttrExtDevCap = IBV_EXTEND_DEV_INLINE_REDUCE;
+    mocker_invoke(RsQueryRdevCb, RsQueryRdevCbGetAttrStub, 1);
+    mocker_invoke((stub_fn_t)ibv_query_port, StubIbvQueryPort, 10);
+    ret = RsRdevGetAttr(phyId, rdevIndex, &attr);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ((int)attr.isInlineReduceSupported, (int)true);
+    mocker_clean();
+
+    /* directFlag==UB 且 extDevCap 不含该位 -> isInlineReduceSupported==false */
+    mocker_clean();
+    gRdevGetAttrDirectFlag = DIRECT_FLAG_UB;
+    gRdevGetAttrExtDevCap = 0;
+    mocker_invoke(RsQueryRdevCb, RsQueryRdevCbGetAttrStub, 1);
+    mocker_invoke((stub_fn_t)ibv_query_port, StubIbvQueryPort, 10);
+    ret = RsRdevGetAttr(phyId, rdevIndex, &attr);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ((int)attr.isInlineReduceSupported, (int)false);
+    mocker_clean();
+
+    /* directFlag==PCIE 且 extDevCap 含该位 -> isInlineReduceSupported==false */
+    mocker_clean();
+    gRdevGetAttrDirectFlag = DIRECT_FLAG_PCIE;
+    gRdevGetAttrExtDevCap = IBV_EXTEND_DEV_INLINE_REDUCE;
+    mocker_invoke(RsQueryRdevCb, RsQueryRdevCbGetAttrStub, 1);
+    mocker_invoke((stub_fn_t)ibv_query_port, StubIbvQueryPort, 10);
+    ret = RsRdevGetAttr(phyId, rdevIndex, &attr);
+    EXPECT_INT_EQ(ret, 0);
+    EXPECT_INT_EQ((int)attr.isInlineReduceSupported, (int)false);
     mocker_clean();
 }

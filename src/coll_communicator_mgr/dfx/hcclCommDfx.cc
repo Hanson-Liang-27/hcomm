@@ -10,10 +10,10 @@
 
 #include "hcclCommDfx.h"
 #include "dpu_comm_dfx.h"
-#include "dfx_dlprof_function.h"
-#include "ccu_rep_context_v1.h"
+#include "dfx/prof_utils_pub.h"
+#include "comm_engine/ccu/ccu_common_pub.h"
 #include "task_info.h"
-#include "channel_profiling_adpt.h"
+#include "dfx/channel_profiling_adpt_pub.h"
 
 namespace hccl {
 
@@ -46,9 +46,8 @@ HcclResult HcclCommDfx::Init(u32 deviceId, const std::string& comTag, u32 myRank
     EXCEPTION_CATCH(
         profiling_ = std::make_unique<HcclCommProfiling>(deviceId_, mirrorTaskManager_.get()), return HCCL_E_PTR);
     CHK_RET(profiling_->Init());
-    // profiling_->Init() 内部触发 DfxDlProfFunctionInit(dlopen libprofapi.so)，必须在 dlsym 完成后计算
-    // groupNameHash_，否则首 comm 走 stub 返回 0
-    groupNameHash_ = Hccl::DfxDlProfFunction::GetInstance().dlMsprofStr2Id(commTag_.c_str(), commTag_.length());
+    // ProfStr2Id 内部确保 DfxDlProfFunctionInit（dlopen libprofapi.so）已完成，无首 comm 走 stub 返回 0 的问题
+    groupNameHash_ = hcomm::ProfStr2Id(commTag_.c_str(), commTag_.length());
 
     // 3. 注册回调
     setAddTaskCallback_ = [this](u32 streamId, u32 taskId, const Hccl::TaskParam& taskParam, u64 handle) {
@@ -150,6 +149,14 @@ HcclResult HcclCommDfx::AddTaskInfoCallback(
     return HCCL_SUCCESS;
 }
 
+void HcclCommDfx::RefreshGroupNameHash()
+{
+    groupNameHash_.store(hcomm::ProfStr2Id(commTag_.c_str(), commTag_.length()), std::memory_order_relaxed);
+    HCCL_INFO(
+        "[%s] refresh groupNameHash_[%llu] for commTag[%s]", __func__, groupNameHash_.load(std::memory_order_relaxed),
+        commTag_.c_str());
+}
+
 HcclResult HcclCommDfx::AddDpuTaskInfoCallback(const Hccl::TaskParam& taskParam, u64 handle)
 {
     return dpuDfx_->AddDpuTaskInfoCallback(taskParam, handle);
@@ -158,9 +165,14 @@ HcclResult HcclCommDfx::AddDpuTaskInfoCallback(const Hccl::TaskParam& taskParam,
 HcclResult HcclCommDfx::SetCurrDfxOpInfo(std::shared_ptr<Hccl::DfxOpInfo> dfxOpInfo)
 {
     if (dfxOpInfo != nullptr) {
+        auto currVersion = Hccl::DfxProfilingHandler::GetProfSwitchVersion();
+        if (currVersion != lastRefreshedVersion_) {
+            RefreshGroupNameHash();
+            lastRefreshedVersion_ = currVersion;
+        }
         // commTag_ 与 op_.opTag 恒等（单算子入口 HcclDfxRegOpInfoByCommId 设 op_.opTag=collComm->GetCommId()，
         // HcclCommDfx::Init 的 comTag 入参来源同为 collComm->GetCommId()），故 groupNameHash_ 可代表 op_.opTag 哈希
-        dfxOpInfo->groupNameHash_ = groupNameHash_;
+        dfxOpInfo->groupNameHash_ = groupNameHash_.load(std::memory_order_relaxed);
     }
     profiling_->SetCurrDfxOpInfo(dfxOpInfo);
     return HCCL_SUCCESS;
@@ -169,18 +181,21 @@ HcclResult HcclCommDfx::SetCurrDfxOpInfo(std::shared_ptr<Hccl::DfxOpInfo> dfxOpI
 // HcclCommDfx接口实现 - 修改为返回HcclResult类型
 HcclResult HcclCommDfx::ReportAllTasks(bool cachedReq)
 {
-    EXCEPTION_CATCH(profiling_->ReportAllTasks(cachedReq), return HCCL_E_PTR);
+    CHK_RET(profiling_->ReportAllTasks(cachedReq));
     return HCCL_SUCCESS;
 }
 
 HcclResult HcclCommDfx::ReportOp(uint64_t beginTime, bool cachedReq, bool isOpBase)
 {
-    EXCEPTION_CATCH(profiling_->ReportOp(beginTime, cachedReq, isOpBase), return HCCL_E_PTR);
+    CHK_RET(profiling_->ReportOp(beginTime, cachedReq, isOpBase));
     return HCCL_SUCCESS;
 }
 
 // 返回值Mc2要改
-void HcclCommDfx::ReportMc2CommInfo(const Mc2CommInfo& mc2CommInfo) { profiling_->ReportMc2CommInfo(mc2CommInfo); }
+HcclResult HcclCommDfx::ReportMc2CommInfo(const Mc2CommInfo& mc2CommInfo)
+{
+    return profiling_->ReportMc2CommInfo(mc2CommInfo);
+}
 
 HcclResult HcclCommDfx::UpdateProfStat()
 {
@@ -224,13 +239,5 @@ HcclResult HcclCommDfx::ReportKernel(
     CHK_RET(profiling_->ReportKernel(beginTime, commTag, kernelName, threadId, cachedReq));
     return HCCL_SUCCESS;
 }
-
-namespace {
-
-    struct ChannelRemoteRankIdRegister {
-        ChannelRemoteRankIdRegister() { hcomm::RegisterGetChannelRemoteRankId(&HcclCommDfx::GetChannelRemoteRankId); }
-    };
-    const ChannelRemoteRankIdRegister g_channelRemoteRankIdRegister;
-} // namespace
 
 } // namespace hccl

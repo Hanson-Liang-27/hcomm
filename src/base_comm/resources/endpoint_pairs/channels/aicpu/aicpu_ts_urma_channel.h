@@ -16,7 +16,8 @@
 #include <memory>
 #include <vector>
 #include "../channel.h"
-#include "aicpu_ts_channel_helper.h"
+#include "aicpu_ts_channel_entity.h"
+#include "aicpu_ts_channel_entity_resources.h"
 
 // Orion
 #include "../../../../../../src/legacy/ascend950/unified_platform/resource/socket/socket.h"
@@ -31,76 +32,45 @@ namespace hcomm {
 
 class AicpuTsUrmaChannel : public Channel {
 public:
-    AicpuTsUrmaChannel(EndpointHandle endpointHandle, const HcommChannelDesc& channelDesc);
+    AicpuTsUrmaChannel(EndpointHandle endpointHandle, const HcommChannelDesc& channelDesc, CommEngine engine);
     ~AicpuTsUrmaChannel() override;
 
-    HcclResult Init() override;
     HcclResult GetNotifyNum(uint32_t* notifyNum) const override;
     HcclResult GetRemoteMems(uint32_t* memNum, CommMem** remoteMem, char*** memInfos) override;
     ChannelStatus GetStatus() override;
     HcclResult UpdateMemInfo(HcommMemHandle* memHandles, uint32_t memHandleNum) override;
-
-    HcclResult H2DResPack(std::vector<char>& buffer);
-    HcommChannelKind GetChannelKind() const override;
+    std::vector<char> GetMemUpdatePack() override;
 
     HcclResult Clean() override;
     HcclResult Resume() override;
-    const HcommChannelDesc& GetChannelDesc() const override { return channelDesc_; }
-    // 数据面接口
-    HcclResult NotifyRecord(const uint32_t remoteNotifyIdx) override;
-    HcclResult NotifyWait(const uint32_t localNotifyIdx, const uint32_t timeout) override;
-    HcclResult WriteWithNotify(void* dst, const void* src, const uint64_t len, uint32_t remoteNotifyIdx) override;
-    HcclResult Write(void* dst, const void* src, uint64_t len) override;
-    HcclResult Read(void* dst, const void* src, uint64_t len) override;
-    HcclResult ChannelFence() override;
 
-    AicpuTsChannelHelper* GetAicpuTsHelper() override { return &aicpuTsHelper_; }
+    HcclResult H2DResPack(std::vector<char>& buffer);
+    HcclResult BuildDeviceEntity(ChannelHandle compatChannelHandle, ChannelHandle& entityHandle);
+
+    IChannelEntity* GetChannelEntity() override { return &aicpuTsEntity_; }
 
 private:
-    AicpuTsChannelHelper aicpuTsHelper_;
-    HcclResult ParseInputParam();
-    HcclResult StartListen();
-    HcclResult BuildSocket();
+    HcclResult ParseInputParam() override;
+    HcclResult StartListen() override;
+    HcclResult BuildSocket() override;
+    HcclResult BuildConnection() override;
+    HcclResult BuildNotify() override;
+    HcclResult BuildBuffer() override;
+
     HcclResult BuildAttr();
-    HcclResult BuildConnection();
-    HcclResult BuildNotify();
-    HcclResult BuildUbMemTransport();
+    HcclResult PackOpData(std::vector<char>& data);
     HcclResult ResetLocalNotifies();
 
-    HcclResult PackOpData(std::vector<char>& data);
-
-private:
-    std::atomic<bool> isFirstPrintChannelInfo_{true}; // 是否第一次打印通道建链信息，避免重复打印日志刷屏
-    // --------------------- 入参 ---------------------
-    EndpointHandle endpointHandle_;
-    HcommChannelDesc channelDesc_;
-
+    AicpuChannelEntityResources entityResources_;
     // --------------------- 转换参数 ---------------------
-    EndpointDesc localEp_{};
-    EndpointDesc remoteEp_{};
-    uint32_t notifyNum_{0};
+    DevBaseAttr devBaseAttr_{};
+    bool devBaseAttrReady_{false};
 
     // --------------------- 具体成员 ---------------------
-    Hccl::Socket* socket_{nullptr};
-    // 保存 socketConfig 的拷贝并记录裸指针，供析构时 DestroySocket 回收引用计数。须在 GetSocket 之前调用，
-    // 避免 GetSocket 成功后 holder 构造异常（bad_alloc）导致 socketConfig_ 未设置、析构无法回收引用计数。
-    void SaveSocketConfig(const Hccl::SocketConfig& socketConfig)
-    {
-        socketConfigHolder_ = std::make_unique<Hccl::SocketConfig>(socketConfig);
-        socketConfig_ = socketConfigHolder_.get();
-    }
-
-    std::unique_ptr<Hccl::SocketConfig> socketConfigHolder_{nullptr};
-    const Hccl::SocketConfig* socketConfig_{nullptr};
-    RdmaHandle rdmaHandle_{nullptr};
+    AicpuTsChannelEntity aicpuTsEntity_;
     std::unique_ptr<Hccl::UbMemTransport> memTransport_{nullptr};
-    Hccl::BaseMemTransport::Attribution attr_{};
-    Hccl::BaseMemTransport::CommonLocRes commonRes_{};
     std::vector<std::unique_ptr<Hccl::DevUbConnection>> connections_{};
-    std::vector<std::unique_ptr<Hccl::UbLocalNotify>> localNotifies_{};
-    std::unique_ptr<Hccl::Socket> serverSocket_;
-    DevBaseAttr devBaseAttr_{};
-    uint32_t devicePhyId_{};
+    std::atomic<bool> isFirstPrintChannelInfo_{true}; // 是否第一次打印通道建链信息，避免重复打印日志刷屏
 };
 
 } // namespace hcomm

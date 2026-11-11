@@ -27,32 +27,6 @@
 #include "rs_ub_dfx.h"
 #include "rs_ctx.h"
 
-int RsGetChipProtocol(unsigned int chipId, enum NetworkMode hccpMode, enum ProtocolTypeT *protocol,
-    unsigned int logicId)
-{
-#define CHIP_NAME_950 "950"
-#define CHIP_NAME_960 "960"
-    halChipInfo chipInfo = {0};
-    int ret;
-
-    // set default protocol to RDMA for compatibility issue
-    *protocol = PROTOCOL_RDMA;
-    // other modes skip to get protocol
-    if (hccpMode != NETWORK_OFFLINE) {
-        return 0;
-    }
-
-    ret = DlHalGetChipInfo(logicId, &chipInfo);
-    CHK_PRT_RETURN(ret != 0,
-        hccp_warn_rma("hal get chip info unsuccessful, chipId[%u], logicId[%u], ret[%d]", chipId, logicId, ret), 0);
-
-    if ((strncmp((char *)chipInfo.name, CHIP_NAME_950, sizeof(CHIP_NAME_950) - 1) == 0) ||
-        (strncmp((char *)chipInfo.name, CHIP_NAME_960, sizeof(CHIP_NAME_960) - 1) == 0)) {
-        *protocol = PROTOCOL_UDMA;
-    }
-    return 0;
-}
-
 STATIC int RsCtxUdmaApiInit(enum ProtocolTypeT protocol)
 {
     int ret;
@@ -135,33 +109,24 @@ int RsCtxApiDeinit(enum NetworkMode hccpMode, enum ProtocolTypeT protocol)
     return 0;
 }
 
-bool RsCtxIsPcieStd(unsigned int phyId)
+bool RsCtxIsPcieStd(unsigned int logicId)
 {
-    unsigned int logicId = 0;
-    unsigned int chipId = 0;
     int64_t val = 0;
-    int ret = 0;
-
-    CHK_PRT_RETURN(phyId >= RS_MAX_DEV_NUM, hccp_err("invalid param phy_id[%u]", phyId), -EINVAL);
-    ret = rsGetLocalDevIDByHostDevID(phyId, &chipId);
-    CHK_PRT_RETURN(ret != 0, hccp_err("phy_id[%u] invalid, ret %d", phyId, ret), ret);
-    ret = DlDrvDeviceGetIndexByPhyId(chipId, &logicId);
-    CHK_PRT_RETURN(ret != 0, hccp_err("DlDrvDeviceGetIndexByPhyId failed, ret(%d), chipId(%u)", ret, chipId), ret);
-
-    ret = DlHalGetDeviceInfo(logicId, MODULE_TYPE_SYSTEM, INFO_TYPE_MAINBOARD_ID, &val);
-    if (ret != 0 || val < 0) {
-        hccp_err("DlHalGetDeviceInfo failed ret[%d] logicId[%u]", ret, logicId);
+    int ret = DlHalGetDeviceInfo(logicId, MODULE_TYPE_SYSTEM, INFO_TYPE_MAINBOARD_ID, &val);
+    if (ret != 0) {
+        hccp_run_warn("DlHalGetDeviceInfo unsuccessful ret[%d] logicId[%u]", ret, logicId);
         return false;
     }
+    hccp_info_others("DlHalGetDeviceInfo success, logicId[%u], val[0x%llx]", logicId, val);
     return (val == RS_MAINBOARD_ID_CARD_NOMESH || val == RS_MAINBOARD_ID_CARD_2PMESH ||
             val == RS_MAINBOARD_ID_CARD_4PMESH);
 }
 
-bool RsCtxGetContextNotSupported(unsigned int mode, unsigned int phyId)
+bool RsCtxGetContextNotSupported(unsigned int mode, unsigned int logicId)
 {
     uint64_t expectUrmaVersion = URMA_GET_ABI_VERSION(0, 1, 0);
 
-    if (mode != NETWORK_PEER_ONLINE && !RsCtxIsPcieStd(phyId)) {
+    if (mode != NETWORK_PEER_ONLINE && !RsCtxIsPcieStd(logicId)) {
         // server pod default support get context
         return false;
     }
@@ -170,12 +135,21 @@ bool RsCtxGetContextNotSupported(unsigned int mode, unsigned int phyId)
 
 RS_ATTRI_VISI_DEF int RsGetDevEidInfoNum(unsigned int phyId, unsigned int *num)
 {
+    struct RsDevEidInfoCb *eidInfoCb = NULL;
+    struct rs_cb *rscb = NULL;
     int ret = 0;
 
     RS_CHECK_POINTER_NULL_RETURN_INT(num);
+    *num = 0;
 
-    ret = RsUbGetDevEidInfoNum(phyId, num);
-    CHK_PRT_RETURN(ret != 0, hccp_err("rs_ub_get_dev_eid_info_num failed, phyId:%u, ret:%d", phyId, ret), ret);
+    ret = RsGetRsCb(phyId, &rscb);
+    CHK_PRT_RETURN(ret != 0, hccp_err("RsGetRsCb failed, phyId:%u, ret:%d", phyId, ret), ret);
+
+    CHK_PRT_RETURN(!RsIsUdmaSupported(), hccp_err("udma is not supported, phyId:%u", phyId), -EINVAL);
+
+    eidInfoCb = (struct RsDevEidInfoCb *)rscb->devEidInfoCb;
+    CHK_PRT_RETURN(eidInfoCb == NULL, hccp_err("devEidInfoCb is not initialized, phyId:%u", phyId), -EAGAIN);
+    *num = eidInfoCb->num;
 
     return ret;
 }
@@ -183,12 +157,27 @@ RS_ATTRI_VISI_DEF int RsGetDevEidInfoNum(unsigned int phyId, unsigned int *num)
 RS_ATTRI_VISI_DEF int RsGetDevEidInfoList(unsigned int phyId, struct HccpDevEidInfo infoList[], unsigned int startIndex,
     unsigned int count)
 {
+    struct RsDevEidInfoCb *eidInfoCb = NULL;
+    struct rs_cb *rscb = NULL;
     int ret = 0;
 
     RS_CHECK_POINTER_NULL_RETURN_INT(infoList);
 
-    ret = RsUbGetDevEidInfoList(phyId, infoList, startIndex, count);
-    CHK_PRT_RETURN(ret != 0, hccp_err("rs_ub_get_dev_eid_info_list failed, phyId:%u, ret:%d", phyId, ret), ret);
+    ret = RsGetRsCb(phyId, &rscb);
+    CHK_PRT_RETURN(ret != 0, hccp_err("RsGetRsCb failed, phyId:%u, ret:%d", phyId, ret), ret);
+
+    CHK_PRT_RETURN(!RsIsUdmaSupported(), hccp_err("udma is not supported, phyId:%u", phyId), -EINVAL);
+
+    eidInfoCb = (struct RsDevEidInfoCb *)rscb->devEidInfoCb;
+    CHK_PRT_RETURN(eidInfoCb == NULL, hccp_err("devEidInfoCb is not initialized, phyId:%u", phyId), -EAGAIN);
+
+    CHK_PRT_RETURN((startIndex > UINT_MAX - count) || (startIndex + count > eidInfoCb->num),
+        hccp_err("data size exceeds the max offset range or start_index:%u + count:%u > num:%u", startIndex, count,
+            eidInfoCb->num),
+        -EINVAL);
+
+    (void)memcpy_s(infoList, sizeof(struct HccpDevEidInfo) * count, &eidInfoCb->infoList[startIndex],
+        sizeof(struct HccpDevEidInfo) * count);
 
     return ret;
 }
@@ -753,30 +742,6 @@ RS_ATTRI_VISI_DEF int RsCtxBatchSendWr(struct WrlistBaseInfo *baseInfo, struct B
     return ret;
 }
 
-RS_ATTRI_VISI_DEF int RsCtxUpdateCi(struct RaRsDevInfo *devInfo, unsigned int qpId, uint16_t ci)
-{
-    struct RsUbDevCb *devCb = NULL;
-    struct rs_cb *rscb = NULL;
-    int ret;
-
-    RS_CHECK_POINTER_NULL_RETURN_INT(devInfo);
-
-    ret = RsGetRsCb(devInfo->phyId, &rscb);
-    CHK_PRT_RETURN(ret != 0, hccp_err("get rscb failed, ret:%d", ret), ret);
-
-    switch (rscb->protocol) {
-        case PROTOCOL_UDMA:
-            ret = RsUbGetDevCb(rscb, devInfo->devIndex, &devCb);
-            CHK_PRT_RETURN(ret != 0, hccp_err("get dev_cb failed, ret:%d devIndex:0x%x", ret, devInfo->devIndex), ret);
-            ret = RsUbCtxJettyUpdateCi(devCb, qpId, ci);
-            break;
-        default:
-            hccp_err("protocol[%d] not support", rscb->protocol);
-            return -EINVAL;
-    }
-    return ret;
-}
-
 RS_ATTRI_VISI_DEF int RsCtxQpDestroyBatch(struct RaRsDevInfo *devInfo, unsigned int ids[], unsigned int *num)
 {
     struct RsUbDevCb *devCb = NULL;
@@ -911,7 +876,7 @@ RS_ATTRI_VISI_DEF int RsCtxGetUbContext(struct RaRsDevInfo *devInfo, unsigned in
     ret = RsUbGetDevCb(rscb, devInfo->devIndex, &devCb);
     CHK_PRT_RETURN(ret != 0, hccp_err("get devCb failed, ret:%d devIndex:0x%x", ret, devInfo->devIndex), ret);
 
-    CHK_PRT_RETURN(RsCtxGetContextNotSupported(devCb->rscb->hccpMode, devInfo->phyId),
+    CHK_PRT_RETURN(RsCtxGetContextNotSupported(devCb->rscb->hccpMode, devCb->rscb->logicId),
         hccp_warn_rma("not support get jetty context"), -ENOTSUPP);
 
     if (contextType == CONTEXT_TYPE_JETTY) {

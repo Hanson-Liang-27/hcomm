@@ -8,7 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#include "cast_utils.h"
+#include "common/cast_utils_pub.h"
 #include "sqe_mgr.h"
 #include <chrono>
 #include "stl_util.h"
@@ -75,7 +75,7 @@ HcclResult SqeMgr::Add(u32 sqId, HcclSqe* sqe)
 
     HCCL_INFO("SqeMgr::%s sqe->GetSqe() %llu", __func__, sqe->GetSqe());
 
-    CHK_RET(AddSqeToBuffer(nextBufferAddr, ReinterpretAs<void*>(sqe->GetSqe())));
+    CHK_RET(AddSqeToBuffer(nextBufferAddr, reinterpret_cast<void*>(sqe->GetSqe())));
     sqInfo->sqeCnt++;
     HCCL_INFO("SqeMgr::%s end sqInfo->sqeCnt[%u]", __func__, sqInfo->sqeCnt);
     return HcclResult::HCCL_SUCCESS;
@@ -249,7 +249,7 @@ u32 SqeMgr::GetTailToHeadDist(u32 sqId, u32 head, u32 tail)
 HcclResult SqeMgr::AddSqeToBuffer(void* bufferAddr, void* sqeAddr) const
 {
     if (bufferAddr == nullptr || sqeAddr == nullptr) {
-        HCCL_ERROR("SqeMgr::%s bufferAddr[%u], sqeAddr[%u]", __func__, bufferAddr, sqeAddr);
+        HCCL_ERROR("SqeMgr::%s bufferAddr[%p], sqeAddr[%p]", __func__, bufferAddr, sqeAddr);
         return HcclResult::HCCL_E_PTR;
     }
     s32 ret = memcpy_s(bufferAddr, AC_SQE_SIZE, sqeAddr, AC_SQE_SIZE);

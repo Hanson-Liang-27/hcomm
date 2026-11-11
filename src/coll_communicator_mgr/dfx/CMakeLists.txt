@@ -13,11 +13,11 @@ set(src_list
     ${CMAKE_CURRENT_SOURCE_DIR}/dpu_comm_dfx.cc
 )
 
-if(TARGET hcomm)
-    target_sources(hcomm PRIVATE
+if(TARGET hcomm_coll_comm_obj)
+    target_sources(hcomm_coll_comm_obj PRIVATE
         ${src_list}
     )
-    target_include_directories(hcomm PRIVATE
+    target_include_directories(hcomm_coll_comm_obj PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/profiling
         ${CMAKE_CURRENT_SOURCE_DIR}/profiling/aicpu
@@ -56,3 +56,5 @@ add_subdirectory(streamTaskMonitor)
 add_subdirectory(cluster_monitor)
 add_subdirectory(ns_recovery)
 add_subdirectory(rtsq_poll)
+add_subdirectory(inconsistentCheck)
+add_subdirectory(detect_connection_anomalies)

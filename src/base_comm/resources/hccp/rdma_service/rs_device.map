@@ -49,7 +49,6 @@ global:
     RsCtxRmemUnimport;
     RsCtxTokenIdAlloc;
     RsCtxTokenIdFree;
-    RsCtxUpdateCi;
     RsDeinit;
     RsDeregisterMr;
     RsDestroyCompChannel;
@@ -130,6 +129,7 @@ global:
     RsQpDestroy;
     RsQpDestroyWithoutCQ;
     RsRdevDeinit;
+    RsRdevGetAttr;
     RsRdevGetPortStatus;
     RsRdevInit;
     RsRdevInitWithBackup;

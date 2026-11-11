@@ -46,6 +46,9 @@ public:
 
     inline u32 GetSqDepth() const { return sqDepth_; }
 
+    // 兼容性访问器：Thread Entity 组装需要 SQ 基地址，后续统一收敛到 base_comm 抽象。
+    inline u64 GetSqBaseAddr() const { return sqBaseAddr_; }
+
     inline u32 GetHead() const { return sqHead_; }
 
     inline u32 GetTail() const { return sqTail_; }
@@ -227,6 +230,13 @@ public:
         return HCCL_E_NOT_SUPPORT;
     }
     virtual void PollCompletion() {}
+
+    virtual void SetCurrentTransportContext(u64 channelHandle, u8 linkType, u8 transportType)
+    {
+        (void)channelHandle;
+        (void)linkType;
+        (void)transportType;
+    }
 
 protected:
     u32 devPhyId_{0};
